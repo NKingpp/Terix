@@ -141,6 +141,21 @@ func (m *MarketToolSet) SetMXClient(c *MXClient) {
 // 只有启动装配与凭证刷新，而刷新走的是 OkxClient.SetCredential 而不是替换实例。
 func (m *MarketToolSet) SetAccountClient(c AccountClient) { m.account = c }
 
+// MXClient 返回当前注入的妙想客户端（未配置时为 nil）。
+//
+// 供 server 把「当前」client 传给 Engine 的 vars 构造器：那些构造器不走
+// MarketToolSet，而是直接拿 client 预取数据。传快照会让凭证页保存后不生效
+// （见 server.Engine.SetMXClientFunc 的注释）。
+func (m *MarketToolSet) MXClient() *MXClient {
+	if m == nil {
+		return nil
+	}
+	if c := m.mx.Load(); c != nil && c.Configured() {
+		return c
+	}
+	return nil
+}
+
 // NewMarketToolSetWithCrypto 构造带 crypto 通道的工具集。
 //
 // 两个 client 都可为 nil —— builtinToolsByAgent() 用全 nil 的空壳读

@@ -746,6 +746,21 @@ func (s *Server) refreshComputeIndicatorDefaults() {
 	}
 }
 
+// withMXClient 把当前妙想客户端放进 ctx（未配置时原样返回）。
+//
+// 抽出来是为了可测：注入逻辑藏在 runIntent 的几十行 ctx 拼装里时，
+// 「到底有没有注进去」只能靠跑真实任务观察，而那要等模型自己决定调不调工具。
+func (e *Engine) withMXClient(ctx context.Context) context.Context {
+	if e == nil || e.mxClientFn == nil {
+		return ctx
+	}
+	mx := e.mxClientFn()
+	if mx == nil {
+		return ctx
+	}
+	return agent.WithMXClient(ctx, mx)
+}
+
 // marketClientForIntent 按 intent 所属标的的市场选行情客户端。
 //
 // 为什么在 engine 层做而不是 Worker 里：Worker 是执行器，「用哪个 client」
@@ -776,6 +791,24 @@ func (e *Engine) marketClientForIntent(intent *db.Node) agent.MarketClient {
 // 不调用 = 全部 nil，vars 构造器走 stub 分支（「数据未接入」的说明）。
 func (e *Engine) SetMarketClients(market, crypto agent.MarketClient) {
 	e.marketCl, e.cryptoCl = market, crypto
+}
+
+// SetMXClientFunc 注入「取当前妙想客户端」的函数。
+//
+// # 为什么传函数而不是传 *MXClient（2026-11-09 事故）
+//
+// 妙想 key 存在 MarketToolSet 里，凭证页保存时热更新（refreshMXClientIfNeeded）。
+// 若这里传的是启动那一刻的实例（或 nil），之后页面上配好 key 也不会生效 ——
+// 而 agent 看到的 `.MXData` 仍是「通道未启用」。
+//
+// 更糟的是这个失效**没有任何报错**：vars 构造器拿不到 client 就返回
+// notWiredMX 文案，分析师据此在 data_gaps 里写「MX_APIKEY 未配置」，
+// planner 读到这条 fact 就把整个美股基本面方向判成 dead end 跳过 ——
+// 一次纯粹的装配遗漏，最后表现为「模型自己放弃了」。
+//
+// 传函数让每次构造 vars 都现取，天然跟随热注入。
+func (e *Engine) SetMXClientFunc(f func() *agent.MXClient) {
+	e.mxClientFn = f
 }
 
 // SetExecAccount 给 Engine 注入默认下单账户。

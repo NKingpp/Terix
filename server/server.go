@@ -285,6 +285,14 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// Engine 也需要 client —— 它给 W5 金融角色的 vars 构造器取数
 		// （vars 构造器要自己取数才能保证 snapshot_id 与 .Bars 同源）。
 		s.engine.SetMarketClients(s.marketCl, s.cryptoCl)
+		// 妙想 client 也要给 Engine —— analyst_fundamental / analyst_news 的
+		// vars 构造器靠它预取 .MXData / .MXNews。不注入的话这两个字段永远是
+		// 「通道未启用」，分析师把这句话写进 data_gaps，planner 再把整个方向
+		// 判成 dead end（2026-11-09 任务 #6）。
+		//
+		// 传函数而不是实例：mts 里的 client 会被凭证页保存热更新，
+		// 快照会让「配好 key 但仍报未启用」复现。
+		s.engine.SetMXClientFunc(mts.MXClient)
 		// 默认下单账户：trader 建草案/过闸需要 account_id。
 		//
 		// 选 active=true 的第一条。没有就不注入 —— trader 会只产信号

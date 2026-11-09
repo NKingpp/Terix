@@ -98,6 +98,13 @@ type Engine struct {
 	marketCl agent.MarketClient
 	cryptoCl agent.MarketClient
 
+	// mxClientFn 返回**当前**的妙想客户端（可能为 nil）。
+	//
+	// 传函数而不是实例：妙想 key 在凭证页保存时会热更新 MarketToolSet 里的 client，
+	// 存实例就会让「配好 key 但 vars 仍报未启用」这个 2026-11-09 的问题复现。
+	// 见 SetMXClientFunc 的注释。
+	mxClientFn func() *agent.MXClient
+
 	// execAccount 是默认下单账户（供 trader 的 vars 构造器取 account_id）。
 	// 零值 = 未装配 → trader 只产信号、不建草案（见 SetExecAccount 注释）。
 	execAccount agent.ExecAccount
@@ -1037,6 +1044,13 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// 渗透 intent 走不到这条路径（payload 里没有 role），所以这次注入对渗透
 	// 任务无影响 —— vars 构造器只是多了一个 ctx value，没人读它。
 	workCtx = agent.WithMarketClient(workCtx, e.marketClientForIntent(intent))
+	// 妙想 client：analyst_fundamental / analyst_news 的 vars 构造器靠它预取
+	// `.MXData` / `.MXNews`。不注入了话这两个字段永远是「通道未启用」，
+	// 而分析师会把那句话写进 data_gaps —— planner 再据此把美股基本面
+	// 判成 dead end（2026-11-09 任务 #6 的成因）。
+	//
+	// 取的是「当前」实例（函数而非快照），这样凭证页保存后立刻生效。
+	workCtx = e.withMXClient(workCtx)
 	// 下单账户：trader 的 vars 构造器要 account_id（authorize_order 必填）。
 	// 零值时 ExecAccountFrom 返回 false，trader 只产信号不建草案。
 	//
