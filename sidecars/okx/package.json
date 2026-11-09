@@ -1,0 +1,9 @@
+{
+  "name": "artex-okx-cli",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Project-local OKX trade CLI runtime (pinned to the version ARTEX was tested against)",
+  "dependencies": {
+    "@okx_ai/okx-trade-cli": "1.4.8"
+  }
+}

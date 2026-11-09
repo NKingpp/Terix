@@ -1,0 +1,137 @@
+- generic [ref=e4]:
+  - generic [ref=e5]:
+    - generic [ref=e6]:
+      - text: Alpaca and selected third parties use cookies on this website as specified in the
+      - link "cookie policy" [ref=e7] [cursor=pointer]:
+        - /url: https://files.alpaca.markets/disclosures/CookiePolicy.pdf
+      - text: . You accept the use of these cookies or other identifiers by pressing 'Accept', closing this notice, or logging into your account.
+    - button "Accept cookies" [ref=e9] [cursor=pointer]: Accept
+  - generic [ref=e11]:
+    - generic [ref=e14]:
+      - img "Alpaca" [ref=e15]
+      - generic [ref=e23]:
+        - generic [ref=e24]:
+          - heading "Create Your Trading API Account" [level=1] [ref=e26]
+          - generic [ref=e27]:
+            - generic [ref=e28]:
+              - generic [ref=e30]:
+                - generic [ref=e31]: First Name
+                - textbox "First Name" [ref=e33]:
+                  - /placeholder: John
+                - paragraph [aria-hidden] [ref=e34]
+              - generic [ref=e36]:
+                - generic [ref=e37]: Last Name
+                - textbox "Last Name" [ref=e39]:
+                  - /placeholder: Doe
+                - paragraph [aria-hidden] [ref=e40]
+            - generic [ref=e43]:
+              - generic [ref=e44]: Country of Tax Residence
+              - generic [ref=e46]:
+                - combobox "Country of Tax Residence" [ref=e47]
+                - button [ref=e48] [cursor=pointer]
+              - paragraph [aria-hidden] [ref=e51]
+            - generic [ref=e53]:
+              - generic [ref=e54]: Email
+              - textbox "Email" [ref=e56]:
+                - /placeholder: john.doe@example.com
+              - paragraph [aria-hidden] [ref=e57]
+            - generic [ref=e59]:
+              - generic [ref=e60]: Password
+              - generic [ref=e61]:
+                - textbox "Password" [ref=e62]:
+                  - /placeholder: ••••••••••••
+                - img [aria-hidden] [ref=e63] [cursor=pointer]
+              - paragraph [aria-hidden] [ref=e65]
+            - generic [ref=e68]:
+              - generic [ref=e69]: How did you hear about us?
+              - button "How did you hear about us? Select an option" [ref=e70] [cursor=pointer]:
+                - generic [ref=e71]: Select an option
+              - paragraph [aria-hidden] [ref=e76]
+            - button "Sign up" [disabled] [ref=e77]
+        - generic [ref=e78]:
+          - paragraph [ref=e79]: Already have an account? Sign in
+          - generic [ref=e80]:
+            - paragraph [ref=e81]: Having trouble? Contact support
+            - paragraph [ref=e82]: Browse our Docs for use cases, sample code, and how to get started.
+    - generic [ref=e84]:
+      - generic [ref=e85]:
+        - heading "Easy to Use, Developer-First API" [level=2] [ref=e86]
+        - paragraph [ref=e87]: Build, backtest and deploy your strategy across thousands of stocks, ETFs, options, and crypto with Trading API.
+      - generic [ref=e88]:
+        - heading "Commission-Free Trading for Retail Investors" [level=2] [ref=e89]
+        - paragraph [ref=e90]: Trade stocks, ETFs, and options with zero commissions using our powerful API and Web Dashboard.
+      - generic [ref=e91]:
+        - heading "Advanced Algorithmic Trading for Institutional Investors" [level=2] [ref=e92]
+        - paragraph [ref=e93]: Elevate your trading experience with our cost-effective solutions. Benefit from ultra-low 1.5ms latency, dedicated white-glove support, and a full suite of advanced order types.
+      - generic [ref=e94]:
+        - heading "Real-time Market Data" [level=2] [ref=e95]
+        - paragraph [ref=e96]: Real-time and historical market data for both paper and live trading. Trade smarter with a complete view of the market.
+      - paragraph [ref=e97]: Want to build a trading app on top of our APIs? Head over to Broker API
+  - contentinfo [ref=e99]:
+    - generic [ref=e101]:
+      - generic [ref=e102]:
+        - generic [ref=e103]:
+          - generic [ref=e104]:
+            - generic [ref=e105]:
+              - heading "Developers" [level=2] [ref=e106]
+              - link "API Docs" [ref=e107] [cursor=pointer]:
+                - /url: https://alpaca.markets/docs/
+              - link "Slack" [ref=e108] [cursor=pointer]:
+                - /url: https://alpaca.markets/slack
+              - link "Forum" [ref=e109] [cursor=pointer]:
+                - /url: https://forum.alpaca.markets/
+              - link "Learn" [ref=e110] [cursor=pointer]:
+                - /url: https://alpaca.markets/learn/
+              - link "GitHub" [ref=e111] [cursor=pointer]:
+                - /url: https://github.com/alpacahq
+              - link "API Status" [ref=e112] [cursor=pointer]:
+                - /url: http://status.alpaca.markets/
+            - generic [ref=e113]:
+              - heading "About Us" [level=2] [ref=e114]
+              - link "Story" [ref=e115] [cursor=pointer]:
+                - /url: https://techcrunch.com/2021/08/30/alpaca-raises-50m-to-rapidly-scale-its-equities-trading-api-business
+              - link "Newsletter" [ref=e116] [cursor=pointer]:
+                - /url: https://eepurl.com/g0K5k9
+              - link "Blog" [ref=e117] [cursor=pointer]:
+                - /url: https://alpaca.markets/blog/
+              - link "Contact" [ref=e118] [cursor=pointer]:
+                - /url: https://alpaca.markets/contact
+              - link "We're hiring!" [ref=e119] [cursor=pointer]:
+                - /url: https://alpaca.markets/hiring
+            - generic [ref=e120]:
+              - heading "Disclosures" [level=2] [ref=e121]
+              - link "Disclosure Library" [ref=e122] [cursor=pointer]:
+                - /url: https://alpaca.markets/disclosures
+              - link "Form CRS" [ref=e123] [cursor=pointer]:
+                - /url: https://files.alpaca.markets/disclosures/library/FormCRS.pdf
+              - link "Form CRS Responses to Conversion Starters" [ref=e124] [cursor=pointer]:
+                - /url: https://files.alpaca.markets/disclosures/library/FormCRSConvStrtrs.pdf
+              - link "Privacy Policy" [ref=e125] [cursor=pointer]:
+                - /url: https://s3.amazonaws.com/files.alpaca.markets/disclosures/PrivacyPolicy.pdf
+              - link "Cookie Policy" [ref=e126] [cursor=pointer]:
+                - /url: https://s3.amazonaws.com/files.alpaca.markets/disclosures/CookiePolicy.pdf
+              - link "Terms & Conditions" [ref=e127] [cursor=pointer]:
+                - /url: https://s3.amazonaws.com/files.alpaca.markets/disclosures/library/TermsAndConditions.pdf
+          - generic [ref=e128]:
+            - link "LinkedIn" [ref=e129] [cursor=pointer]:
+              - /url: https://www.linkedin.com/company/9300556/
+              - generic [aria-hidden] [ref=e130]: 
+            - link "GitHub" [ref=e132] [cursor=pointer]:
+              - /url: https://github.com/alpacahq
+              - generic [aria-hidden] [ref=e133]: 
+            - link "Slack" [ref=e135] [cursor=pointer]:
+              - /url: https://alpaca.markets/slack
+              - generic [aria-hidden] [ref=e136]: 
+        - paragraph [ref=e138]:
+          - text: © 2026 AlpacaDB, Inc. All rights reserved.© 2026 Alpaca Securities LLC All rights reserved.© 2026 Alpaca Crypto LLC All rights reserved. Securities Brokerage services are provided by Alpaca Securities , member
+          - link "FINRA" [ref=e139] [cursor=pointer]:
+            - /url: https://www.finra.org/
+          - text: /
+          - link "SIPC" [ref=e140] [cursor=pointer]:
+            - /url: https://www.sipc.org/
+          - text: ",a wholly-owned subsidiary of AlpacaDB, Inc. Technology and services are offered by AlpacaDB, Inc. Cryptocurrency services are made available by Alpaca Crypto LLC (\"Alpaca Crypto\"), a FinCEN registered money services business (NMLS # 2160858), and a wholly-owned subsidiary of AlpacaDB, Inc. Alpaca Crypto is not a member of SIPC or FINRA. Cryptocurrencies are not stocks and your cryptocurrency investments are not protected by either FDIC or SIPC. Depending on your location, cryptocurrency services may be provided by West Realm Shires Services, Inc. Please see the"
+          - link "Disclosure Library" [ref=e141] [cursor=pointer]:
+            - /url: https://alpaca.markets/disclosures
+          - text: for more information. This is not an offer, solicitation of an offer, or advice to buy or sell securities or cryptocurrencies, or open a brokerage account or cryptocurrency account in any jurisdiction where Alpaca Securities, Alpaca Crypto, are not registered or licensed, as applicable.
+      - paragraph [ref=e143]: View important disclosures
+  - region "Notifications Alt+T"

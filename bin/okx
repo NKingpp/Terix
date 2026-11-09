@@ -1,0 +1,22 @@
+#!/bin/sh
+# ARTEX 项目自带的 OKX CLI 入口。
+# Go 后端用 exec.LookPath("okx") 找它；start.sh / dev.sh 会把 bin/ 放进 PATH。
+# CLI 本体在 sidecars/okx/node_modules，随附的官方二进制在 sidecars/okx/bin。
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+CLI="$ROOT/sidecars/okx/node_modules/@okx_ai/okx-trade-cli/dist/index.js"
+if [ ! -f "$CLI" ]; then
+	echo "okx CLI 未安装：缺少 $CLI（在 sidecars/okx 执行 npm install）" >&2
+	exit 127
+fi
+
+# CLI 默认去 ~/.okx/bin 找这两个二进制，这里改指向项目内随附的副本。
+: "${OKX_PILOT_BINARY_PATH:=$ROOT/sidecars/okx/bin/okx-pilot}"
+: "${OKX_AUTH_BIN:=$ROOT/sidecars/okx/bin/okx-auth}"
+export OKX_PILOT_BINARY_PATH OKX_AUTH_BIN
+
+if [ -n "${NODE:-}" ] && [ -x "$NODE" ]; then
+	exec "$NODE" "$CLI" "$@"
+fi
+exec node "$CLI" "$@"

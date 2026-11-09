@@ -1,0 +1,254 @@
+// Package db 是 ARTEX 的数据访问层（SQLite）。
+//
+// 它打开库文件、应用 schema、seed 内置数据，并在写锁竞争时自动重试。
+//
+// # 与 PostgreSQL 版的三个关键差异
+//
+//  1. 没有"建库"步骤：SQLite 的库就是一个文件，只需建父目录。
+//  2. schema 与 seed 在**同一个**事务里：单写者模型下，schema 事务持锁期间
+//     任何走连接池的写入都会等满 busy_timeout 然后报 BUSY。
+//  3. 没有 advisory lock：BEGIN IMMEDIATE 本身就是跨进程互斥。
+//
+// 并发模型、事务时长的约束与应对见 docs/quantex/ARCH-SQLite-Migration.md §6.4。
+package db
+
+import (
+	"context"
+	"database/sql"
+	_ "embed"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/Autumn-27/artex/config"
+	_ "modernc.org/sqlite" // driver name is "sqlite"
+)
+
+//go:embed schema_sqlite.sql
+var schemaSQL string
+
+const (
+	// maxOpenConns 是连接池上限。
+	//
+	// 为什么不是 1：SQLite 虽是单写者，但 MaxOpenConns(1) + 持有一条 *sql.Conn
+	// 再走池会**死锁**（实测：Go runtime 直接 "all goroutines are asleep"）。
+	// 而启动期正是"握事务做 schema、seed 里再要连接"的模式。
+	//
+	// 为什么不是 2：schema 事务 + seed 各占一条刚好用满，任何嵌套就挂。
+	// 取 8 留余量；WAL 下读并发不受限，写靠 busy_timeout 排队。
+	maxOpenConns = 8
+
+	// busyRetryDelays 是 BUSY 重试次数。
+	busyRetryDelays = 4
+)
+
+// schemaBusyRetryDelays 是退避序列。
+//
+// busy_timeout 已经承担"等锁"的主要工作，这里的重试只作临界抖动兜底。
+var schemaBusyRetryDelays = [...]time.Duration{
+	100 * time.Millisecond,
+	250 * time.Millisecond,
+	500 * time.Millisecond,
+	time.Second,
+}
+
+// execer 是 *DB 与 *sql.Tx 的公共子集。
+//
+// seed 函数与 schema 应用都通过它取连接 —— 这样"schema + seed 同一事务"才成立。
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// DB wraps the shared *sql.DB.
+//
+// SQLite 是单写者模型：同一时刻只有一个写事务。读不受限（WAL）。
+// 事务要短、IO 移出事务、BUSY 要重试 —— 详见 ARCH-SQLite-Migration.md §6.4。
+type DB struct {
+	*sql.DB
+
+	path string // 库文件绝对路径，供日志与备份用
+}
+
+// DSN 报告当前数据库位置。
+//
+// 保留函数名（原 PG 版返回连接串）以不动 server/manager.go 的调用点。
+// SQLite 没有连接串，返回的是库文件路径；source 说明它从哪来。
+func DSN() (dsn, source string, err error) {
+	path, src, err := config.DBPath()
+	if err != nil {
+		return "", "", err
+	}
+	return path, src, nil
+}
+
+// Path 返回库文件绝对路径（供日志、备份、诊断）。
+func (d *DB) Path() string { return d.path }
+
+// Open 打开（必要时创建）SQLite 库，应用 schema，然后 seed。
+//
+// pathOrDSN 可以是库文件路径，也可以是已拼好的 DSN（BuildDSN 的产物）。
+func Open(pathOrDSN string) (*DB, error) {
+	dsn, path := resolveDSN(pathOrDSN)
+	if err := ensureDataDir(path); err != nil {
+		return nil, err
+	}
+
+	sqlDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("打开 sqlite（%s）: %w", path, err)
+	}
+	sqlDB.SetMaxOpenConns(maxOpenConns)
+	sqlDB.SetMaxIdleConns(maxOpenConns)
+	// 本地文件库没有中间件会断连，不需要生命周期上限。
+	sqlDB.SetConnMaxLifetime(0)
+	sqlDB.SetConnMaxIdleTime(0)
+
+	if err := sqlDB.Ping(); err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("连接 sqlite（%s）: %w", path, err)
+	}
+
+	d := &DB{DB: sqlDB, path: path}
+	if err := d.initSchemaAndSeed(); err != nil {
+		sqlDB.Close()
+		return nil, err
+	}
+	return d, nil
+}
+
+// initSchemaAndSeed 在**一个** BEGIN IMMEDIATE 事务里跑完 schema + 全部 seed。
+//
+// 为什么必须同一个事务：
+//   - 单写者下 schema 事务持有写锁期间，任何走连接池的写入都会等满
+//     busy_timeout 然后失败（实测 5s 后 database is locked）。
+//   - BEGIN IMMEDIATE 直接拿 RESERVED 锁，天然把并发启动的第二个实例挡在门外
+//     （不需要 advisory lock）。
+func (d *DB) initSchemaAndSeed() error {
+	tx, err := d.Begin()
+	if err != nil {
+		return fmt.Errorf("开启 schema 事务: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // 提交成功后是 no-op
+
+	if err := applySchemaWithRetry(context.Background(), tx); err != nil {
+		return fmt.Errorf("应用 schema: %w", err)
+	}
+
+	// seed 顺序即依赖顺序：agents 必须先建，agent_prompt_vars 才有 agent_id。
+	steps := []struct {
+		name string
+		fn   func(execer) error
+	}{
+		{"builtins", seedBuiltins},
+		{"draft rules", seedDraftRules},
+	}
+	for _, s := range steps {
+		if err := s.fn(tx); err != nil {
+			return fmt.Errorf("seed %s: %w", s.name, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交 schema + seed: %w", err)
+	}
+	return nil
+}
+
+// applySchemaWithRetry 执行 schema 脚本，遇 BUSY 时退避重试。
+//
+// 注意必须由 tx 驱动：单次 Exec 可含多语句但**不在同一事务内**，
+// 中途失败会留下半套表（实测）。所以 schema 由调用方开事务。
+func applySchemaWithRetry(ctx context.Context, e execer) error {
+	for attempt := 0; ; attempt++ {
+		_, err := e.Exec(schemaSQL)
+		if err == nil {
+			return nil
+		}
+		if !isBusyFn(err) || attempt >= len(schemaBusyRetryDelays) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(schemaBusyRetryDelays[attempt]):
+		}
+	}
+}
+
+// coordinateWithSchemaMigration 是 PG 版遗留的"长事务与启动 DDL 互斥"钩子。
+//
+// SQLite 单写者模型下不需要：写事务之间本来就互斥。保留空实现让既有调用点
+// （task_archives / task_archives_restore / commands / llm_usage）不用改。
+func coordinateWithSchemaMigration(tx *sql.Tx) error { return nil }
+
+// ---------------------------------------------------------------------------
+// BUSY 重试包装
+// ---------------------------------------------------------------------------
+
+// Exec 在遇到 SQLITE_BUSY 时自动退避重试。
+//
+// 为什么需要：busy_timeout 只在"等锁"阶段生效；BEGIN IMMEDIATE 阶段撞锁
+// 会直接返回 BUSY。现状代码没有重试，迁移后会偶发"随机失败"。
+func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
+	var res sql.Result
+	err := d.withBusyRetry(func() error {
+		var e error
+		res, e = d.DB.Exec(query, args...)
+		return e
+	})
+	return res, err
+}
+
+// Query 在遇到 SQLITE_BUSY 时自动退避重试。
+func (d *DB) Query(query string, args ...any) (*sql.Rows, error) {
+	var rows *sql.Rows
+	err := d.withBusyRetry(func() error {
+		var e error
+		rows, e = d.DB.Query(query, args...)
+		return e
+	})
+	return rows, err
+}
+
+// QueryRow 在遇到 SQLITE_BUSY 时自动退避重试。
+//
+// QueryRow 的错误延迟到 Scan 才暴露，所以这里只能重试"取行句柄"阶段；
+// Scan 阶段的 BUSY 实际几乎不会发生（取行时已拿到锁）。
+func (d *DB) QueryRow(query string, args ...any) *sql.Row {
+	var row *sql.Row
+	_ = d.withBusyRetry(func() error {
+		row = d.DB.QueryRow(query, args...)
+		return nil
+	})
+	return row
+}
+
+// withBusyRetry 执行 fn，遇 BUSY 时按退避序列重试。
+func (d *DB) withBusyRetry(fn func() error) error {
+	var err error
+	for attempt := 0; attempt <= busyRetryDelays; attempt++ {
+		err = fn()
+		if err == nil || !isBusyFn(err) {
+			return err
+		}
+		if attempt == busyRetryDelays {
+			break
+		}
+		idx := attempt
+		if idx >= len(schemaBusyRetryDelays) {
+			idx = len(schemaBusyRetryDelays) - 1
+		}
+		time.Sleep(schemaBusyRetryDelays[idx])
+	}
+	return err
+}
+
+var (
+	_ = errors.Is
+	_ = strings.TrimSpace
+	_ = slog.Warn
+)
