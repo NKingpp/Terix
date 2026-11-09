@@ -91,6 +91,15 @@ type MarketToolSet struct {
 	// （见 server 的 refreshMXClientIfNeeded），而 worker 线程同时在读。
 	// 裸字段在这里是实打实的数据竞争。
 	mx atomic.Pointer[MXClient]
+
+	// account 是交易账户读取通道（余额/资产）。nil 表示未装配 ——
+	// 工具仍注册，调用时返回明确的「未配置」。
+	//
+	// # 为什么单独一个字段而不是并进 crypto
+	//
+	// 行情公开、账户私有（见 market_client.go 的 AccountClient 注释）。
+	// 合成一个接口会让「行情可用」被误读成「凭证有效」。
+	account AccountClient
 }
 
 // NewMarketToolSet 构造工具集（只用默认通道）。
@@ -121,6 +130,16 @@ func (m *MarketToolSet) SetMXClient(c *MXClient) {
 	}
 	m.mx.Store(c)
 }
+
+// SetAccountClient 注入交易账户读取通道（余额）。
+//
+// 不调用 = get_account_balance 返回「未配置」。不 panic、不报错：
+// 未装配是可诊断状态，由工具 handler 给出明确错误。
+//
+// 与 SetMXClient 一样可在运行期调用（凭证变更后重建 client），故不加锁 ——
+// AccountClient 本身是 *OkxClient，内部用 credMu 保护凭证，替换指针的场景
+// 只有启动装配与凭证刷新，而刷新走的是 OkxClient.SetCredential 而不是替换实例。
+func (m *MarketToolSet) SetAccountClient(c AccountClient) { m.account = c }
 
 // NewMarketToolSetWithCrypto 构造带 crypto 通道的工具集。
 //
@@ -158,6 +177,7 @@ func (m *MarketToolSet) Tools() []actool.CoreTool {
 		m.getMacro(),
 		m.getVolatility(),
 		m.getCryptoFlow(),
+		m.getAccountBalance(), // 交易账户余额（需凭证，见 tools_account_balance.go）
 		m.getIndicatorOkx(), // 服务端指标（需 OKX 网络）
 		m.getNews(),         // 新闻（只走 akshare，见 market_news.go）
 		m.getFundamentals(), // 财报（只走 akshare，仅 A 股）

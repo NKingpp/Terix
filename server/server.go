@@ -277,6 +277,10 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// 金融工具装配：MarketToolSet 需要真实的 client + DB（后者让 snapshot 落库生效）。
 		// 这里复用 Server 已在 New() 里构造好的三个客户端，避免重复建连。
 		mts := agent.NewMarketToolSetWithCryptoAndFlow(s.marketCl, s.cryptoCl, s.cryptoFlow)
+		// 交易账户通道（余额）。与行情分开注入了两次，因为它们是两个接口 ——
+		// 行情公开、账户私有，混用会让「行情通」被误读成「凭证有效」。
+		// 这里传的是同一个 *OkxClient 实例：凭证由它内部的 cred 提供。
+		mts.SetAccountClient(s.okxCli)
 		s.mts = mts
 		// Engine 也需要 client —— 它给 W5 金融角色的 vars 构造器取数
 		// （vars 构造器要自己取数才能保证 snapshot_id 与 .Bars 同源）。

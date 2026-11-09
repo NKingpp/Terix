@@ -133,17 +133,28 @@ func builtinToolsByAgent() map[string][]actool.CoreTool {
 		"debate_bear": {ts.listFacts(), ts.listThesis(), ts.emitThesis()},
 		// research_manager: list_facts list_thesis emit_thesis
 		"research_manager": {ts.listFacts(), ts.listThesis(), ts.emitThesis()},
-		// trader: get_quote mx_query list_thesis emit_signal
+		// trader: get_quote mx_query get_account_balance list_thesis emit_signal
 		//
 		// mx_query 用于确认最新价/涨跌幅口径（交易员下单前要一个可复核的最新数），
 		// 但不给它 emit_fact —— 交易员产出的是 signal，不是事实。
-		"trader": {mts.getQuote(), mts.mxQuery(), ts.listThesis(), ts.emitSignal()},
+		//
+		// get_account_balance：算仓位必须有余额。2026-11-09 的任务里这一项缺失，
+		// 导致 agent 只能开 shell 摸 CLI、看到 env 为空就误判「未登录」。
+		// 它同时是唯一能真正验证交易凭证的工具（行情类走公开接口不需要凭证）。
+		"trader": {
+			mts.getQuote(), mts.mxQuery(), mts.getAccountBalance(),
+			ts.listThesis(), ts.emitSignal(),
+		},
 		// risk_*: list_thesis list_facts emit_thesis
 		"risk_aggressive":   {ts.listThesis(), ts.listFacts(), ts.emitThesis()},
 		"risk_neutral":      {ts.listThesis(), ts.listFacts(), ts.emitThesis()},
 		"risk_conservative": {ts.listThesis(), ts.listFacts(), ts.emitThesis()},
 		// portfolio_manager: list_facts list_thesis list_signals emit_rating
-		"portfolio_manager": {ts.listFacts(), ts.listThesis(), ts.listSignals(), ts.emitRating()},
+		//   + get_account_balance（组合层面要按总权益算目标收益与仓位上限）
+		"portfolio_manager": {
+			ts.listFacts(), ts.listThesis(), ts.listSignals(), ts.emitRating(),
+			mts.getAccountBalance(),
+		},
 	}
 }
 

@@ -230,6 +230,19 @@ var marketToolMetas = map[string]marketToolMeta{
 		SourceKind: SourceRealtime,
 	},
 
+	"get_account_balance": {
+		// 交易账户资产。**唯一需要有效凭证的金融工具** ——
+		// 行情类全部走公开接口，取不到余额不可能是「行情挂了」。
+		//
+		// AssetClasses 列全 4 种：账户本身不分资产类别（一个 OKX 账户
+		// 同时能交易 crypto 与 tokenized 资产），限权在通道层。
+		AssetClasses: []string{"stock", "etf", "index", "crypto"},
+		Channels:     []Channel{ChannelOKX},
+		Timeout:      15 * time.Second,
+		// realtime：余额是当下快照，没有历史版本，不能用于回测重放。
+		SourceKind: SourceRealtime,
+	},
+
 	// ── 东方财富妙想（MX Skills）───────────────────────────────────────
 	//
 	// 两个工具都是**自然语言问句**接口：入参是一句中文问句，不是 symbol+period。

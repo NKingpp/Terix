@@ -707,6 +707,111 @@ func (c *OkxClient) FetchIndicator(ctx context.Context, in IndicatorQuery) (*Ind
 	return parseOkxIndicator(raw, indicator, symbol, bar, in.BacktestTime)
 }
 
+// FetchBalance 用 `okx account balance --json` 取交易账户资产。
+//
+// # 这是**唯一**能证明交易凭证有效的调用
+//
+// 行情接口（`okx market ticker`）不需要任何凭证 —— 实测无凭证也能返回实时价。
+// 所以「行情通了」绝不能当成「凭证有效」。而 `account balance` 必须带
+// 有效 API key/secret/passphrase 签名，无凭证直接
+// `okx-auth rejected the caller (unauthorized)`。
+//
+// 凭证来自 OkxClient 注入的 cred（凭证页 → market_credentials 表），
+// 由 run() 作为 OKX_API_KEY / OKX_SECRET_KEY / OKX_PASSPHRASE 传给 CLI 子进程。
+//
+// 响应形状（实测 2026-11）：数组，只取第一个账户。每个 details[] 是一个币种。
+func (c *OkxClient) FetchBalance(ctx context.Context) (*AccountBalance, error) {
+	raw, err := c.run(ctx, "account", "balance")
+	if err != nil {
+		return nil, err
+	}
+	return parseAccountBalance(raw)
+}
+
+// parseAccountBalance 解析 `okx account balance --json` 的输出。
+//
+// 与 FetchBalance 分开是为了可测：没有真凭证时也能验证解析与
+// 「只留非零币种」的过滤逻辑（见 tools_account_balance_test.go）。
+func parseAccountBalance(raw []byte) (*AccountBalance, error) {
+	body := trimToJSON(raw)
+	var outer []struct {
+		TotalEq string `json:"totalEq"`
+		AdjEq   string `json:"adjEq"`
+		Upl     string `json:"upl"`
+		UTime   string `json:"uTime"`
+		Details []struct {
+			Ccy       string `json:"ccy"`
+			Eq        string `json:"eq"`
+			CashBal   string `json:"cashBal"`
+			AvailBal  string `json:"availBal"`
+			FrozenBal string `json:"frozenBal"`
+			EqUsd     string `json:"eqUsd"`
+		} `json:"details"`
+	}
+	if err := json.Unmarshal(body, &outer); err != nil {
+		return nil, &MarketError{
+			Code:      "OKX_PARSE_FAILED",
+			Message:   fmt.Sprintf("解析 account balance 失败: %v (raw=%s)", err, snippet(body)),
+			Channel:   ChannelOKX,
+			Retryable: true,
+		}
+	}
+	if len(outer) == 0 {
+		return nil, &MarketError{
+			Code:      "OKX_NO_DATA",
+			Message:   "account balance 返回空数组（账户无资产或凭证无该账户权限）",
+			Channel:   ChannelOKX,
+			Retryable: false,
+		}
+	}
+	r := outer[0]
+	out := &AccountBalance{
+		TotalEq:    r.TotalEq,
+		AdjustedEq: r.AdjEq,
+		Upl:        r.Upl,
+		UpdateTime: r.UTime,
+	}
+	// 只保留真正有余额的币种：OKX 会把账户支持的所有币种都列出来，
+	// 绝大多数是 0。全返回会让模型以为「持有 200 种币」。
+	for _, d := range r.Details {
+		if isZeroAmount(d.Eq) && isZeroAmount(d.CashBal) && isZeroAmount(d.AvailBal) {
+			continue
+		}
+		out.Currencies = append(out.Currencies, CurrencyBalance{
+			Ccy:       d.Ccy,
+			Eq:        d.Eq,
+			CashBal:   d.CashBal,
+			AvailBal:  d.AvailBal,
+			FrozenBal: d.FrozenBal,
+			EqUsd:     d.EqUsd,
+		})
+	}
+	return out, nil
+}
+
+// isZeroAmount 判断金额字符串是否可视为 0（空串或 "0" / "0.0" / "0.000"）。
+//
+// 不用 float 解析：金额精度是铁律（见 FundingRate 的注释），
+// 这里只需要「是不是全 0」，去掉小数点与前后空格后全是 '0' 即可。
+func isZeroAmount(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return true
+	}
+	neg := false
+	if s[0] == '-' || s[0] == '+' {
+		neg, s = s[0] == '-', s[1:]
+	}
+	for _, r := range s {
+		if r != '0' && r != '.' {
+			// 任意一个非 0 数字 → 非零。-0.0 仍算 0。
+			return false
+		}
+	}
+	_ = neg
+	return true
+}
+
 // parseOkxIndicator 解析 OKX indicator 的嵌套响应。
 //
 // 响应形状（实测，2026-10）：

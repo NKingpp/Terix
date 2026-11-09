@@ -208,12 +208,15 @@ func TestFinancialToolBindingsMatchSpec(t *testing.T) {
 		// 用户要求「通过工具实现下单，否则后面无法进行拦截」。
 		// 交易员负责「提案 + 过闸」，**不给 execute_paper_order** —— 执行权留在用户侧。
 		// 这是规格变更（不是实现漂移），所以同步更新这张对照表。
+		// 2026-11-09 新增 get_account_balance：任务目标是「使用全部账户余额」，
+		// 没有余额工具就无法算仓位（任务 #4 因此卡住）。这也是规格变更。
 		"trader": {"get_quote", "mx_query", "list_thesis", "emit_signal",
-			"create_order_draft", "authorize_order"},
+			"create_order_draft", "authorize_order", "get_account_balance"},
 		"risk_aggressive":   {"list_thesis", "list_facts", "emit_thesis"},
 		"risk_neutral":      {"list_thesis", "list_facts", "emit_thesis"},
 		"risk_conservative": {"list_thesis", "list_facts", "emit_thesis"},
-		"portfolio_manager": {"list_facts", "list_thesis", "list_signals", "emit_rating"},
+		// portfolio_manager 同样需要余额：按总权益折算目标收益与仓位上限。
+		"portfolio_manager": {"list_facts", "list_thesis", "list_signals", "emit_rating", "get_account_balance"},
 	}
 	if len(financialToolBindings) != len(want) {
 		t.Errorf("角色数 = %d, want %d", len(financialToolBindings), len(want))

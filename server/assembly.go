@@ -538,11 +538,20 @@ var financialToolBindings = map[string]toolBinding{
 	},
 	"trader": {
 		Tools: []string{"get_quote", "mx_query", "list_thesis", "emit_signal",
-			"create_order_draft", "authorize_order"},
+			"create_order_draft", "authorize_order", "get_account_balance"},
 		Notes: map[string]string{
 			"list_thesis": "读 research_manager 的裁决（含 conclusion 与 confidence），作为发信号的唯一依据",
 			"get_quote":   "确认最新价，判断信号的可执行性（不重新分析）",
 			"mx_query":    "下单前要一个可复核的最新价/涨跌幅口径（东财权威库）",
+			// 余额：算仓位必须先知道有多少钱。
+			//
+			// 2026-11-09 任务 #4 的教训：这个工具缺失时，agent 会开 shell 手摸
+			// `okx` CLI，看到进程 env 里 OKX_API_KEY 为空（凭证只注入给 CLI 子进程，
+			// 不进 server 进程环境），就去跑 `okx-auth status`，拿到 not_logged_in
+			// 并得出「交易账户未登录」的**错误结论** —— 而实际凭证一直是好的。
+			// 它同时也是**唯一**真正的凭证校验：行情类走公开接口，不需要凭证。
+			"get_account_balance": "算仓位前必须调它拿总权益与可用余额。取得到余额 = 凭证有效；" +
+				"报 UNAUTHORIZED 才是凭证问题（这与 okx-auth 的 OAuth 登录态无关，不要用 okx-auth status 判断）",
 			// ⚠️ 只给 trader 前两步，**不给 execute_paper_order**。
 			//
 			// 交易员的职责是「提出并论证一笔交易」，不是「自己拍板执行」。
@@ -571,11 +580,13 @@ var financialToolBindings = map[string]toolBinding{
 		},
 	},
 	"portfolio_manager": {
-		Tools: []string{"list_facts", "list_thesis", "list_signals", "emit_rating"},
+		Tools: []string{"list_facts", "list_thesis", "list_signals", "emit_rating", "get_account_balance"},
 		Notes: map[string]string{
 			"list_signals": "读 trader 的交易信号（结构化字段：direction/horizon/confidence）",
 			"list_thesis":  "读三方风控意见 + 研究裁决",
 			"emit_rating":  "唯一的评级写入者。若 trader 也能写评级，就成了「既提案又决定」",
+			// 组合层面的目标收益要按总权益折算（「赚 1000 USDT」需要知道本金）。
+			"get_account_balance": "按总权益算目标收益与本方案的可执行仓位上限",
 		},
 	},
 }
@@ -602,7 +613,12 @@ func (s *Server) seedFinancialToolBindings() {
 	// **必须 bump**：v2 在旧库上已置 true，不换 flag 名这段绑定对已部署的库
 	// 永远不生效 —— 而 prompt 里已经告诉模型「你有 mx_query」，它调用后会
 	// 因为 tools.agents 没绑而拿不到工具（ToolResolve 按 DB 过滤）。
-	const flag = "financial_tool_bindings_v5"
+	// v6（2026-11-09）：给 trader / portfolio_manager 补绑 get_account_balance。
+	//
+	// **必须 bump**：v5 在已部署的库上早已 true。不换 flag 名，
+	// 新工具永远绑不上 —— 而任务目标是「使用全部账户余额」，
+	// 拿不到余额就无法算仓位（2026-11-09 任务 #4 就卡在这里）。
+	const flag = "financial_tool_bindings_v6"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}

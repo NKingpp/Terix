@@ -148,6 +148,51 @@ type OpenInterest struct {
 }
 
 // ---------------------------------------------------------------------
+// 账户余额
+// ---------------------------------------------------------------------
+
+// AccountClient 读取交易账户资产。
+//
+// # 为什么必须与 MarketClient 分开
+//
+// 行情是**公开**的（`okx market ticker` 不需要任何凭证，实测可用），
+// 账户是**私有**的（`okx account balance` 无凭证直接 unauthorized）。
+// 把两者塞进一个接口，会让「行情可用」被误读成「凭证可用」——
+// 2026-11-09 任务 #4 就是这么翻车的：意图 #194 用 quote_okx + get_crypto_flow
+// 验证「OKX 凭据正常」，而这两个接口根本不需要凭据；真正需要凭据的
+// 余额接口当时没有任何工具可达，agent 只能去 shell 手摸，最终误判
+// 「未登录（not_logged_in）」。接口分开后，调用 AccountClient 就是
+// 一次真实的凭证校验 —— 拿得到余额，凭证必然有效。
+type AccountClient interface {
+	// FetchBalance 返回交易账户各币种余额。
+	FetchBalance(ctx context.Context) (*AccountBalance, error)
+}
+
+// AccountBalance 是交易账户资产快照。金额一律 string（NUMERIC 精度铁律）。
+type AccountBalance struct {
+	// TotalEq 是账户总权益（USD 计价），OKX 顶层字段 totalEq。
+	TotalEq string `json:"total_eq"`
+	// AdjustedEq 是有效保证金调整后权益，可能为空串（现货账户不返回）。
+	AdjustedEq string `json:"adjusted_eq,omitempty"`
+	// Upl 是未实现盈亏。
+	Upl string `json:"upl,omitempty"`
+	// UpdateTime 是快照时间（毫秒时间戳字符串）。
+	UpdateTime string `json:"update_time,omitempty"`
+	// Currencies 是按币种展开的明细，只保留有余额的（0 余额不返回）。
+	Currencies []CurrencyBalance `json:"currencies"`
+}
+
+// CurrencyBalance 是单币种的余额明细。
+type CurrencyBalance struct {
+	Ccy       string `json:"ccy"`
+	Eq        string `json:"eq"`         // 折算成「该币种」的权益
+	CashBal   string `json:"cash_bal"`   // 现金余额
+	AvailBal  string `json:"avail_bal"`  // 可用余额（能下单的部分）
+	FrozenBal string `json:"frozen_bal"` // 冻结（挂单占用）
+	EqUsd     string `json:"eq_usd"`     // 折算成 USD
+}
+
+// ---------------------------------------------------------------------
 // OKX 服务端技术指标
 // ---------------------------------------------------------------------
 
