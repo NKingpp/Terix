@@ -426,7 +426,24 @@ do sleep 2; done
 
 裸机部署时 ARTeX 与 sidecar 同机，两端的 `AKSHARE_SIDECAR_ADDR` 都用默认 `127.0.0.1:8791` 即可。systemd 托管时给 sidecar 单独一个 unit，并在主服务里加 `After=`。
 
-Windows venv 路径是 `Scripts/` 而非 `bin/`。**必须等 `warmup_done:true`**，端口通不等于可用（首次 `import akshare` / 预热可能几十秒）。东财 `*_em` 源被代码硬禁用，不要试图改配置启用。LLM 出网需代理时用 `ARTEX_LLM_PROXY`（或 `HTTP(S)_PROXY`）。
+Windows venv 路径是 `Scripts/` 而非 `bin/`。**必须等 `warmup_done:true`**，端口通不等于可用（首次 `import akshare` / 预热可能几十秒）。东财 `*_em` 源被代码硬禁用，不要试图改配置启用。
+
+#### 5.3 新闻源
+
+`get_news` 走 sidecar 的 `/news`，覆盖 `cn` / `us` / `hk`（**不支持 crypto**，加密的消息面用 `mx_news`）。
+
+| 场景 | 用哪个源 | 说明 |
+|---|---|---|
+| 带 `symbol` | 东财 `stock_news_em` **优先** | 唯一按代码精确取的源，六列齐全（标题/内容/时间/来源/链接） |
+| 带 `symbol`，东财不可用 | 降级到财新+财联社快照 | 用中文别名表匹配（英伟达/特斯拉…），见 `_SYMBOL_ALIASES` |
+| 不带 `symbol` | 财新 + 财联社全市场快照 | 40-100 条，适合看宏观/市场层面 |
+
+两个注意点：
+
+- **东财 `stock_news_em` 是 `FORBIDDEN_SOURCES` 的定点豁免**（`EM_EXEMPT`）。封禁针对的是行情接口（`hist`/`spot`，大表+分页）；这条是「按单代码取 10 条」，请求量小一个量级，2026-11-09 实测稳定可用。豁免不等于信任：它失败会**降级**到快照源，不会把「东财挂了」变成「这只票没新闻」。
+- **不要用原始代码去匹配中文新闻**。财新/财联社写的是「英伟达」而不是 `NVDA`，按代码做子串匹配必然 0 命中（实测 NVDA 归零）。改 `_SYMBOL_ALIASES` 后跑一次 `python3 sidecars/akshare/check_symbols.py`。
+
+LLM 出网需代理时用 `ARTEX_LLM_PROXY`（或 `HTTP(S)_PROXY`）。
 
 ### 6. 首次初始化（可自动化）
 

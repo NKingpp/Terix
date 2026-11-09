@@ -80,16 +80,17 @@ func (m *MarketToolSet) getNews() actool.CoreTool {
 	meta := marketToolMetas["get_news"]
 	return readTool(
 		"get_news",
-		"查询财经新闻（财新 + 财联社合并去重）。\n"+
-			"覆盖市场：cn / us / hk。**不支持 crypto** —— 财新(stock_news_main_cx)与\n"+
-			"  财联社(stock_info_global_cls)都是股票市场文本源，没有加密新闻。\n"+
-			"symbol 可省略：省略时返回该市场的全量新闻（按 limit 截断）；给出时只保留\n"+
-			"  title/summary 里含该代码的条目。\n"+
-			"返回的每条含 title/summary/source(caixin|cls)/published/url。\n"+
+		"查询财经新闻。\n"+
+			"覆盖市场：cn / us / hk。**不支持 crypto** —— 现有新闻源都是股票市场文本，\n"+
+			"  没有加密新闻（加密的消息面用 mx_news 或 get_crypto_flow 的资金流判断）。\n"+
+			"symbol 可省略：省略时返回该市场的全量快照（按 limit 截断）；给出时**优先按代码\n"+
+			"  精确取该标的的新闻**，取不到才降级到全市场快照做中文别名匹配（英伟达/NVDA 等）。\n"+
+			"返回的每条含 title/summary/source(caixin|cls|eastmoney)/published/url。\n"+
 			"  published 与 url **都可能为空**：财新无时间列（日期从 URL 抠）、财联社无原文链接。\n"+
 			"  这是上游限制，不是解析漏了 —— 空值不要当成「很久以前」或「没有链接的假新闻」。\n"+
 			"「该标的近期无相关新闻」会返回明确的 NO_DATA 错误（不是空列表），\n"+
-			"  因为「没新闻」是有效结论，必须能被上层区分出来。",
+			"  因为「没新闻」是有效结论，必须能被上层区分出来。\n"+
+			"提示：想看宏观/市场层面的消息而不限定标的时，去掉 symbol 传 limit 更大值。",
 		obj(map[string]any{
 			"symbol": str("可选。标的代码（cn: 6位数字；hk: 5位；us: 字母）。省略表示按市场取全量"),
 			"market": str("市场：cn|hk|us（默认按标的推，缺省 cn）"),

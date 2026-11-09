@@ -81,14 +81,42 @@ UPSTREAM_TIMEOUT = float(os.getenv("AKSHARE_UPSTREAM_TIMEOUT", "25"))
 # 实测 stock_zh_a_hist / stock_zh_a_spot_em / stock_hk_hist / stock_us_hist
 # 全部 RemoteDisconnected；带浏览器 UA + Referer 直连东财 API 同样被拒
 # （说明封的是 IP 不是 UA）；等待 2 分钟后重测仍失败（说明不是短时限流）。
-# 因此**禁止调用任何 _em 结尾的函数**，改用新浪 / 腾讯源。
+# 因此**禁止调用任何 _em 结尾的行情的函数**，改用新浪 / 腾讯源。
 # 若未来东财解封，必须先重新实测确认，再从这里移除前缀。
 FORBIDDEN_SOURCES = ("_em", "_em_", "em_")
 
+# 白名单：确认可用、且是**唯一**能满足需求的 _em 函数。
+#
+# # 为什么 stock_news_em 单独豁免（2026-11-09 实测）
+#
+# 上面那条封禁针对的是**行情**接口（hist/spot），它们返回大表、走分页，
+# 触发的是东财的批量抓取风控。而 stock_news_em 是「按单个代码取 10 条新闻」，
+# 请求量小一个量级，实测当前稳定可用：
+#
+#   ak.stock_news_em(symbol='NVDA') → 10 行
+#     列：关键词/新闻标题/新闻内容/发布时间/文章来源/新闻链接
+#   ak.stock_news_em(symbol='AAPL') → 10 行
+#
+# 它是**唯一**能按标的代码取新闻的源：财新 stock_news_main_cx 与财联社
+# stock_info_global_cls 都只有全市场快照（40-100 条），拿个股名做子串匹配
+# 命中率极低（实测 NVDA 修好中文别名后也只有 1 条）。
+#
+# # 仍然保留「失败即降级」的写法
+#
+# 豁免不等于信任。东财的封禁状态是**可变的**，今天通不代表明天通。
+# 所以调用方捕获异常后必须降级到财新/财联社，绝不能让「东财挂了」变成
+# 「这只票没有新闻」—— 见 _fetch_news_em 与 ep_news 的降级分支。
+EM_EXEMPT = ("stock_news_em",)
+
 
 def _assert_allowed(fn_name):
-    """硬约束：禁止使用东财源。违反即视为编程错误（不是运行时数据问题）。"""
+    """硬约束：禁止使用东财源。违反即视为编程错误（不是运行时数据问题）。
+
+    EM_EXEMPT 里的函数是实测确认可用的定点豁免（见其注释）。
+    """
     low = fn_name.lower()
+    if low in EM_EXEMPT:
+        return
     for bad in FORBIDDEN_SOURCES:
         if low.endswith("_em") or "_em_" in low:
             raise ApiError(
@@ -566,6 +594,72 @@ _US_KW = ("美股", "纳斯达克", "道指", "道琼斯", "标普", "美联储"
           "NASDAQ", "S&P", "Fed", "FOMC", "CPI")
 _HK_KW = ("港股", "恒生", "港交所", "港元", "南向资金", "恒指", "H股")
 
+# 代码 → 中文/别名映射。
+#
+# # 为什么必须有（2026-11-09 实测）
+#
+# 财新与财联社都是**中文**源。一条讲英伟达的新闻里写的是「英伟达」或
+# 「黄仁勋」，**永远不会出现 “NVDA” 这个字符串**。所以按原始代码做子串
+# 匹配必然 0 命中 —— 实测 /news?market=us 不带 symbol 返回 24 条，
+# 带上 symbol=NVDA 立刻变成 0 条。
+#
+# 上游看到的就变成「这只票没有相关新闻」，而真相是「过滤方式不对」。
+# 这与 ep_news 文档里那条「空是合法结论」的语义直接冲突 —— 空结果必须
+# 真的意味着「没有新闻」，否则分析师会据错误前提写 data_gaps。
+#
+# 只收录**确定无歧义**的别名：宁可少匹配，也不要因为「苹果」既指公司又指
+# 水果而把水果新闻塞给 AAPL。歧义大的（如 META 与「元宇宙」）不收录。
+_SYMBOL_ALIASES = {
+    "AAPL": ("苹果", "apple"),
+    "MSFT": ("微软", "microsoft"),
+    "NVDA": ("英伟达", "黄仁勋", "nvidia"),
+    "TSLA": ("特斯拉", "马斯克", "tesla", "musk"),
+    "GOOGL": ("谷歌", "alphabet", "google"),
+    "GOOG": ("谷歌", "alphabet", "google"),
+    "AMZN": ("亚马逊", "贝索斯", "amazon"),
+    "META": ("facebook", "扎克伯格"),
+    "AMD": ("超威", "amd"),
+    "INTC": ("英特尔", "intel"),
+    "TSM": ("台积电", "tsmc"),
+    "AVGO": ("博通", "broadcom"),
+    "NFLX": ("奈飞", "netflix"),
+    "BABA": ("阿里巴巴", "alibaba"),
+    "PDD": ("拼多多"),
+    "JD": ("京东"),
+    "NIO": ("蔚来"),
+    "XPEV": ("小鹏"),
+    "LI": ("理想汽车"),
+    "COIN": ("coinbase"),
+    "MSTR": ("微策略", "microstrategy"),
+    "SPY": ("标普", "s&p"),
+    "QQQ": ("纳斯达克", "nasdaq"),
+}
+
+# 指数/宏观占位代码：这些不是个股，任何带市场语义的新闻都算相关。
+_MARKET_SYMBOLS = {"^VIX", "^GSPC", "^IXIC", "^DJI", "^NDX", "VIX"}
+
+
+def _symbol_needles(symbol):
+    """把标的代码展开成一组用于文本匹配的子串（全小写）。
+
+    返回**空列表**表示「不做 symbol 过滤」—— 调用方据此跳过筛选，
+    而不是拿一个空集合把所有新闻都过滤掉。
+    """
+    s = (symbol or "").strip().lower()
+    if not s:
+        return []
+    if s.upper() in _MARKET_SYMBOLS:
+        return []
+    # 去掉 A 股常见前缀（sh600519 → 600519），让纯数字代码也能命中。
+    bare = s[2:] if s[:2] in ("sh", "sz", "bj") else s
+    out = [bare]
+    # 美股代码大小写不敏感；映射表按大写键查。
+    alias = _SYMBOL_ALIASES.get(bare.upper())
+    if alias:
+        out.extend(a.lower() for a in alias)
+    return [n for n in dict.fromkeys(out) if n]
+
+
 
 def _matches_market(item, market):
     """判断一条新闻是否属于指定市场。cn 视为「通用/未分类」—— 不筛。"""
@@ -574,6 +668,46 @@ def _matches_market(item, market):
     text = (item.get("title") or "") + " " + (item.get("summary") or "")
     kws = _US_KW if market == "us" else _HK_KW
     return any(k.lower() in text.lower() for k in kws)
+
+
+def _fetch_news_em(symbol, limit):
+    """按标的代码取个股新闻（东财 stock_news_em，定点豁免见 EM_EXEMPT）。
+
+    这是**唯一**真正按标的取新闻的源。财新/财联社只有全市场快照，
+    拿个股名做子串匹配命中率极低 —— 实测 NVDA 在修好中文别名后也只有 1 条，
+    而这里稳定返回 10 条带时间戳的新闻。
+
+    **失败必须抛异常让调用方降级**，不要返回 []：那会让上层把
+    「东财今天封了」读成「这只票没有新闻」。
+    """
+    _assert_allowed("stock_news_em")
+    try:
+        df = ak.stock_news_em(symbol=symbol)
+    except Exception as e:
+        raise wrap_upstream(e, "stock_news_em")
+    if df is None or len(df) == 0:
+        return []
+    out = []
+    for _, r in df.iterrows():
+        title = str(pick(r, "新闻标题", default="") or "").strip()
+        content = str(pick(r, "新闻内容", default="") or "").strip()
+        url = str(pick(r, "新闻链接", default="") or "").strip()
+        src = str(pick(r, "文章来源", default="") or "").strip()
+        published = str(pick(r, "发布时间", default="") or "").strip()
+        if not title and not content:
+            continue
+        out.append({
+            # 东财这两列都有，不像财新要拿 summary 首句凑标题。
+            "title": title or content[:60],
+            "summary": content,
+            "url": url,
+            "source": "eastmoney" + (f"/{src}" if src else ""),
+            "category": "",
+            "published": published,
+        })
+        if len(out) >= limit:
+            break
+    return out
 
 
 def ep_news(market="cn", symbol="", limit=20):
@@ -613,6 +747,38 @@ def ep_news(market="cn", symbol="", limit=20):
     fetch_n = min(100, max(limit * 4, 40))
     items = []
     errs = []
+
+    # ── 有 symbol：优先按标的精确取（东财个股新闻）────────────────────
+    #
+    # # 为什么把这条放最前面
+    #
+    # 下面两个源（财新/财联社）是**全市场快照**，只有 40-100 条。
+    # 拿个股名在里面做子串匹配是「碰运气」：实测 NVDA 命中 1 条、
+    # AAPL 命中 0 条 —— 而当时市场上苹果新闻并不少，只是不在那 100 条快照里。
+    #
+    # 这会让上游看到「这只票没新闻」，进而写进 data_gaps，污染分析结论。
+    # 按代码精确取是唯一能保证「空 = 真的没有」的做法。
+    if symbol:
+        try:
+            em_items = _fetch_news_em(symbol, limit)
+            if em_items:
+                # 精准源命中就直接返回：不再混入全市场快照的关键词匹配结果，
+                # 那些既可能误命中（同名不同公司），又会挤掉 limit 名额。
+                return {
+                    "symbol": symbol,
+                    "market": market,
+                    "matched": len(em_items),
+                    "items": em_items[:limit],
+                    "source_errors": [],
+                    "source": "eastmoney",
+                }
+            # 成功但零行 = 该标的确实没新闻。这是合法结论，
+            # 但仍往下走一遍，因为快照里可能有收录更广的报道。
+        except ApiError as e:
+            # 东财今天不可用 → 降级到快照源。**绝不**把这条当成
+            # 「没有新闻」直接返回空。
+            errs.append({"code": e.code, "message": e.message})
+
     for fetch in (_fetch_news_cx, _fetch_news_cls):
         try:
             items.extend(fetch(fetch_n))
@@ -638,11 +804,12 @@ def ep_news(market="cn", symbol="", limit=20):
         deduped.append(it)
 
     if symbol:
-        needle = symbol.strip().lower()
+        needles = _symbol_needles(symbol)
         deduped = [
             it for it in deduped
-            if needle in (it.get("title") or "").lower()
-            or needle in (it.get("summary") or "").lower()
+            if any(n in (it.get("title") or "").lower()
+                   or n in (it.get("summary") or "").lower()
+                   for n in needles)
         ]
 
     deduped = [it for it in deduped if _matches_market(it, market)]

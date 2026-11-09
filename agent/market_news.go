@@ -32,10 +32,13 @@ const (
 
 // NewsItem 是一条财经新闻。
 //
-// 字段来源说明（两个源的列结构完全不同，这里做了归一）：
+// 字段来源说明（三个源的列结构完全不同，这里做了归一）：
 //   - 财新 stock_news_main_cx 只有 tag/summary/url，没有标题、没有时间。
 //     Title 取 summary 首句，Category 放 tag，Published 从 URL 里的日期抠。
 //   - 财联社 stock_info_global_cls 有 标题/内容/发布日期/发布时间，没有 URL。
+//   - 东财 stock_news_em（按标的代码精确取，见 sidecars 的 EM_EXEMPT）
+//     六列齐全：标题/内容/时间/来源/链接。**只有它在带 symbol 时可靠** ——
+//     前两个是全市场快照（40-100 条），拿个股名做子串匹配命中率极低。
 //
 // 所以 **URL 和 Published 都可能为空** —— 这是上游限制，不是解析漏了。
 // 调用方渲染时必须容忍空串，不能当成错误。
@@ -43,7 +46,7 @@ type NewsItem struct {
 	Title     string `json:"title"`
 	Summary   string `json:"summary"`
 	URL       string `json:"url"`
-	Source    string `json:"source"`    // caixin | cls
+	Source    string `json:"source"`    // caixin | cls | eastmoney（可能带 /来源媒体）
 	Published string `json:"published"` // 可能为空
 	Category  string `json:"category,omitempty"`
 }
@@ -70,9 +73,13 @@ type Fundamental struct {
 // 市场常量（sidecar 只认这三个）。
 var validNewsMarkets = map[string]bool{"cn": true, "us": true, "hk": true}
 
-// FetchNews 取财经新闻（财新 + 财联社合并去重）。
+// FetchNews 取财经新闻。
 //
-// symbol 非空时只保留 title/summary 里含该代码的条目。
+// # 取源顺序由 sidecar 决定
+//
+// 带 symbol 时 sidecar 优先用东财个股新闻（按代码精确取），失败或零行才
+// 降级到财新/财联社的全市场快照。所以这里的错误文案必须同时提到三类源，
+// 不能只说「财新+财联社」—— 那会让分析师以为没试过按标的取。
 //
 // # 空结果不是错误，但仍返回 error —— 这是刻意的设计冲突，解释如下
 //
@@ -122,7 +129,7 @@ func (c *AkshareClient) FetchNews(ctx context.Context, symbol, market string, li
 	if len(d.Items) == 0 {
 		return nil, &MarketError{
 			Code: ErrNewsNoData,
-			Message: fmt.Sprintf("%s 近期无相关新闻（market=%s，已检索财新+财联社）",
+			Message: fmt.Sprintf("%s 近期无相关新闻（market=%s，已检索按标的新闻与财新/财联社快照）",
 				orDash(symbol), market),
 			Channel:   ChannelAkshareCN,
 			Retryable: false, // 换通道也找不到「不存在的新闻」
