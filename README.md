@@ -385,11 +385,35 @@ docker run -d --pull=never --name terix -p 8787:8787 \
 - `docker-compose.yml` 已是本地 `build` + `pull_policy: never`，直接 `docker compose up -d --build`；**不要**改回远程 `image`、不要配置镜像 tag、不要执行 `docker compose pull`。`POSTGRES_*` 是上游遗留，可删。
 - 唯一允许拉取的**容器镜像**是 `Dockerfile` 的官方基础镜像 `python:3.12-slim-bookworm`（构建时仍会按 `apt` / `npm` 下载依赖）；业务镜像必须本地构建，运行容器一律 `--pull=never`。
 - 镜像 `CMD` 自带 `-addr :8787 -proxy :8788`，8788 无监听，映射它无意义。
-- **akshare 两端共读 `AKSHARE_SIDECAR_ADDR`**（默认 `127.0.0.1:8791`）：Go 侧拿它当目标地址，sidecar 拿它当监听地址，跨容器时会冲突。最省事的是 `--network host` 并在宿主跑 sidecar（两端都保持默认），或把 sidecar 打进同一个容器一起启动。
+- **akshare 两端共读 `AKSHARE_SIDECAR_ADDR`**（默认 `127.0.0.1:8791`）：Go 侧拿它当**目标**地址，sidecar 拿它当**监听**地址。跨容器时必须写成两个不同的值，否则连不上 —— 容器里配 `127.0.0.1` 指的是容器自己（没有 sidecar 进程），会全部报 `SIDECAR_UNREACHABLE`。`docker-compose.yml` 已按正确方式配好：artex 侧 `AKSHARE_SIDECAR_ADDR=akshare:8791`（服务名），sidecar 侧 `AKSHARE_SIDECAR_ADDR=0.0.0.0:8791`（监听全部网卡）。**不要**把两边都留默认值。
 
-### 5. 可选依赖：akshare sidecar
+### 5. akshare sidecar（A股/港股/美股行情）
 
-A 股 / 港股 / 美股行情工具依赖它；**不装也能启动**，只是相关工具返回 `_unavailable`，不要误判为启动失败。
+不装也能启动，但**只有加密（OKX 通道）能取行情**；`get_quote` / `get_kline` / `get_news` / `get_macro` 对 stock/etf/index 一律返回 `SIDECAR_UNREACHABLE`。这是「任务选品卡住、只拿到 BTC/ETH、美股完全取不到」的标准成因，不是模型问题。
+
+#### 5.1 容器部署（推荐，compose 已内置）
+
+`docker-compose.yml` 里的 `akshare` 服务就是它，无需额外操作：
+
+```bash
+docker compose up -d akshare          # 或 up -d 全起
+docker compose ps akshare             # STATUS 要等到 (healthy)
+curl -s 127.0.0.1:8791/health         # data.warmup_done 必须为 true
+```
+
+`sidecars/akshare/Dockerfile` 基于 `python:3.12-slim-bookworm`（与主镜像同一个官方镜像），镜像 tag `artex-akshare:20260901`。健康检查按 `warmup_done` 判，`start_period: 120s` —— 首次 `import akshare` + 预热要几十秒，端口通不等于可用。
+
+单独调试 sidecar：
+
+```bash
+docker compose build akshare
+docker compose up -d --force-recreate akshare
+docker logs -f artex-akshare
+curl -s "127.0.0.1:8791/quote?market=us&symbol=AAPL"    # 宿主侧可见（端口只绑 127.0.0.1）
+docker exec artex-nas curl -s http://akshare:8791/health # 容器间走服务名
+```
+
+#### 5.2 裸机 / 源码部署
 
 ```bash
 python3 -m venv .venv-akshare
@@ -399,6 +423,8 @@ until curl -fsS http://127.0.0.1:8791/health 2>/dev/null | python3 -c \
   'import json,sys; sys.exit(0 if json.load(sys.stdin).get("data",{}).get("warmup_done") is True else 1)' 2>/dev/null
 do sleep 2; done
 ```
+
+裸机部署时 ARTeX 与 sidecar 同机，两端的 `AKSHARE_SIDECAR_ADDR` 都用默认 `127.0.0.1:8791` 即可。systemd 托管时给 sidecar 单独一个 unit，并在主服务里加 `After=`。
 
 Windows venv 路径是 `Scripts/` 而非 `bin/`。**必须等 `warmup_done:true`**，端口通不等于可用（首次 `import akshare` / 预热可能几十秒）。东财 `*_em` 源被代码硬禁用，不要试图改配置启用。LLM 出网需代理时用 `ARTEX_LLM_PROXY`（或 `HTTP(S)_PROXY`）。
 
@@ -424,6 +450,8 @@ curl -fsS -X POST http://127.0.0.1:8787/api/auth/init \
 用户名固定 `ARTEX`；密码 ≥ 8 字符且 ≤ 72 字节；仅首次可设。静态页面公开，除 `/api/auth/*` 与 `/api/health` 外所有 API 需 JWT（`Authorization: Bearer` / `artex_token` cookie / `?token=`，供 SSE）。
 随后在「系统 → LLM」配置模型与 Key，或启动时注入 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 及 `ARTEX_LLM_PROVIDER` / `ARTEX_LLM_MODEL` / `ARTEX_LLM_BASE_URL` / `ARTEX_LLM_PROXY`。市场凭证（OKX / MX）在「系统 → 凭证」页填写，**绝不写进 config.json、镜像或提交到仓库**。未配 LLM 时服务能起，但任务不会跑（`llm_configured=false`）。
 
+凭证保存即生效（无需重启进程）：OKX 走 `SetCredential` 热刷 CLI 注入，妙想走 `SetMXClient` 热刷工具集。改完之后直接跑任务即可。
+
 ### 7. 验证契约（全部通过才算部署成功）
 
 | 检查 | 期望 |
@@ -435,6 +463,7 @@ curl -fsS -X POST http://127.0.0.1:8787/api/auth/init \
 | `GET /api/stats`（带 token） | 200；LLM 已配时 `llm_configured:true` |
 | `data/quantex.db` | 存在且可写，WAL 模式下 `.db-wal` / `.db-shm` 同目录 |
 | 若启用 sidecar | `/health` 返回 `warmup_done:true` |
+| 美股/港股/A股取数 | `get_quote(market=us, symbol=AAPL)` 返回真实价；报 `SIDECAR_UNREACHABLE` = sidecar 没起或 `AKSHARE_SIDECAR_ADDR` 配错 |
 | 镜像来源 | 业务镜像由本仓库本地构建；配置里无远程 `image:`、无 `docker compose pull`，compose 为 `pull_policy: never` |
 
 ### 8. 备份、升级、回滚

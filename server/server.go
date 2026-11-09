@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -134,6 +135,11 @@ type Server struct {
 	// okxCli 是 cryptoCl 的具体类型（同一实例），保留它是为了在
 	// 凭证变更时调 SetCredential —— 接口类型调不到那个方法。
 	okxCli *agent.OkxClient
+
+	// mts 是金融工具集本身。留一个引用是给凭证热更新用的：妙想 key 存在
+	// MarketToolSet 里，改 key 必须回到这个实例上 SetMXClient，否则
+	// 「页面显示已保存、agent 仍报未启用」，且只有重启容器才能恢复。
+	mts *agent.MarketToolSet
 
 	// Explicit task chains use one task-scoped dynamic provider shared by goals,
 	// planner, workers, and the main agent. Bundles are stable; their runtime reads
@@ -271,6 +277,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// 金融工具装配：MarketToolSet 需要真实的 client + DB（后者让 snapshot 落库生效）。
 		// 这里复用 Server 已在 New() 里构造好的三个客户端，避免重复建连。
 		mts := agent.NewMarketToolSetWithCryptoAndFlow(s.marketCl, s.cryptoCl, s.cryptoFlow)
+		s.mts = mts
 		// Engine 也需要 client —— 它给 W5 金融角色的 vars 构造器取数
 		// （vars 构造器要自己取数才能保证 snapshot_id 与 .Bars 同源）。
 		s.engine.SetMarketClients(s.marketCl, s.cryptoCl)
@@ -3968,11 +3975,14 @@ func (s *Server) SetMarketClients(market, crypto agent.MarketClient, flow agent.
 // 而凭证变更本来就该即时生效 —— 用 SetCredential 在保存凭证的
 // handler 里再刷一次即可（见 market_credentials.go 的同步钩子）。
 //
-// # 找不到凭证时不做任何事
+// # 表里没有可用的 key 时清空注入（而不是保留旧的）
 //
-// 不 SetCredential 意味着 CLI 读 ~/.okx/config.toml。
-// 这是**降级而不是失败**：开发机上可能就是用 config.toml 配的，
-// 表里空着不该让 CLI 直接不可用。
+// 启动时 cl 是干净的，清空等于 no-op；但凭证页删掉/禁用了最后一条 key 之后
+// 调用这里，如果只是 return，内存里那把**已删除的 key**会继续被用 ——
+// 报错由 OKX 侧给出（50119 key 不存在），排查时完全看不出是本地缓存。
+//
+// 清空后 CLI 回退到 ~/.okx/config.toml，这仍是「降级而不是失败」：
+// 开发机上可能就是用 config.toml 配的。
 func (s *Server) injectOkxCredential(cl *agent.OkxClient) {
 	if cl == nil || s.m == nil || s.m.pg == nil {
 		return
@@ -4011,6 +4021,8 @@ func (s *Server) injectOkxCredential(cl *agent.OkxClient) {
 			c.APIKeyHint) // 只打 hint，绝不打 key 本体
 		return
 	}
+	// 一条可用都没有 —— 显式清空，见函数头注释。
+	cl.SetCredential(nil)
 }
 
 // loadMXAPIKey 取妙想的 API Key：凭证表优先，环境变量兜底。
@@ -4051,7 +4063,39 @@ func (s *Server) loadMXAPIKey() string {
 			return k
 		}
 	}
-	return ""
+
+	// 表里没有 → 环境变量兜底。这里必须显式读一次：启动时若表里为空，
+	// refreshMXClientIfNeeded 之后只有这条退路能救回来。
+	return strings.TrimSpace(os.Getenv("MX_APIKEY"))
+}
+
+// refreshMXClientIfNeeded 在妙想凭证变更后重建工具集里的 MXClient。
+//
+// # 为什么需要它（2026-11-09 线上问题）
+//
+// 妙想 key 只在 server.New() 里读一次（loadMXAPIKey → SetMXClient）。用户在
+// 凭证页新建/修改 key 之后，内存里的 mts.mx 仍是旧的（或仍是 nil），于是
+// agent 一直报「mx 通道未启用：MX_APIKEY 未配置」。而凭证页显示的是新 hint、
+// 验证也通过 —— 最容易得出「key 无效」的错误结论。唯一解法是重启容器，
+// 这不该是配置 key 的必经步骤。
+//
+// # 为什么对任何 mx 变更都刷，而不只对 data 类
+//
+// 幂等且便宜（一次 ListMarketCredentials）。判断「这条改动是否影响当前生效
+// 的那个 key」需要复现 loadMXAPIKey 的选取规则，那份逻辑一改两处就会漂移。
+func (s *Server) refreshMXClientIfNeeded(cred *db.MarketCredential) {
+	if cred == nil || cred.Provider != "mx" || s.mts == nil {
+		return
+	}
+	key := s.loadMXAPIKey()
+	if key == "" {
+		// 全部删/禁用了 —— 必须显式清掉，否则旧 key 继续在用。
+		s.mts.SetMXClient(nil)
+		log.Printf("[mx] 凭证已移除，妙想通道停用")
+		return
+	}
+	s.mts.SetMXClient(agent.NewMXClient(key))
+	log.Printf("[mx] 已刷新妙想客户端（key=%s）", cred.APIKeyHint)
 }
 
 // marketClientFor 返回某个 market 应使用的行情客户端。

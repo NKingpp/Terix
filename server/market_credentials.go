@@ -217,10 +217,12 @@ func (s *Server) saveMarketCredential(w http.ResponseWriter, r *http.Request) {
 		// 得重启进程才生效，而「保存成功」的提示会让他以为已经生效了。
 		// 这正是「验证通过、交易报错」那类事故的温床。
 		s.refreshOkxCredentialIfNeeded(cred)
+		s.refreshMXClientIfNeeded(cred)
 		writeJSON(w, 200, credentialWithSync(cred, syncRes))
 		return
 	}
 	s.refreshOkxCredentialIfNeeded(cred)
+	s.refreshMXClientIfNeeded(cred)
 	writeJSON(w, 200, cred)
 }
 
@@ -291,6 +293,8 @@ func (s *Server) deleteMarketCredential(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, 400, "id 必须为正整数")
 		return
 	}
+	// 先取一次，供删除后的热更新判断用（删完就查不到了）。
+	cred, _ := pg.GetMarketCredential(id)
 	if err := pg.DeleteMarketCredential(id); err != nil {
 		if err == db.ErrCredentialNotFound {
 			writeErr(w, 404, "凭证不存在")
@@ -299,6 +303,10 @@ func (s *Server) deleteMarketCredential(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, 500, err.Error())
 		return
 	}
+	// 删掉的可能是当前生效的那条 key。不刷新的话它会在内存里继续可用
+	// （或反过来：删了之后仍报「已配置」），与页面对不上。
+	s.refreshOkxCredentialIfNeeded(cred)
+	s.refreshMXClientIfNeeded(cred)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 

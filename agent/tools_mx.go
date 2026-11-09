@@ -54,12 +54,12 @@ const (
 // 出现「配了 MX_APIKEY 却报未启用」。所以 SetMXClient 没设时按环境变量兜底 ——
 // 环境变量本身就是这条通道的开关（见 NewMXClient）。
 func (m *MarketToolSet) mxSource() (*MXClient, error) {
-	if m.mx != nil {
-		if !m.mx.Configured() {
+	if cli := m.mx.Load(); cli != nil {
+		if !cli.Configured() {
 			return nil, fmt.Errorf(
 				"mx 通道未启用：MX_APIKEY 为空（设置环境变量后重启；已注入的客户端没有 apiKey）")
 		}
-		return m.mx, nil
+		return cli, nil
 	}
 	if c := NewMXClient(""); c.Configured() {
 		return c, nil

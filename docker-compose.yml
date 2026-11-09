@@ -9,10 +9,16 @@ services:
       args:
         TARGETARCH: ${TARGETARCH:-amd64}
     pull_policy: never
+    depends_on:
+      - akshare
     environment:
       # SQLite 库文件位于挂载进来的 /app/data 下，容器重建不丢。
       # 不写这个变量也可以（默认就是 /app/data/quantex.db，见 config.DBPath）。
       ARTEX_DB_PATH: /app/data/quantex.db
+      # 行情 sidecar 的目标地址：跨容器必须用服务名，不能是 127.0.0.1
+      #（那指容器自己，没有 sidecar 进程 → 全部 SIDECAR_UNREACHABLE）。
+      # 注意 sidecar 侧的同名变量含义相反，是**监听**地址，见下面的 akshare 服务。
+      AKSHARE_SIDECAR_ADDR: akshare:8791
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ARTEX_LLM_PROVIDER: ${ARTEX_LLM_PROVIDER:-}
@@ -29,4 +35,28 @@ services:
       # 把项目根目录的 skills 挂进容器（覆盖镜像内置的 /app/skills）；
       # 改 skill 无需重建镜像，容器读的就是宿主机这份。
       - ./skills:/app/skills
+    restart: unless-stopped
+
+  # A 股 / 港股 / 美股行情桥接。akshare 是纯 Python 库、ARTEX 是 Go，只能起 HTTP 桥。
+  # 缺了它非加密标的全部报 SIDECAR_UNREACHABLE（crypto 走 OKX，不受影响）。
+  akshare:
+    build:
+      context: ./sidecars/akshare
+      dockerfile: Dockerfile
+    pull_policy: never
+    environment:
+      # 必须 0.0.0.0：默认 127.0.0.1 在容器里只有自己可达，artex 连不进来。
+      AKSHARE_SIDECAR_ADDR: 0.0.0.0:8791
+      TZ: Asia/Shanghai
+    # 只绑回环，便于宿主 curl 排查；容器间走服务名 akshare:8791。
+    ports:
+      - "127.0.0.1:8791:8791"
+    healthcheck:
+      # 按 warmup_done 判，不是「端口通就算好了」—— 首次 import akshare
+      # 要几十秒，这段时间端口已监听但调用必超时。
+      test: ["CMD", "python", "-c", "import json,urllib.request,sys; d=json.load(urllib.request.urlopen('http://127.0.0.1:8791/health')); sys.exit(0 if d.get('data',{}).get('warmup_done') else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     restart: unless-stopped

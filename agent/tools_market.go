@@ -38,6 +38,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	actool "github.com/Autumn-27/norma/tool"
@@ -85,7 +86,11 @@ type MarketToolSet struct {
 	// 三个构造器都被测试、工具目录种子壳与 server 装配调用。改签名会让
 	// 所有调用点跟着改，而收益为零 —— 妙想是可选的补充通道。
 	// 不调用 SetMXClient = 不启用（工具仍会注册，调用时返回明确的「未启用」）。
-	mx *MXClient
+	//
+	// 用原子指针而不是裸字段：SetMXClient 会在凭证保存时**运行期**改写它
+	// （见 server 的 refreshMXClientIfNeeded），而 worker 线程同时在读。
+	// 裸字段在这里是实打实的数据竞争。
+	mx atomic.Pointer[MXClient]
 }
 
 // NewMarketToolSet 构造工具集（只用默认通道）。
@@ -105,7 +110,17 @@ func (m *MarketToolSet) SetDB(d *db.DB) { m.db = d }
 //
 // 传 nil 或不传等价 —— 都不启用。不 panic、不报错：未配置是可诊断状态，
 // 由工具 handler 给出明确错误（见 mxSource）。
-func (m *MarketToolSet) SetMXClient(c *MXClient) { m.mx = c }
+//
+// 可在运行期反复调用（凭证页保存 / 删除 key 时刷新），并发安全。
+func (m *MarketToolSet) SetMXClient(c *MXClient) {
+	if c == nil || !c.Configured() {
+		// 存 nil 而不是「未配置的 client」：mxSource 的 nil 分支还会退回
+		// 环境变量 MX_APIKEY，语义才是「页面上没有 key」而不是「key 是空串」。
+		m.mx.Store(nil)
+		return
+	}
+	m.mx.Store(c)
+}
 
 // NewMarketToolSetWithCrypto 构造带 crypto 通道的工具集。
 //
