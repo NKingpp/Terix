@@ -177,6 +177,9 @@ type TaskNodeDTO struct {
 	State        string `json:"state"`
 	Origin       string `json:"origin"`
 	TS           string `json:"ts"`
+	// Role 是执行该 intent 的角色（金融阶段图节点才有，如 analyst_market；
+	// 渗透 intent 为空 —— payload 里没有 role，ClaimIntent 落的是 work#N 槽名）。
+	Role         string `json:"role,omitempty"`
 	SourceTaskID string `json:"source_task_id,omitempty"`
 	Inherited    bool   `json:"inherited,omitempty"`
 	DeleteReason string `json:"delete_reason,omitempty"` // 意图假删除(state='deleted')时的删除原因
@@ -192,6 +195,7 @@ func taskNodeDTO(n *db.Node) TaskNodeDTO {
 		State:        n.State,
 		Origin:       n.Origin,
 		TS:           rfc3339(n.CreatedAt),
+		Role:         n.Role(),
 	}
 	if n.SourceTaskID > 0 {
 		d.SourceTaskID = i64s(n.SourceTaskID)

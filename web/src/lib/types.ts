@@ -367,6 +367,7 @@ export interface TaskNode {
   priority: number; // 0..10
   state: string; // GoalState | IntentState | FindingState | HintState
   origin: string;
+  role?: string; // 执行该节点的角色（金融阶段图才有，如 analyst_market）；空/undefined = 通用 worker
   ts: string;
   source_task_id?: string;
   inherited?: boolean;
@@ -784,6 +785,8 @@ export interface Session {
   source_task_id?: string;
   inherited?: boolean;
   seg?: number; // main-agent session: which conversation segment (0 = original)
+  // worker 会话的执行角色 key（analyst_market / trader …）。空或 work#N 槽名 = 无角色。
+  worker_role?: string;
 }
 
 // ---- Security ----

@@ -54,6 +54,7 @@ import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
 import { MOCK } from "@/lib/mock/enabled";
 import { isBtwCommand } from "@/lib/side-questions";
 import { taskAssetSourceLabel, taskAssetTypeLabel } from "@/lib/task-assets";
+import { parseIntents, roleText } from "@/lib/intent-label";
 import type {
   Activity,
   ChatAttachment,
@@ -320,18 +321,19 @@ function intentStatus(state: string): SessionStatus {
 // Derive worker sessions from running/open intents — there is no backend
 // sessions endpoint, so intents (≈ worker units) are the closest real source.
 function intentToSession(n: TaskNode): Session {
-  const label = (n.payload ?? "").trim();
+  const { summary } = parseIntents(n.payload);
   const state = intentStatus(n.state);
   return {
     id: n.id,
     role: "worker",
-    title: label || `Intent ${n.id}`,
+    title: summary || `Intent ${n.id}`,
     status: state,
     live: !n.inherited && state === "running",
     last_activity: n.ts,
     intent_id: n.id,
     source_task_id: n.source_task_id,
     inherited: n.inherited,
+    worker_role: n.role,
   };
 }
 
@@ -339,6 +341,7 @@ function SessionItem({
   s,
   active,
   displayTitle,
+  roleLabel,
   hasPending,
   unread,
   onClick,
@@ -349,6 +352,8 @@ function SessionItem({
   s: Session;
   active: boolean;
   displayTitle: string;
+  // 执行角色展示文案（"技术面分析师 analyst_market"）；空 = 无角色的通用 worker。
+  roleLabel?: string;
   hasPending?: boolean;
   unread?: number;
   onClick: () => void;
@@ -387,6 +392,11 @@ function SessionItem({
           <span className="shrink-0 rounded bg-muted px-1 py-0.5 font-mono text-[10px] tabular-nums text-muted-foreground">
             #{s.intent_id}
           </span>
+        )}
+        {roleLabel && (
+          <Badge variant="outline" className="shrink-0 px-1 py-0 text-[10px] font-normal">
+            {roleLabel}
+          </Badge>
         )}
         {s.inherited && s.source_task_id && (
           <Badge variant="outline" className="shrink-0">
@@ -514,6 +524,25 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const [attachments, setAttachments] = React.useState<ChatAttachment[]>([]);
   const [uploading, setUploading] = React.useState(false);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+
+  // agent key → 中文名（"analyst_market" → "技术面分析师"）。一次拉取，失败静默降级
+  // 为只显示 key —— 角色徽标是附加信息，不该因为一次请求失败就挡住会话列表。
+  const [roleNames, setRoleNames] = React.useState<Map<string, string>>(new Map());
+  React.useEffect(() => {
+    let cancelled = false;
+    api
+      .agents()
+      .then((list) => {
+        if (cancelled) return;
+        const m = new Map<string, string>();
+        for (const a of list) if (a.key) m.set(a.key, a.name || a.key);
+        setRoleNames(m);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function pickFiles(files: FileList | null) {
     if (!files || files.length === 0) return;
@@ -1123,18 +1152,18 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const sessionMeta = React.useMemo(() => {
     const map = new Map<string, { title: string; json: unknown; deleted: boolean; deleteReason: string }>();
     for (const node of allIntents) {
-      let title = `Intent ${node.id}`;
-      let parsedPayload: unknown = node.payload;
+      const { summary } = parseIntents(node.payload);
+      const title = summary || `Intent ${node.id}`;
       // 假删除:意图 state='deleted',删除原因在独立字段 delete_reason 上。
       const deleted = node.state === "deleted";
       const deleteReason = node.delete_reason ?? "";
+      // 悬浮 JSON 用解析后的 payload（解析失败时是原文），便于排查原始字段。
+      let parsedPayload: unknown = node.payload;
       if (node.payload) {
         try {
-          const p = JSON.parse(node.payload);
-          parsedPayload = p;
-          if (p?.summary) title = String(p.summary);
+          parsedPayload = JSON.parse(node.payload);
         } catch {
-          title = node.payload.trim() || title;
+          parsedPayload = node.payload;
         }
       }
       const json = { ...node, payload: parsedPayload };
@@ -1250,6 +1279,8 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   // 折叠态（手机端）标题栏要替代整张列表：显示当前会话名 + 其它会话的未读合计，
   // 否则收起后既不知道自己在看哪个会话，也看不到别处有新消息。
   const activeDisplayTitle = (active.role === "worker" ? sessionMeta.get(active.id)?.title : "") || active.title;
+  // 当前 worker 会话的执行角色文案（"技术面分析师 analyst_market"）；空 = 通用 worker。
+  const workerRoleLabel = active.worker_role ? roleText(active.worker_role, roleNames) : "";
   const hiddenUnread = React.useMemo(
     () => Object.entries(store).reduce((sum, [key, s]) => (key === activeKey ? sum : sum + s.unread), 0),
     [store, activeKey],
@@ -1629,6 +1660,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                           s={s}
                           active={s.id === activeId}
                           displayTitle={meta?.title ?? s.title}
+                          roleLabel={s.worker_role ? roleText(s.worker_role, roleNames) : ""}
                           hasPending={hasPendingForSession(s)}
                           unread={store[keyForSession(s)]?.unread}
                           onClick={() => {
@@ -1673,7 +1705,11 @@ export function SessionsTab({ taskId }: { taskId: string }) {
         {/* Right: transcript */}
         <SideQuestionWorkspace
           side={side}
-          label={active.role === "worker" ? `Worker #${active.intent_id} · ${activeDisplayTitle}` : activeDisplayTitle}
+          label={
+            active.role === "worker"
+              ? `Worker #${active.intent_id}${workerRoleLabel ? ` · ${workerRoleLabel}` : ""} · ${activeDisplayTitle}`
+              : activeDisplayTitle
+          }
         >
           <div className="flex min-h-0 flex-1 min-w-0 flex-col overflow-hidden rounded-lg border bg-card">
             <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 border-b px-3 py-2 sm:px-4 sm:py-2.5">

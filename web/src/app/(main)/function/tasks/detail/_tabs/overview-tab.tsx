@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 
 import { StatusBadge } from "@/components/status-badge";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -28,6 +29,7 @@ import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
 import { api } from "@/lib/api";
+import { parseIntents, roleText } from "@/lib/intent-label";
 import type {
   AssetInterceptKind,
   AssetInterceptRule,
@@ -79,6 +81,19 @@ const SCOPE_SOURCE_LABELS: Record<TaskScopeRow["source"], string> = {
   manual: "手动",
 };
 
+// IntentRoleBadge 显示执行该意图的角色（"技术面分析师 analyst_market"）。
+// 无角色（渗透 intent，owner 是 work#N 槽名或空）时什么都不渲染 ——
+// 空徽标比没有徽标更干扰视线。
+function IntentRoleBadge({ role, names }: { role?: string; names: Map<string, string> }) {
+  const text = role ? roleText(role, names) : "";
+  if (!text) return null;
+  return (
+    <Badge variant="outline" className="shrink-0 px-1 py-0 text-[10px] font-normal">
+      {text}
+    </Badge>
+  );
+}
+
 function StatCard({
   label,
   value,
@@ -118,6 +133,23 @@ export function OverviewTab({ taskId }: { taskId: string }) {
   } | null>(null);
   // 正在重跑的意图 id（含 "__all__" 表示批量），用于禁用按钮 + 转圈。
   const [rerunning, setRerunning] = React.useState<Set<string>>(new Set());
+  // agent key → 中文名（"analyst_market" → "技术面分析师"）。一次拉取，失败静默降级为只显示 key。
+  const [roleNames, setRoleNames] = React.useState<Map<string, string>>(new Map());
+  React.useEffect(() => {
+    let cancelled = false;
+    api
+      .agents()
+      .then((list) => {
+        if (cancelled) return;
+        const m = new Map<string, string>();
+        for (const a of list) if (a.key) m.set(a.key, a.name || a.key);
+        setRoleNames(m);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   // 测试范围列表 + 新增表单状态。
   const [scope, setScope] = React.useState<TaskScopeRow[]>([]);
   const [scopeKind, setScopeKind] = React.useState<TaskScopeRow["kind"]>("root_domain");
@@ -949,7 +981,10 @@ export function OverviewTab({ taskId }: { taskId: string }) {
             {running.slice(0, 6).map((i) => (
               <div key={i.id} className="flex items-center gap-2 text-sm">
                 <StatusBadge domain="intent" value={i.state} />
-                <span className="min-w-0 flex-1 truncate">{i.payload}</span>
+                <IntentRoleBadge role={i.role} names={roleNames} />
+                <span className="min-w-0 flex-1 truncate" title={parseIntents(i.payload).summary}>
+                  {parseIntents(i.payload).summary}
+                </span>
               </div>
             ))}
             {running.length === 0 && <p className="text-sm text-muted-foreground">暂无进行中意图</p>}
@@ -1018,7 +1053,10 @@ export function OverviewTab({ taskId }: { taskId: string }) {
             {blocked.slice(0, 20).map((i) => (
               <div key={i.id} className="flex items-center gap-2 text-sm">
                 <StatusBadge domain="intent" value={i.state} />
-                <span className="min-w-0 flex-1 truncate">{i.payload}</span>
+                <IntentRoleBadge role={i.role} names={roleNames} />
+                <span className="min-w-0 flex-1 truncate" title={parseIntents(i.payload).summary}>
+                  {parseIntents(i.payload).summary}
+                </span>
                 <Button
                   size="sm"
                   variant="ghost"
