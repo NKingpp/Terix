@@ -502,7 +502,7 @@ var financialToolBindings = map[string]toolBinding{
 		Tools: []string{"get_quote", "get_fundamentals", "mx_query", "list_facts", "emit_fact"},
 		Notes: map[string]string{
 			"get_quote":        "仅用于确认交易日/最新价（PE 需要股价，但本轮不给股本，故不能算 PE）",
-			"get_fundamentals": "取财报数据；目前只有 A 股通道，美股/港股返回 NO_DATA 时如实写进 data_gaps（那是能力缺口，不是源故障）",
+			"get_fundamentals": "取财报数据；只有 A 股（cn）有结构化报表。us/hk 请改用 mx_query，那才是这两个市场的财报表源（不是缺口）",
 			"mx_query":         "get_fundamentals 给不了的问句（「近三年毛利率」「单季度扣非净利润」），且覆盖港股/美股",
 			"emit_fact":        "每个判断维度（盈利质量/财务健康/数据时效）写一条事实，evidence 必须含科目名+报告期+数值",
 		},

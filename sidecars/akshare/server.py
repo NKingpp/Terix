@@ -974,11 +974,14 @@ def ep_fundamental(symbol="", market="cn", report_type="abstract"):
                        f"report_type 非法: {report_type!r}（应为 {'/'.join(allowed_types)}）")
 
     if market in ("us", "hk"):
-        # 明确的能力缺口，而不是错误：见文件头注释「为什么美股财报不用 _em」。
+        # akshare 侧不接东财 _em（理由见上方长注释）。但系统**并不缺**这两个市场
+        # 的财报 —— 由妙想通道（mx_query）提供。所以这里说的是「本 sidecar 不覆盖」，
+        # 不要说成「财报通道待接入」，否则上层会把整个维度判成缺口。
         raise ApiError(
             Err.NO_DATA,
-            f"美股/港股财报通道待接入（不用东财 _em 接口，见注释）",
-            {"_unavailable": "美股/港股财报通道待接入",
+            f"akshare 不提供 {market} 结构化财报（非东财源护栏，见注释）；该系统请改用妙想通道",
+            {"_unavailable": f"akshare 不提供 {market} 结构化财报",
+             "_hint": "us/hk 财报走 mx_query（东财妙想）",
              "market": market, "symbol": symbol},
         )
 

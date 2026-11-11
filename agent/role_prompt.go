@@ -44,7 +44,14 @@ const (
 	// 那是数据状态。两者导致完全不同的输出：前者可能给 neutral 并声称「无消息面」，
 	// 后者会给 unavailable 并写进 data_gaps。
 	notWiredNews        = "（新闻数据尚未接入 —— 本次分析无新闻可用。这是数据状态，不是「今天没有消息」。请在 data_gaps 写明并给 stance=unavailable）"
-	notWiredFundamental = "（财务数据尚未接入 —— 本次分析无财报可用。请在 data_gaps 写明并给 stance=unavailable）"
+	// akshare 侧只提供 A 股结构化财报；us/hk 由妙想（.MXData）承担。
+	// 所以这里**不能**无条件命令 stance=unavailable —— 那会让已有妙想报表的
+	// 美股/港股分析被强行判成「无数据」。条件写在文案里，由模型按 .MXData 判定。
+	notWiredFundamental = "（本轮 akshare 结构化财报无数据。若下方「妙想财务数据」也为空，才是真正的缺口，" +
+		"请写进 data_gaps 并给 stance=unavailable；若妙想有表，用它分析，**不要**判 unavailable）"
+	// us/hk 专用措辞：这不是故障也不是能力缺口，是「该市场财报在本系统走妙想」。
+	notAkshareFundamentalUS = "（akshare 不提供 %s 结构化财报 —— 该市场财报请读「妙想财务数据」；" +
+		"妙想也为空时才算数据缺口）"
 	// 申报文件通道（SEC EDGAR / 巨潮公告）**确实还没接**。
 	// 与上面两条的区别：这条是长期能力缺口，不是装配问题 —— 所以要写明原因，
 	// 让 LLM 把它归到 source_unavailable 而不是 not_applicable。
@@ -491,7 +498,12 @@ func fetchFundamentalForVars(ctx context.Context, cli MarketClient, intent *db.N
 	f, err := ak.FetchFundamental(cctx, symbol, market, "abstract")
 	if err != nil {
 		if IsNoDataError(err) {
-			// 美股/港股的「通道待接入」是能力缺口，与源故障分开表述。
+			// us/hk 不是故障也不是缺口 —— 这两个市场的结构化财报由妙想通道承担，
+			// 而妙想数据在 vars.MXData 里（本函数管不到）。只有 cn 才是真「无数据」。
+			if market == "us" || market == "hk" {
+				return nil, "[]", fmt.Sprintf(notAkshareFundamentalUS, market), nil,
+					[]string{fmt.Sprintf("akshare 无 %s 结构化财报（非故障；该市场财报见妙想财务数据）", market)}
+			}
 			return nil, "[]", notWiredFundamental, nil,
 				[]string{fmt.Sprintf("财务数据不可用：%v（能力缺口，重试无用）", err)}
 		}
@@ -659,20 +671,41 @@ func agentKeyForIntent(intent *db.Node) string {
 // 妙想是 LLM 解析问句，问得越泛越容易返回一堆无关表或直接无数据。
 // 带上公司名 + 指标 + 时间范围时解析最准（实测）。
 //
-// 拿不到 symbol 时返回空串 —— 调用方据此跳过（而不是发一个
-// 「某公司最新财报」这种必然漂移的问句）。
+// # 为什么 us 只用 symbol，其它市场用 name + symbol
+//
+// 妙想对**中文名**解析最好，但对英文全名经常直接返回 0 张表（实测：
+// 「Apple Inc AAPL最近三期…」→ 1 表，而「NVIDIA Corp NVDA最近三期…」→ 0 表，
+// 同期「NVDA最近三期…」→ 2 表）。即英文名不是锚点而是噪声。
+// 所以 us 只给 ticker（AAPL/DVDA 这类是妙想认的唯一稳定锚点），
+// hk/cn 给「中文名 代码」，两个锚点互补。
 func fundamentalQuestion(ctx context.Context, intent *db.Node) string {
 	view := instrumentFromPayload(intent, storeFrom(ctx))
-	name := strings.TrimSpace(view.Name)
-	sym := strings.TrimSpace(view.Symbol)
-	label := name
-	if label == "" {
-		label = sym
-	}
+	label := fundamentalQuestionLabel(view.Market, view.Name, view.Symbol)
 	if label == "" {
 		return ""
 	}
 	return label + "最近三期营业收入、净利润、毛利率与资产负债率"
+}
+
+// fundamentalQuestionLabel 选问句里的标的锚点。纯函数，便于测。
+//
+// us 只留 ticker：实测英文公司名（NVIDIA Corp）会让妙想返回 0 张表，
+// 而同一标的的 ticker（NVDA）返回 2 张表 —— 英文名是噪声不是锚点。
+// cn/hk 用「中文名 代码」，代码去重（name 里已含代码则不重复拼）。
+func fundamentalQuestionLabel(market, name, sym string) string {
+	name, sym = strings.TrimSpace(name), strings.TrimSpace(sym)
+	switch {
+	case sym == "":
+		return name
+	case market == "us":
+		return sym
+	case name == "" || strings.EqualFold(name, sym):
+		return sym
+	}
+	if strings.Contains(strings.ToUpper(name), strings.ToUpper(sym)) {
+		return name
+	}
+	return name + " " + sym
 }
 
 // fetchMXNewsForVars 取妙想资讯进 vars。
@@ -726,15 +759,26 @@ func fetchMXNewsForVars(ctx context.Context, intent *db.Node) (string, string, [
 // fetchMXQueryForVars 取妙想问句结果进 vars。
 //
 // question 为空表示构造不出问句（标的信息缺失），直接跳过并记 gap。
+//
+// # 为什么未配置时 us/hk 要记 gap 而 cn 不必
+//
+// 妙想对 cn 是**补充**通道（akshare 新浪已在），没配只是少一层口径，报 gap
+// 就是每轮一条同码噪声。但 us/hk 的结构化财报 akshare 不提供，妙想是**唯一**
+// 来源 —— 静默不记会让模型以为「这家公司没有财报」，那是分析结论而非数据状态。
 func fetchMXQueryForVars(ctx context.Context, intent *db.Node, question string) (string, string, []string) {
+	view := instrumentFromPayload(intent, storeFrom(ctx))
 	cli := mxForVars(ctx)
 	if cli == nil {
+		if view.Market == "us" || view.Market == "hk" {
+			return notWiredMX, "[]",
+				[]string{fmt.Sprintf("妙想通道未配置（MX_APIKEY 缺失）：%s 财报无其它来源，本维度不可用", view.Market)}
+		}
 		return notWiredMX, "[]", nil
 	}
 	if strings.TrimSpace(question) == "" {
 		return notWiredMX, "[]", []string{"妙想问句未构造：标的信息不足（symbol 与 name 都为空）"}
 	}
-	if view := instrumentFromPayload(intent, storeFrom(ctx)); view.AssetClass == AssetClassCrypto {
+	if view.AssetClass == AssetClassCrypto {
 		return "（妙想无加密数据 —— 本维度不适用）", "[]", nil
 	}
 

@@ -227,6 +227,30 @@ func TestInstrumentFromPayloadNoFakeSymbol(t *testing.T) {
 	}
 }
 
+// TestFundamentalQuestionLabel 问句锚点选择。
+//
+// us 只用 ticker：实测妙想对英文公司名（NVIDIA Corp）返回 0 表，
+// 对同标的 ticker（NVDA）返回 2 表。cn/hk 用「中文名 代码」。
+func TestFundamentalQuestionLabel(t *testing.T) {
+	cases := []struct {
+		market, name, sym, want string
+	}{
+		{"us", "NVIDIA Corp", "NVDA", "NVDA"},
+		{"us", "AAPL", "AAPL", "AAPL"},
+		{"us", "", "AAPL", "AAPL"},
+		{"hk", "腾讯控股", "00700.HK", "腾讯控股 00700.HK"},
+		{"cn", "贵州茅台", "600519", "贵州茅台 600519"},
+		{"cn", "", "600519", "600519"},
+		{"cn", "苹果(AAPL)", "AAPL", "苹果(AAPL)"}, // name 已含代码，不重复拼
+		{"cn", "", "", ""},
+	}
+	for _, c := range cases {
+		if got := fundamentalQuestionLabel(c.market, c.name, c.sym); got != c.want {
+			t.Errorf("market=%s name=%q sym=%q → %q, want %q", c.market, c.name, c.sym, got, c.want)
+		}
+	}
+}
+
 // TestWithMarketClientNilIsNoop 注入 nil 等于不注入。
 func TestWithMarketClientNilIsNoop(t *testing.T) {
 	ctx := WithMarketClient(context.Background(), nil)

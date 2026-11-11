@@ -208,10 +208,14 @@ var marketToolMetas = map[string]marketToolMeta{
 		// 与「不该查」是两件事，交给出错路径处理比提前裁剪更诚实。
 		//
 		// us/hk 也在 market 参数里允许，但 sidecar 侧固定返回 NO_DATA：
-		// 唯一能取美股财报的接口是东财 stock_financial_us_report_em，它以 _em
-		// 结尾，而东财对本机 IP 封禁且状态可变 —— 该接口失效时返回空 DataFrame
-		// 而不抛异常，调用方会把「通道死了」当成「这家公司没有财报」。
-		// 宁可明确说「通道待接入」（能力缺口，可提示用户），也不要一个会静默死掉的通道。
+		// akshare 侧唯一能取美股财报的接口是东财 stock_financial_us_report_em，
+		// 它以 _em 结尾，而东财对本机 IP 封禁且状态可变 —— 该接口失效时返回空
+		// DataFrame 而不抛异常，调用方会把「通道死了」当成「这家公司没有财报」。
+		//
+		// **us/hk 的财报由 mx 通道（ChannelMX / mx_query）提供，不是缺失**。
+		// 所以本工具的 Channels 只列 akshare:cn 是正确的 —— 它描述的是「本工具
+		// 自己能走哪些通道」，不是「这个维度系统里有没有数据」。判断某市场财报
+		// 是否可得，要看 get_fundamentals（cn）∪ mx_query（cn/hk/us）的并集。
 		AssetClasses: []string{"stock", "etf", "index"},
 		Channels:     []Channel{ChannelAkshareCN},
 		Timeout:      20 * time.Second, // 新浪三大报表是 104 行 × 147 列，转置+截断比 quote 慢

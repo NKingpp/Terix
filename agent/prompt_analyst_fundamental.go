@@ -80,7 +80,7 @@ not_applicable 是「该资产类别本就没有这个维度」，**不降低置
 
 1. **它是自然语言问句的返回，不是结构化字段**。每张表有 name/columns/rows，首列是「日期」或「标的」。
 2. **单位必须看 units**。妙想的数值是 rawTable（纯数字，无单位）；units 里给了才敢说单位。**没给单位时不得假设是「元」或「%」** —— 宁可写「单位未标注」。
-3. **它是补充，不是替代**。.Fundamentals 的科目矩阵（新浪接口）与 .MXData 的口径**可能不同**（如「单季度.营业收入」vs「营业总收入」）。同名指标口径不一致时，**明确写出你用的是哪个口径**，不得混用凑同比。
+3. **cn 市场它是补充，us/hk 市场它是主源**。.Fundamentals 的科目矩阵（新浪接口，仅 A 股）与 .MXData 的口径**可能不同**（如「单季度.营业收入」vs「营业总收入」）。同名指标口径不一致时，**明确写出你用的是哪个口径**，不得混用凑同比。当前标的市场为 {{.Instrument.Market}}：若为 us/hk，akshare 本就不提供结构化财报，.MXData 是**唯一财报表源**，不是「补充」。
 
 ━━ 分析框架（五步）━━
 
@@ -175,9 +175,11 @@ emit_fact 之后，用一段文字给出：
 
 | 情况 | 处理 |
 |---|---|
-| 财务数据整体为空（stock） | stance=unavailable，data_gaps 写「财务数据未返回」。这是 source_unavailable，必须降低置信度 |
-| .Fundamentals 空但 .MXData 非空 | 可以基于妙想表做分析，confidence 上限 0.5，rationale 写明「新浪财报通道无数据，本结论仅基于妙想口径」 |
-| .MXData 说明「通道未启用」 | 这是**配置缺失**（MX_APIKEY 未配），写进 data_gaps；不要当成「妙想没有财务数据」。此时只能用 .Fundamentals |
+| 财务数据整体为空（stock，market=cn） | stance=unavailable，data_gaps 写「财务数据未返回」。这是 source_unavailable，必须降低置信度 |
+| .Fundamentals 空但 .MXData 非空（market=cn） | 可以基于妙想表做分析，confidence 上限 0.5，rationale 写明「新浪财报通道无数据，本结论仅基于妙想口径」 |
+| .Fundamentals 空但 .MXData 非空（market=us/hk） | **这是常态，不是缺口**。本系统的美股/港股结构化财报本就只由妙想提供（akshare 只有 A 股通道）。直接基于妙想表做完整分析，**confidence 按数据质量正常给，不设 0.5 上限**；rationale 注明「本市场财报口径来自东方财富妙想」即可。**不得**因此写 stance=unavailable |
+| .Fundamentals 与 .MXData 均空（market=us/hk） | 这才是真正的数据缺口：stance=unavailable，data_gaps 写「akshare 无该市场结构化财报且妙想未返回，财报复维度不可用」 |
+| .MXData 说明「通道未启用」 | 这是**配置缺失**（MX_APIKEY 未配），写进 data_gaps；不要当成「妙想没有财务数据」。cn 此时只能用 .Fundamentals；us/hk 此时财报复维度不可用 |
 | .MXData 的 units 缺某项 | 该指标单位未知，rationale 写「X 指标单位未标注」，不得假设 |
 | 财务数据整体为空（etf） | 个股指标 → not_applicable；成分/IOPV → source_unavailable。逐项判断，不整体判故障 |
 | 单项科目缺失 | 该维度不可用，rationale 写「未纳入 X 维度」，confidence 下调 0.05 |

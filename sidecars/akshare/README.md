@@ -132,9 +132,11 @@ t=24s  /health → status=ok,         warmup_done=true, warmup_elapsed_ms=802
 | `GET /quote` | `symbol=&market=` | **最新日线收盘价**（非实时 tick），含涨跌幅 |
 | `GET /kline` | `symbol=&period=&count=&market=` | K 线，多源降级 新浪→腾讯。`period`: daily/weekly/monthly；`market`: cn/hk/us |
 | `GET /macro` | `indicator=cpi` | 宏观指标。`indicator`: gdp/cpi/pmi |
+| `GET /news` | `symbol=&market=&limit=` | 财经新闻（财新 + 财联社 + 按标的东财新闻）。`market`: cn/hk/us |
+| `GET /fundamental` | `symbol=&market=&report_type=` | 财报（新浪源）。**只有 cn**；us/hk 返回 NO_DATA（该市场由妙想通道承担）。`report_type`: abstract/资产负债表/利润表/现金流量表 |
 | `POST /_shutdown` | — | 优雅退出（测试用） |
 
-**尚未实现**（§1.3.2 的第二批）：`/v1/news`、`/v1/breadth`、`/v1/fundamentals`。
+**尚未实现**（§1.3.2 的第三批）：`/v1/breadth`。
 
 ### symbol 约定
 

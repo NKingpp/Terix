@@ -203,8 +203,8 @@ func analystsFor(assetClass string) []string {
 	//     东财（_em）仍被 IP 封禁，FORBIDDEN_SOURCES 不变。
 	//   - analyst_fundamental：新增 get_fundamentals，走新浪财报
 	//     （stock_financial_report_sina / stock_financial_abstract），实测可用。
-	//     ⚠️ 目前只有 A 股通道；美股/港股返回 _unavailable，分析师会在
-	//     DataGaps 里如实说明「该市场财报通道未接入」。
+	//     只有 A 股有结构化报表；**美股/港股的财报由妙想通道（mx_query）提供**，
+	//     不是缺失维度 —— vars 里 .MXData 就是这条通道的预取结果。
 	//   - analyst_sentiment（股票版）：**仍然不注册** —— 无可靠社交情绪源
 	//     （Reddit/StockTwits 需付费 API，且架构已定 P0 不做）。加密侧有
 	//     analyst_sentiment_crypto 走资金费率/持仓量，那是独立实现。

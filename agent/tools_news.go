@@ -180,15 +180,14 @@ func (m *MarketToolSet) getFundamentals() actool.CoreTool {
 			"report_type：资产负债表 / 利润表 / 现金流量表 / abstract（摘要，默认）。\n"+
 			"返回 {symbol, market, report_type, currency, periods, columns, rows, note}：\n"+
 			"  rows 每行是一个科目（首列「科目」/「指标」，其余列是报告期，**新→旧**）。\n"+
-			"⚠ 只有 A 股（cn）通道。**美股/港股返回明确的 NO_DATA 错误**，原因不是故障：\n"+
-			"  唯一能取美股财报的接口是东财 stock_financial_us_report_em，它以 _em 结尾，\n"+
-			"  而东财对本机 IP 是封禁/可变的 —— 该接口失效时返回空 DataFrame 而不抛异常，\n"+
-			"  调用方会把「通道死了」当成「这家公司没有财报」。宁可明确说「待接入」。\n"+
+			"⚠ 只有 A 股（cn）有结构化报表（新浪源）。**美股/港股请改用 mx_query**\n"+
+			"  （东财妙想，覆盖 A股/港股/美股，自然语言问句取财务数据）。\n"+
+			"  对 us/hk 调本工具会得到 NO_DATA —— 那是「本工具不覆盖该市场」，不是「该公司没有财报」。\n"+
 			"⚠ 已截断：只保留白名单科目 × 最近 4 期。完整报表 104 行 × 147 列会吃掉数万 token。\n"+
 			"⚠ 不含 PE/PB/ROE —— 需要股价与股本才能算，本工具不提供，别凭印象填。",
 		obj(map[string]any{
 			"symbol":      str("必填。A 股代码（6位数字，如 600519；也接受 sh600519/sz000001）"),
-			"market":      str("市场：cn|us|hk（默认 cn）。us/hk 当前返回 NO_DATA（通道待接入）"),
+			"market":      str("市场：cn|us|hk（默认 cn）。仅 cn 有结构化报表；us/hk 请改用 mx_query"),
 			"report_type": str("报表类型：资产负债表|利润表|现金流量表|abstract，默认 abstract"),
 		}, "symbol"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
@@ -231,6 +230,13 @@ func (m *MarketToolSet) getFundamentals() actool.CoreTool {
 			f, err := ak.FetchFundamental(cctx, symbol, market, reportType)
 			if err != nil {
 				if IsNoDataError(err) {
+					if market == "us" || market == "hk" {
+						// 本工具不覆盖该市场，但系统整体并不缺这个维度。
+						return actool.Errorf(fmt.Sprintf(
+							"get_fundamentals 不覆盖 market=%q（只有 A 股有结构化报表）。"+
+								"请改用 mx_query 取该市场财务数据（东财妙想覆盖 A股/港股/美股）；"+
+								"若妙想也不可用，才把「财报复维度不可用」写进 data_gaps", market)), nil
+					}
 					return actool.Errorf(fmt.Sprintf(
 						"get_fundamentals: %v —— 这是**能力缺口**（该市场财报通道未接入），"+
 							"不是数据源故障，重试无用。请把这条写进 data_gaps，不要推测财报数字", err)), nil
