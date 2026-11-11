@@ -1329,7 +1329,11 @@ func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64,
 	if !changed {
 		return fmt.Errorf("%w: 意图不再是 paused 状态", db.ErrIntentStateConflict)
 	}
-	node.State, node.Owner = "running", "chat"
+	// 只改 state，不动 Owner：owner 是节点的**产出角色**（触发器从 payload.role
+	// 派生）。覆写成 "chat" 会让 PM 评级 → 草案的判据（见本文件下方
+	// `intent.Owner == agent.RolePortfolioManager`）在人工消息轮之后失效。
+	// 谁在跑由 activity.worker 与 label 表达，不需要占用 owner。
+	node.State = "running"
 	// Record the human turn as a visible activity BEFORE the run starts, so it is
 	// ordered ahead of any worker step and never appears without the run happening.
 	// Keep the UI copy concise; ExecuteWithMessage writes the server-resolved

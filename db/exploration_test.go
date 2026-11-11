@@ -380,6 +380,71 @@ WHERE owner IS NULL AND payload->>'role' IS NOT NULL`).Scan(&bad); err != nil {
 	}
 }
 
+// TestClaimIntentKeepsSemanticOwner 认领不得抹掉 intent 的产出角色。
+//
+// # 这条守的是什么
+//
+// owner 列承载两件事：节点**产出角色**（触发器从 payload.role 派生，金融阶段图
+// intent 靠它定位 portfolio_manager 等）与「谁在跑」（work#N 槽位）。
+// ClaimIntent 早期无条件 `SET owner=$1`，语义角色在 claim 那一刻永久丢失 ——
+// server/engine.go 的 `intent.Owner == agent.RolePortfolioManager` 判据
+// 因此在真实运行中永不成立，PM 评级 → 交易草案整条链路静默失效。
+//
+// 所以断言两件事：有角色时保留角色，无角色时仍落槽名（渗透侧不回归）。
+func TestClaimIntentKeepsSemanticOwner(t *testing.T) {
+	d := testOpen(t)
+
+	expID, err := d.CreateExploration("test", "claim 保留语义角色")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	es := d.Exploration(expID)
+
+	// 金融阶段图 intent：payload 带 role，触发器派生 owner。
+	withRole, err := es.AddIntent(map[string]any{
+		"summary": "综合三方风控出评级", "role": "portfolio_manager",
+	}, 5, nil, "system")
+	if err != nil {
+		t.Fatalf("AddIntent(带 role): %v", err)
+	}
+	// 渗透 intent：payload 只有 summary —— owner 为 NULL。
+	plain, err := es.AddIntent(map[string]any{"summary": "test idor"}, 5, nil, "planner")
+	if err != nil {
+		t.Fatalf("AddIntent(无 role): %v", err)
+	}
+
+	ok, err := es.ClaimIntent(withRole, "work#1")
+	if err != nil || !ok {
+		t.Fatalf("claim 带 role 的意图: ok=%v err=%v", ok, err)
+	}
+	n, err := es.GetNode(withRole)
+	if err != nil || n == nil {
+		t.Fatalf("读回意图 %d: %v", withRole, err)
+	}
+	if n.Owner != "portfolio_manager" {
+		t.Errorf("claim 后 owner = %q，期望 portfolio_manager —— "+
+			"语义角色被 work#N 槽名覆写了，engine.go 的 PM 判据会永久失效", n.Owner)
+	}
+
+	ok, err = es.ClaimIntent(plain, "work#2")
+	if err != nil || !ok {
+		t.Fatalf("claim 无 role 的意图: ok=%v err=%v", ok, err)
+	}
+	n, err = es.GetNode(plain)
+	if err != nil || n == nil {
+		t.Fatalf("读回意图 %d: %v", plain, err)
+	}
+	if n.Owner != "work#2" {
+		t.Errorf("无 role 的意图 claim 后 owner = %q，期望 work#2（槽名兜底）", n.Owner)
+	}
+
+	// 认领守卫未受影响：同一 id 二次 claim 仍失败（state 已 running）。
+	if again, _ := es.ClaimIntent(withRole, "work#3"); again {
+		t.Error("同一意图被二次认领 —— state='open' 守卫失效")
+	}
+}
+
 // TestJoinBecomesBlockedWhenUpstreamBlocked 上游失败时 join 必须转 blocked（不是 done）。
 //
 // # 这条守的是 ARCH-W2-W5.md:4641

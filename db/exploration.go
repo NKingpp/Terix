@@ -1295,8 +1295,17 @@ WHERE exploration_id=$1 AND kind='goal' AND state='open')`, s.expID).Scan(&exist
 }
 
 // ClaimIntent atomically moves an open intent to running. Returns true if claimed.
+//
+// # 为什么是 COALESCE(owner,$1) 而不是 owner=$1
+//
+// owner 列同时承载两件事：① 节点**产出角色**（触发器从 payload.role 派生，
+// 金融阶段图 intent 靠它定位 portfolio_manager 等角色）；② 「谁在跑」（work#N 槽位）。
+// 无条件覆写会让语义角色在 claim 那一刻永久丢失 —— engine.go 的
+// `intent.Owner == agent.RolePortfolioManager` 判据因此在真实运行中永不成立
+// （评级 → 草案整条链路静默失效）。COALESCE 让「已有角色」保留，
+// 「无角色」（渗透 intent，owner IS NULL）仍落槽名，渗透侧行为不变。
 func (s *ExplorationStore) ClaimIntent(id int64, owner string) (bool, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='running', owner=$1
+	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='running', owner=COALESCE(owner,$1)
 WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state='open'`, owner, id, s.expID)
 	if err != nil {
 		return false, err
