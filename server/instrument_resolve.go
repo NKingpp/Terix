@@ -223,12 +223,10 @@ var commonWords = map[string]bool{
 
 // inferMarket 从代码形态推断市场。
 //
-// # 为什么可以推断（而 asset_class 不能）
+// # 为什么可以推断
 //
 // 市场的形态特征足够强（A 股 6 位数字、港股 5 位、加密带连字符），
-// 而 asset_class 决定阶段图模板（stock 有财报维度，crypto 没有）——
-// 猜错会让整条分析链问错问题。所以：market 可以推断，asset_class 一律
-// 按「股票」登记并要求行情验证真实存在（ETF/指数 用户应显式走 sync 端点指定）。
+// 且按市场选通道是机械动作 —— 猜错了行情验证会失败，不会污染数据。
 func inferMarket(symbol string) string {
 	if strings.Contains(symbol, "-") {
 		return "crypto"
@@ -240,6 +238,31 @@ func inferMarket(symbol string) string {
 		return "hk"
 	}
 	return "us"
+}
+
+// assetClassForMarket 由市场推 asset_class。
+//
+// # 为什么 crypto 必须单独给（2026-11-11 修）
+//
+// 原来这里写死 stock，于是 BTC-USDT 会被登记成 `market=crypto, asset_class=stock`
+// —— **自相矛盾的一行**。后果不是报错，而是建出 stock 阶段图：多出
+// analyst_fundamental（crypto 没有财报源，必然写 unavailable）与 debate 的股票口径，
+// 少了 analyst_sentiment_crypto（加密资金费率/持仓量）。
+//
+// 与 set_instrument_tool.go 的 assetClass 规则对齐（那里早就是 crypto→crypto）。
+// 同一语义两条路径两种结果，正是这次要消掉的分叉。
+//
+// # 为什么 stock 是兜底而不是细分为 etf/index
+//
+// etf/index 的形态特征不足以从代码推断（510300 是 ETF 还是股票？
+// 000300 是指数还是深市股票？）。猜错会让阶段图用错模板，
+// 而这两种需要用户显式走 sync 端点指定。所以只有 crypto 能自动判定，
+// 其余一律 stock —— 与原来的保守策略一致。
+func assetClassForMarket(market string) string {
+	if market == "crypto" {
+		return db.AssetClassCrypto
+	}
+	return db.AssetClassStock
 }
 
 func isAllDigits(s string) bool {
@@ -320,7 +343,7 @@ func (s *Server) resolveInstrumentFromTaskText(r *http.Request, texts ...string)
 			continue
 		}
 		id, created, err := store.UpsertInstrument(db.InstrumentInput{
-			Market: market, Symbol: symbol, AssetClass: db.AssetClassStock,
+			Market: market, Symbol: symbol, AssetClass: assetClassForMarket(market),
 		})
 		if err != nil {
 			continue

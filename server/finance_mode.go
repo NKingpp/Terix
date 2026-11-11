@@ -30,7 +30,11 @@ package server
 // 文本判定没有这个不一致风险，且不需要迁移历史数据。
 // 若将来需要用户显式指定领域，再加一个可空列并由它优先即可。
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/Autumn-27/artex/agent"
+)
 
 // financeKeywords 是「这是金融任务」的强信号词。
 //
@@ -78,4 +82,45 @@ func taskIsFinance(instrumentID *int64, texts ...string) bool {
 		}
 	}
 	return false
+}
+
+// assetClassHintForTask 从任务文本推断资产类别，供**无标**金融任务建阶段图时用。
+//
+// # 为什么需要（2026-11-11）
+//
+// 无标任务原来恒用 AssetClassStock 展开阶段图（stageGraphMaterializer），
+// 于是 screener 节点的 payload 带着 asset_class=stock —— 模型看到的第一手信息
+// 就是「这是美股票」，于是一个写满「加密永续」的任务被选成了 NVDA。
+//
+// 注释说选 stock 是因为「三套模板里覆盖最广」。但覆盖广不等于猜对：
+// stock 模板含 analyst_fundamental（crypto 没有财报源），真做加密时会写一堆
+// unavailable；而且它对选品方向有实质误导。
+//
+// # 判据为什么是「关键词计数」而不是「有 crypto 词就是 crypto」
+//
+// 任务可能同时提到两类（「比较 BTC 和美股科技股」）。取出现次数多的一侧，
+// 平局则回到 stock（保守兜底，与原来行为一致）。
+//
+// 返回 agent.AssetClass* 之一。
+func assetClassHintForTask(texts ...string) string {
+	blob := strings.ToLower(strings.Join(texts, " "))
+	cryptoScore := 0
+	for _, kw := range cryptoHintKeywords {
+		cryptoScore += strings.Count(blob, strings.ToLower(kw))
+	}
+	// 美股/A股不加权：它们在 stock 模板下都能跑，只有 crypto 需要换模板。
+	if cryptoScore > 0 {
+		return agent.AssetClassCrypto
+	}
+	return agent.AssetClassStock
+}
+
+// cryptoHintKeywords 是「这是加密任务」的市场信号词（比 financeKeywords 更专）。
+//
+// 不含 "币" 这种过宽的词：用户说「资金」也会命中。
+var cryptoHintKeywords = []string{
+	"加密", "加密货币", "数字货币", "比特币", "以太坊",
+	"永续", "合约", "usdt", "okx",
+	"btc", "eth", "sol", "doge", "xrp", "bnb",
+	"-swap",
 }

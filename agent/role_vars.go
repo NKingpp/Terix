@@ -294,20 +294,58 @@ func asOfFromPayload(p map[string]any) string {
 // 「标的：（）」「日线：」这种看起来像数据故障的东西，把模型带向
 // 「数据没接好」的错误结论。
 //
-// 只保留它真正需要的一个字段：数据缺口说明（用来解释为什么没有标的）。
+// ScreenerVars 是选品员模板的变量。
+//
+// # 为什么需要 TaskGoal / TaskDescription（2026-11-11 修）
+//
+// 原来的版本只有 DataGaps，注释说「给更多上下文会让它以为已经知道答案」。
+// 实测后果比设计者预期的糟得多：screener **完全看不到任务目标**，
+// 于是只能按「默认条件（近 20 日动量居前 + 波动率居中）」在美股里凑候选。
+//
+// 任务 15 就是活例：goal 明写「分析 BTC-USDT 加密永续的多空方向」，
+// screener 却选了 NVDA —— 它压根没见过 BTC-USDT 这三个字
+// （节点 payload 只有 asset_class=stock / instrument_id=0）。
+//
+// 而 prompt 第 34 行还写着「你的意图摘要见下方 user 消息的第一段」——
+// 那是**不存在的**：role prompt 路径下 user 消息是占位句（worker.go:633）。
+// 系统等于对模型撒了两次谎。
+//
+// 所以这里补上目标与描述。判断「是否已有明确标的」交给 prompt 里的规则，
+// 而不是靠隐藏信息来防它「以为知道答案」。
 type ScreenerVars struct {
-	DataGaps []string
+	TaskGoal        string
+	TaskDescription string
+	DataGaps        []string
 }
 
 // buildScreenerVars 构造选品员的模板变量。
 //
-// 信息极少是刻意的：选品员的任务是「按策略去市场里找」，
-// 它能依赖的只有 user 消息里的意图摘要与自己调 get_quote 拿到的实时数据。
-// 给它更多预置上下文（比如任务目标）反而会让它以为「已经知道答案」。
+// 目标与描述从 exploration 根行读（tasks/explorations 的 goal 字段），
+// 而不是从 intent payload —— 后者在建图时没有写 summary（pipeline.go 的 add
+// 只塞 asset_class/instrument_id/stage）。
 func buildScreenerVars(ctx context.Context, intent *db.Node) ScreenerVars {
-	return ScreenerVars{
-		DataGaps: []string{
-			"本任务未指定具体标的 —— 需要你先筛选出候选",
-		},
+	v := ScreenerVars{}
+	ts := storeFrom(ctx)
+	if ts == nil {
+		// 无 store 时不能编造目标。仍给出数据缺口说明，让模型知道
+		// 「这不是你想不起策略，是执行器没拿到」。
+		v.DataGaps = []string{"执行器未拿到任务上下文（无 exploration store）—— 请按 user 消息里的意图摘要选品"}
+		return v
 	}
+	if desc, goal, err := ts.Root(); err == nil {
+		v.TaskDescription = strings.TrimSpace(desc)
+		v.TaskGoal = strings.TrimSpace(goal)
+	}
+	// 从目标+描述里切候选代码。CandidateSymbols 是私有函数，
+	// 但同包内可直接用（它在 server 包 —— 这里在 agent 包，不可用）。
+	// 所以用 intent payload 里可能存在的候选，或留空让模型自己看文本。
+	//
+	// 不在这里重复实现切分逻辑：agent 包不该依赖 server 包的解析规则。
+	// 目标文本已经完整给出，模型有能力自己认出 BTC-USDT 这种显式代码。
+	v.DataGaps = []string{
+		"本任务未**指定**标的（用户没在表单里选）—— 需要你先筛选出候选。" +
+			"但请注意：任务目标里可能**已经写了**具体标的代码（如 BTC-USDT），" +
+			"那种情况应直接绑定它，不要另选。",
+	}
+	return v
 }

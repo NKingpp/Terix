@@ -192,6 +192,27 @@ func (s *Server) pgSyncInstruments(w http.ResponseWriter, r *http.Request) {
 //
 // 区分这两种是必要的：如果源故障也报「符号不存在」，用户会去改一个
 // 本来正确的代码，越改越错。
+// channelForVerifyMarket 返回该市场用于「标的是否真实存在」校验的通道。
+//
+// 与 agent 的 channelForMarket 同构，但那个是私有且需 marketToolMeta。
+// 这里只有 market 一个输入，写死映射更直接。
+//
+// 与 agent.channelForMarket 的分工：那边是「取数时的降级链」（可多通道），
+// 这边是「验证时的单一通道」（验证只要一次，失败就是失败，不需要降级）。
+func channelForVerifyMarket(market string) agent.Channel {
+	switch market {
+	case "crypto":
+		return agent.ChannelOKX
+	case "hk":
+		return agent.ChannelAkshareHK
+	case "cn":
+		return agent.ChannelAkshareCN
+	default:
+		// us 及未知市场走美股通道。未知市场本来就该由 inferMarket 兜成 us。
+		return agent.ChannelAkshareUS
+	}
+}
+
 func (s *Server) verifyInstrumentSymbol(r *http.Request, market, symbol string) (code, msg string, ok bool) {
 	// 走 server 装配的客户端（New() 里构造一次，全 server 复用连接池）。
 	cli := s.marketClientFor(market)
@@ -205,7 +226,24 @@ func (s *Server) verifyInstrumentSymbol(r *http.Request, market, symbol string) 
 			cli = agent.NewAkshareClient("")
 		}
 	}
-	q, err := cli.FetchQuote(r.Context(), symbol, market, "")
+	// Channel 必须按 market 显式给出 —— 不能留空。
+	//
+	// # 为什么（2026-11-11 修：文本里写明的标的被静默丢弃）
+	//
+	// 任务 goal 写着「分析 BTC-USDT 加密永续」，但 tasks.instrument_id 恒为 NULL：
+	//   CandidateSymbols 切出 ["BTC-USDT"]  ✅
+	//   inferMarket("BTC-USDT") = "crypto"  ✅
+	//   本函数传 Channel=""                ❌
+	//   OkxClient.FetchQuote 第一行 `if ch != ChannelOKX` → CHANNEL_NOT_APPLICABLE
+	//   → 这里映射成 UPSTREAM_BLOCKED → ok=false → 候选全丢 → resolved=nil
+	//   → 走「无标金融任务」→ screener 重选 → 选了 NVDA（美股）
+	//
+	// 对比：AkshareClient 只拒绝 ChannelOKX，空串会落到 channelToMarket("")==""、
+	// 保留传入的 market —— 所以美股/A股一直侥幸能验通，只有 crypto 全灭。
+	// 这个不对称让 bug 在测试里看不出来（既有 e2e 测试用的都是美股）。
+	//
+	// 正确用法见 agent/tools_market.go 的 fetchQuoteWithFallback（用 channelForMarket）。
+	q, err := cli.FetchQuote(r.Context(), symbol, market, channelForVerifyMarket(market))
 	if err != nil {
 		// 用错误码区分「查不到」与「源故障」。
 		var me *agent.MarketError

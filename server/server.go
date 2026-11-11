@@ -1745,7 +1745,8 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	if resolved != nil || financeNoInstrument {
 		// 建图逻辑抽到 stageGraphMaterializer —— 编排 spawn_task 也要用它，
 		// 两处各写一遍必然分叉（一处忘 ScreenerOnly、一处忘幂等）。
-		materialize = s.stageGraphMaterializer(resolved)
+		materialize = s.stageGraphMaterializerHinted(resolved,
+			assetClassHintForTask(req.Description, req.Goal))
 	}
 
 	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{

@@ -155,3 +155,46 @@ func (s *Server) reseedFinanceContextToolDescriptions() {
 		log.Printf("[tools] 金融语境迁移：%d 个工具描述已刷新", migrated)
 	}
 }
+
+// reseedScreenerPrompt 把选品员的提示词刷成当前代码默认。
+//
+// # 为什么需要单独一次迁移（2026-11-11）
+//
+// screener 的 prompt 原来写着「你的意图摘要见下方 user 消息的第一段」——
+// 那段**不存在**：role prompt 路径下 user 消息是占位句（worker.go:633），
+// 而阶段图建的 screener 节点 payload 里也没有 summary。
+// 于是选品员既看不到策略、也看不到任务目标，只能按默认条件在美股里凑候选
+// （任务 15：goal 明写 BTC-USDT，却选了 NVDA）。
+//
+// 新版把任务目标渲染进模板（ScreenerVars.TaskGoal），并加了一条
+// 「目标里已写明标的代码就直接绑定、不要另选」的规则。
+//
+// 存量库里的 screener prompt 是旧快照（seedPrompts 首插入 only），
+// 不刷就永远看不到新内容。所以用独立 flag 做一次性迁移。
+func (s *Server) reseedScreenerPrompt() {
+	const flag = "screener_prompt_task_goal_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	// 无论成败只尝试一次（与同文件另外两个迁移一致：避免「部分已迁移」的不可预测状态）
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }()
+
+	tmpl := agent.BuiltinPromptSeeds()[agent.RoleScreener]
+	if tmpl == "" {
+		log.Printf("[prompts] screener 无代码默认，跳过迁移")
+		return
+	}
+	a, err := s.m.pg.GetAgentByKey(agent.RoleScreener)
+	if err != nil || a == nil {
+		// 全新库尚未建该 agent 行 —— seedPrompts 会用最新默认，无需迁移。
+		return
+	}
+	if cur, err := s.m.pg.CurrentPrompt(a.ID); err == nil && cur == tmpl {
+		return // 已是默认，不产生重复版本
+	}
+	if _, err := s.m.pg.ResetPromptToDefault(a.ID, tmpl); err != nil {
+		log.Printf("[prompts] screener 重刷失败: %v", err)
+		return
+	}
+	log.Printf("[prompts] screener 提示词已切换到含任务目标的版本（旧版本保留在历史）")
+}

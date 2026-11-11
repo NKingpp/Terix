@@ -290,8 +290,28 @@ func (s *Server) materializeTaskDownstream(taskID string) (int, error) {
 //
 // inst == nil 表示「无标任务」：只建选品阶段，下游等 set_task_instrument。
 func (s *Server) stageGraphMaterializer(inst *db.Instrument) func(tx *sql.Tx, expID int64) error {
+	return s.stageGraphMaterializerHinted(inst, "")
+}
+
+// stageGraphMaterializerHinted 同上，但允许显式给出 assetClass 提示。
+//
+// hint 用于**无标**任务：调用方从任务文本推断资产类别（assetClassHintForTask），
+// 避免一律用 stock 模板。
+//
+// # 为什么需要它（2026-11-11）
+//
+// 「分析 BTC-USDT 加密永续」这种任务在 screener 跑起来之前没有 inst，
+// 原来恒用 stock → screener 节点 payload 带 asset_class=stock →
+// 模型看到「股票」就选了 NVDA。阶段图的模板选择本身就在给选品方向下暗示，
+// 不该由「哪个模板覆盖最广」决定。
+//
+// inst != nil 时 hint 被忽略（标的自己的 asset_class 才是权威）。
+func (s *Server) stageGraphMaterializerHinted(inst *db.Instrument, hint string) func(tx *sql.Tx, expID int64) error {
 	return func(tx *sql.Tx, expID int64) error {
 		assetClass := agent.AssetClassStock
+		if hint != "" {
+			assetClass = hint
+		}
 		var instID int64
 		if inst != nil {
 			if inst.AssetClass != "" {

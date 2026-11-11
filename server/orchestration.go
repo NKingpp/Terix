@@ -354,7 +354,8 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 				}
 				// inst == nil 时也建图：无标金融任务只建 screener 阶段
 				// （ScreenerOnly），由选品员自己挑标的（见 createTask 同名注释）。
-				opts.MaterializeGraph = s.stageGraphMaterializer(inst)
+				opts.MaterializeGraph = s.stageGraphMaterializerHinted(inst,
+					assetClassHintForTask(a.Description, a.Goal))
 			}
 			t, err := s.m.CreateTaskWithOptions(a.Description, a.Goal, opts)
 			if err != nil {
@@ -504,6 +505,9 @@ func (s *Server) seedOrchestrationTools() {
 	// 内容修订型迁移，理由见 prompt_finance_migration.go 顶部。
 	s.reseedFinanceContextPrompts()
 	s.reseedFinanceContextToolDescriptions()
+	// screener 提示词补上任务目标（2026-11-11）：原版让模型「看 user 消息第一段」，
+	// 而那段不存在 → 选品员看不到策略与目标 → 任务写明 BTC-USDT 却选了 NVDA。
+	s.reseedScreenerPrompt()
 	// 注：pentest / reporter / retester 三个渗透语义 agent 已下线，清理在
 	// db.seedAgentRemovals（flag 守卫的一次性 DELETE）里做，不再在启动期 seed 它们。
 	// 注：pentest 的默认工具绑定无需迁移——BuiltinToolSeeds 在全新初始化时就把
