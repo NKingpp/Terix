@@ -30,6 +30,10 @@ type Planner struct {
 	maxTurns          int                                    // max agent turns per run (0 = unlimited)
 	killWork          func(intentID int64) error             // engine callback to terminate a running work (nil = off)
 	steerWork         func(intentID int64, msg string) error // engine callback to steer a running work mid-run (nil = off)
+	// materializeDownstream 是 server 的「补建阶段图」回调（nil = 工具不可用）。
+	// 见 SetMaterializeDownstream 的注释：screener 失败后下游节点从未建出，
+	// planner 需要自己能补，否则只能派无 role 的通用意图顶替。
+	materializeDownstream func() (int, error)
 	proxyAddr         string                                 // recording proxy for WebFetch (empty = direct)
 	proxyCACert       string                                 // recording proxy's CA cert path (HTTPS verify)
 	webSearch         WebSearchOpts                          // web_search tool backend selection (off by default)
@@ -124,6 +128,18 @@ func (p *Planner) SetKillWork(fn func(intentID int64) error) { p.killWork = fn }
 // SetSteerWork wires the engine's per-work steering callback so the planner's
 // steer_work tool can inject a mid-run course-correction into a running worker.
 func (p *Planner) SetSteerWork(fn func(intentID int64, msg string) error) { p.steerWork = fn }
+
+// SetMaterializeDownstream wires the server's stage-graph backfill so the planner's
+// materialize_downstream tool can rebuild the missing half of the pipeline.
+//
+// # 为什么 planner 需要这个能力
+//
+// 下游节点只有一个创建入口：screener 成功 → set_task_instrument →
+// MaterializeDownstream。screener 因 model_error/网络故障被标 blocked 时，
+// 下游 13 个节点**从未存在**，而 planner 除了干等没有别的选择。
+// 2026-11-11 task 11 就是这么卡住的：planner 只能派两条无 role 的「筛选候选」
+// 意图顶替，而那两条根本没有选品员的 prompt 与工具。
+func (p *Planner) SetMaterializeDownstream(fn func() (int, error)) { p.materializeDownstream = fn }
 
 // renderPlannerTodos formats the persistent planning todo for injection into the
 // wake-up prompt (empty when there are no todos yet — first wake-up).
@@ -377,10 +393,38 @@ const plannerDefaultTmpl = `你是金融交易平台 Terix（覆盖美股 / 港�
 
    **串行分析链：分步派，别拆成并行。** 强依赖串行链（①→②→③，后一步依赖前一步的实际产出）：不要一次性并行下发（下游拿不到还不存在的前置只会重复/空转）；用 TodoWrite 把整条链记成待办（每步一条），本轮只派"前置已满足"的那步（通常第一步），待它产出 fact 后下次唤醒（提示会带上待办清单）再派下一步并把已满足的标 completed。"同一件事"别拆两条（"确认驱动因素"和"验证驱动因素"是同一步）；只有【平行、互不依赖】的维度（如并行调研多个不相关标的）才用多意图并行。
 
+   **阶段图缺口（graph_overview 返回 stage_graph_missing 非空时）**：它列出按标的类别本该存在、但图里**没有任何意图承担**的执行角色 —— 典型原因是某个阶段中途失败，后续十几个节点从未建出。
+   - 任务**已绑定标的** → 直接调 materialize_downstream 补建（补建前别抢派分析师，否则会和补建出来的节点重复）。
+   - 任务**未绑定标的** → 派一条 role=screener 的意图重跑选品；它调 set_task_instrument 选定标的后会自动展开下游。
+   - 补建/重跑之后该字段会在下一轮消失。它还在，就说明还没修好 —— 别当没看见，也别用无 role 的通用意图去"顶替"某个角色（那只会得到一份没有该角色 prompt 的分析）。
+
+   **选品卡死（graph_overview 返回 stage_graph_stalled 时）**：说明选品阶段已 failed/blocked，下游 13 个节点**永远不会**自动建出来（它们靠 set_task_instrument 触发）。此时 materialize_downstream 会因为「未绑定标的」拒绝 —— 正确做法是派一条 **role=screener** 的意图重跑选品。别用通用意图去"顶替"选品员：它拿不到选品员的 prompt 与 set_task_instrument 工具，选了标的也写不进任务。
+
 6. **提交**：用【一次】add_intent 批量提交筛出的新方向（intents 数组，最多 4 个最高价值的，不要逐条多次调）：
    - **summary**：一句话自然语言描述该方向（标的代码/名称 + 分析什么 + 为什么），不套固定分类；去重主要靠它与已有意图比对。
    - **asset_ids**：本方向要分析的标的 id（尽量传，0/1/多个，来自 list_assets）——只要方向围绕具体标的（个股/板块/市场/时间周期）就务必传，用于覆盖去重、连入标的链路，跨多标的就都传；纯全局数据收集无具体标的才留空。
    - **parent_ids**：本方向由哪些上游节点综合得出（可选，0/1/多个）——多个事实结合产生一个意图就都传，派生自某上游意图/分析结论也传其 id，顶层全新方向留空。
+   - **role**（可选）：把这条意图交给指定**执行角色**，取值只能从下表选。
+     **只在「补齐一条本该存在、但因故没跑成的流水线阶段」时填。**
+     | role | 负责 |
+     |---|---|
+     | screener | 按策略从市场筛候选标的，并把首选写进任务（唯一能改标的的角色） |
+     | analyst_market | 技术面：趋势/动量/波动/量价 |
+     | analyst_news | 新闻与宏观：影响标的事件与方向 |
+     | analyst_fundamental | 基本面：财报、估值、经营质量 |
+     | analyst_sentiment_crypto | 加密衍生品：资金费率/持仓量/多空拥挤度 |
+     | debate_bull / debate_bear | 多空论证（读分析师事实，不自己取数） |
+     | research_manager | 裁决多空论证强度，出结论与置信度 |
+     | trader | 出交易信号/建单草案并过风控闸门 |
+     | risk_aggressive / risk_conservative / risk_neutral | 三方风控意见 |
+     | portfolio_manager | 组合评级（流程终点） |
+
+     ⚠ **不填 role 才是多数情况**：
+     - 开放式探索、线索挖掘、纯数据收集 —— 通用执行者工具最全，能自己去查；
+     - 跨角色的综合推理（「把基本面和技术面结论合起来看」）—— 没有哪个角色负责这个；
+     - 你不确定该由谁负责 —— 不确定就别猜，留空。
+     角色执行者**只读上游产出、不做开放式探索**：它拿不到 Bash/Write，也不会跳出自己的
+     意图范围去取数。给它派「去查一下 X」这类活，它只会报数据缺失。
 
 不重复、不硬凑；但目标未达成、又有未覆盖且更深的分析角度时，该派就派。简洁、聚焦、高效。`
 
@@ -412,6 +456,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	tsx.SetCoverageEnabled(as == nil || as.CoverageEnabled(taskID))
 	tsx.killWork = p.killWork   // enable kill_work tool (nil = unavailable)
 	tsx.steerWork = p.steerWork // enable steer_work tool (nil = unavailable)
+	tsx.materializeDownstream = p.materializeDownstream // enable materialize_downstream (nil = unavailable)
 	if origin, _ := ts.OriginFactID(); origin > 0 {
 		tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)
 	}

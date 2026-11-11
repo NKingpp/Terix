@@ -275,6 +275,45 @@ func (s *ExplorationStore) AddGoal(payload map[string]any, origin string) (int64
 	return s.AddNode("goal", payload, 0, "open", origin, nil)
 }
 
+// InstrumentMeta 返回本探索已确定的标的（instID, assetClass）。
+//
+// # 谁用、为什么需要
+//
+// planner 通过 add_intent 指定 role 时，必须同时给意图带上 instrument_id ——
+// 角色执行者靠它定位标的（各角色的 vars 构造器读 payload.instrument_id 决定
+// 取哪只票）。而 planner 只管「方向」，它自己不知道标的 id。
+//
+// 不回填的后果：analyst_market 拿到 instrument_id=0 → 判「标的未知」→
+// 直接写 unavailable，整条分析链白跑。
+//
+// # 为什么从图里抄，而不是查 tasks 表
+//
+// ExplorationStore 刻意不持有 tasks 表的查询能力（分层：它只管探索图）。
+// 而 Expand 建阶段图时已经把 instrument_id / asset_class 写进**每个**阶段节点的
+// payload（见 agent/materialize.go）—— 那是任务级稳定事实，与
+// explorationIsFinancial 用的是同一个判据来源。
+//
+// # 为什么取 id 最大的
+//
+// 阶段图节点在任务创建时一次性建完，id 递增。取最新的一条即「当前图里的标的」。
+// 若任务后来通过 set_task_instrument 换了标的，新展开的下游节点 id 更大，
+// 天然覆盖旧值。
+//
+// 返回 instID==0 表示本任务没有绑定标的（无标任务、或渗透任务）。
+func (s *ExplorationStore) InstrumentMeta() (instID int64, assetClass string) {
+	_ = s.db.QueryRow(`
+SELECT CAST(json_extract(payload,'$.instrument_id') AS INTEGER),
+       COALESCE(json_extract(payload,'$.asset_class'),'')
+  FROM exploration_nodes
+ WHERE exploration_id=$1 AND kind='intent'
+   AND COALESCE(CAST(json_extract(payload,'$.instrument_id') AS INTEGER),0) > 0
+ ORDER BY id DESC LIMIT 1`, s.expID).Scan(&instID, &assetClass)
+	if instID <= 0 {
+		return 0, ""
+	}
+	return instID, assetClass
+}
+
 // OriginFactID returns this exploration's root fact id — the KindFact node with
 // state='origin' seeded at task creation (the task root). Every intent traces
 // back to it. Returns 0 (no error) when none exists (legacy explorations created

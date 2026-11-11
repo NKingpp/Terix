@@ -45,6 +45,11 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 		if ys := yieldsOf[n.ID]; len(ys) > 0 {
 			m["yields"] = ys // 下游：本意图产生了哪些事实/发现
 		}
+		// role 回显：planner 每次唤醒都是新 session，这是它「上一轮派过哪些角色」
+		// 的唯一记忆。不回显的话它只能靠 summary 文字猜，容易重复派同一条。
+		if r, _ := p["role"].(string); strings.TrimSpace(r) != "" {
+			m["role"] = strings.TrimSpace(r)
+		}
 		out = append(out, m)
 	}
 	return out
@@ -92,6 +97,16 @@ type ToolSet struct {
 	// intent id (engine callback, wired by the planner): the worker injects it before
 	// its next tool call and re-plans, without being killed. nil = tool unavailable.
 	steerWork func(intentID int64, msg string) error
+	// materializeDownstream, if set, 补建本任务的阶段图（engine/server 回调）。
+	//
+	// # 为什么需要它（2026-11-11 task 11）
+	//
+	// 下游节点原本只有**一个**创建入口：screener 成功调 set_task_instrument →
+	// MaterializeDownstream。screener 一失败（model_error 很常见），整张图的下半截
+	// 就不存在，而 planner 手上没有任何手段自己补 —— 只能派无 role 的通用意图顶替。
+	//
+	// nil = 工具报不可用（未装配的旧路径）。
+	materializeDownstream func() (int, error)
 	// notify, if set, wakes the task's planner after a graph change that should be
 	// re-planned promptly (currently: a new hint). nil = no wake (the hint is still
 	// stored and read on the next round triggered by other events). debounced.
@@ -580,6 +595,116 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		recentDone = recentDone[:recentDoneCap]
 	}
 	out["recent_done_intents"] = compactIntents(recentDone, parentsOf, yieldsOf)
+	// stage_graph_missing：按标的类别**本该有**、但图里完全没有意图承担的执行角色。
+	//
+	// # 为什么必须有这个字段（2026-11-11 task 11）
+	//
+	// screener 因 model_error 被标 blocked → 它不会调 set_task_instrument →
+	// 下游 13 个节点（由 MaterializeDownstream 创建）**从未存在**。
+	// 在此之前这件事没有任何可观测信号：planner 只看到「recent_done 里没有 trader」，
+	// 而「没跑过」与「压根没建」在列表里长得一模一样，只能自己派无 role 的意图瞎补。
+	//
+	// # present 为什么算上 blocked/exhausted
+	//
+	// 只按「节点存在」判断，不按成败。否则一个 blocked 的 trader 会每轮被报成
+	// 「缺失」，planner 就会每轮派一条新的 role=trader 意图 —— 刷屏。
+	// blocked 的重跑由提示词里既有的「blocked/exhausted 处置」段负责。
+	//
+	// # 为什么「任务还没定标的」时不报（2026-11-11 实测纠正）
+	//
+	// 无标任务的第一阶段就是 screener，下游**本来**还不该存在 —— 那是正常流程，
+	// 不是缺口。此时报缺失会让 planner 在选品还没结束时就去补建，
+	// 而补建出来的全是 instrument_id=0 的空节点，分析师只会写 unavailable。
+	//
+	// 判据用「图里有没有带 instrument_id 的节点」而不是「有没有 screener 节点」：
+	// 后者在选品成功、下游展开后又会被 set_task_instrument 清掉，不可靠。
+	// # 为什么判据是「图里有没有带 asset_class 的**非 screener** 节点」
+	//
+	// screener 自己带 asset_class（Expand 给所有节点都塞了），所以不能用
+	// 「有没有 asset_class」区分「已选品」和「还没选品」。真正的分界是：
+	// 下游节点（analyst_* / trader / …）存在，说明选品成功、图已展开。
+	//
+	// 于是：
+	//   - 只建了 screener（ScreenerOnly）→ 只有 screener 节点 → 不报缺失（正常流程）
+	//   - screener blocked 且下游从未建 → 同样只有 screener 节点 → **也不报**
+	//
+	// 后者是 2026-11-11 task 11 的真实形态，也是这个字段最该报的场景。
+	// 区分它是靠 tasks.instrument_id：已绑标的但只有 screener 节点 = 卡住了。
+	// 但 ExplorationStore 拿不到 tasks（分层），所以改由 add_intent 的
+	// instrument_id 回填来表达「任务已定标的」—— 见下面的 hasInstrument。
+	if ac := assetClassOfGraph(t.ts); ac != "" {
+		present := make(map[string]bool)
+		hasDownstream := false
+		for _, n := range all {
+			if len(n.Payload) == 0 {
+				continue
+			}
+			var p map[string]any
+			if json.Unmarshal(n.Payload, &p) != nil {
+				continue
+			}
+			role, _ := p["role"].(string)
+			role = strings.TrimSpace(role)
+			if role == "" {
+				continue
+			}
+			present[role] = true
+			// 除 screener 外的角色存在 ⇒ 选品已完成、下游已展开。
+			if role != RoleScreener {
+				hasDownstream = true
+			}
+		}
+		// 只有 screener 时不报缺失：那是「选品进行中或失败」的中间态，
+		// 处置方式与「下游缺失」不同（重跑 screener，而非补建）。
+		// 这个状态由 planner prompt 的「screener blocked → 重派 role=screener」覆盖。
+		if hasDownstream {
+			var missing []string
+			for _, r := range ExpectedStageRoles(ac) {
+				if !present[r] {
+					missing = append(missing, r)
+				}
+			}
+			if len(missing) > 0 {
+				out["stage_graph_missing"] = missing
+			}
+		} else if len(present) > 0 {
+			// 有 screener 但没有任何下游角色 —— 两种可能：
+			//   (a) 选品还在跑（正常）
+			//   (b) 选品已 failed/blocked，下游永远不会自动展开（task 11 形态）
+			//
+			// 两者在图上不可区分（都只有 screener 节点）。所以不报
+			// stage_graph_missing（会误报 (a)），而是报一个**带状态**的
+			// 诊断字段，让 planner 自己看 screener 的 state 判断。
+			type roleState struct {
+				Role  string `json:"role"`
+				State string `json:"state"`
+			}
+			var only []roleState
+			terminal := false
+			for _, n := range all {
+				if len(n.Payload) == 0 {
+					continue
+				}
+				var p map[string]any
+				if json.Unmarshal(n.Payload, &p) != nil {
+					continue
+				}
+				if r, _ := p["role"].(string); strings.TrimSpace(r) != "" {
+					only = append(only, roleState{Role: strings.TrimSpace(r), State: n.State})
+					if n.State == "blocked" || n.State == "exhausted" {
+						terminal = true
+					}
+				}
+			}
+			if terminal {
+				out["stage_graph_stalled"] = map[string]any{
+					"reason": "选品阶段已失败，下游 13 个阶段节点从未建出；" +
+						"重派一条 role=screener 的意图重跑选品（它调 set_task_instrument 后会自动展开下游）",
+					"present": only,
+				}
+			}
+		}
+	}
 	// cold-digest §6.1: 折叠冷区的 digest body，按最新成员时间降序取前 N；被截的更旧 digest
 	// 只给裸 id（仍可 expand_digest 展开），避免冷区唯一出口被无限拉长。
 	const coldDigestsCap = 15
@@ -1150,6 +1275,9 @@ type intentItem struct {
 	AssetIDs  []json.RawMessage `json:"asset_ids"`
 	ParentIDs []json.RawMessage `json:"parent_ids"`
 	Priority  int               `json:"priority"`
+	// Role 把这条意图交给指定执行角色（见 finance_roles.go 的白名单）。
+	// 空 = 通用执行者（worker，工具最全）。取值非法时 addOneIntent 会拒绝。
+	Role string `json:"role"`
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1159,6 +1287,19 @@ type intentItem struct {
 func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
+	}
+	// role 校验必须在落库前 —— 不存在的 role 会让 agentKeyForIntent 原样返回它，
+	// 然后 renderRolePrompt 找不到模板 fallback 到 worker prompt、工具子集为空，
+	// 节点照样派发、照样跑，只是跑错身份。**静默退化比拒绝难查十倍**。
+	//
+	// 放在 rejectDuplicateIntent 之前也有讲究：非法 role 是调用方的编程错误，
+	// 不该为它触发一次全表去重扫描。
+	role := strings.TrimSpace(it.Role)
+	if role != "" && !IsFinancialRole(role) {
+		return 0, fmt.Errorf(
+			"role=%q 不是可指派的执行角色。可用：%s。"+
+				"若这条意图是开放式探索/取数/跨角色综合，请省略 role —— 通用执行者工具最全",
+			it.Role, strings.Join(FinancialRoleKeys(), "、"))
 	}
 	// 落库前抑制重复方向（等待型目标最容易被硬底线逼成每轮派同一条意图）。
 	if err := t.rejectDuplicateIntent(it.Summary); err != nil {
@@ -1199,6 +1340,24 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if len(anchors) > 0 {
 		payload["asset_ids"] = anchors
 	}
+	if role != "" {
+		// 写 role 一次解决三件事：
+		//   ① agentKeyForIntent 选 prompt（role_prompt.go 读 payload.role）
+		//   ② 工具子集过滤（金融角色拿不到 Bash/Write）
+		//   ③ owner 列 —— AddNode 会从 payload["role"] 派生它
+		//      （db/exploration.go 的 owner 派生 + schema 触发器兜底）
+		payload["role"] = role
+		// 角色执行者靠 payload.instrument_id 定位标的：各角色的 vars 构造器
+		// 读它决定取哪只票。planner 只管方向、不写标的，从图里抄 ——
+		// Expand 建阶段图时已把任务级标的写进每个节点。
+		//
+		// 不回填的后果：analyst_market 拿到 instrument_id=0 → 判「标的未知」
+		// → 直接写 unavailable，整条分析链白跑（比不派还浪费）。
+		if instID, ac := t.ts.InstrumentMeta(); instID > 0 {
+			payload["instrument_id"] = instID
+			payload["asset_class"] = ac
+		}
+	}
 	id, err := t.ts.AddIntent(payload, priority, anchors, "planner")
 	if err != nil {
 		return 0, err
@@ -1223,11 +1382,20 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 	return t.writeExpTool("add_intent", "生成【探索方向】写入 frontier，并连入探索链路。意图是开放的探索方向，不是固定类型——用 summary 一句话自由描述要探索/验证/利用什么。\n"+
 		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。",
 		obj(map[string]any{
-			"intents":    map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
+			"intents":    map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority/role）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
 			"summary":    str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
 			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要分析的【目标标的 id】（**尽量传**，0/1/多个；是 list_assets 返回的标的 id，不是探索节点 id）：这条分析方向针对哪些标的（个股/板块/指数/品种等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
 			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
 			"priority":   intp("优先级 0-10，默认5"),
+			// enum 是「成本优化」：模型看到 enum 就不会传拼错的 role，
+			// 省一次工具往返。handler 里的硬校验仍是安全边界，两层各有作用。
+			"role": map[string]any{
+				"type": "string",
+				"enum": FinancialRoleKeys(),
+				"description": "【可选】把这条意图交给指定分析角色执行。" +
+					"只在「补齐一条本该存在、但因故没跑成的流水线阶段」时填；" +
+					"开放式探索/纯取数/跨角色综合一律留空 —— 通用执行者工具最全。",
+			},
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -1850,6 +2018,48 @@ func (t *ToolSet) killWorkTool() actool.CoreTool {
 		})
 }
 
+// materializeDownstreamTool 让 planner 补建本任务的阶段图。
+//
+// # 为什么需要这个工具（2026-11-11 task 11）
+//
+// 下游节点（分析→辩论→研究→交易→风控→组合，共 13 个）唯一的创建入口是
+// screener 调 set_task_instrument → MaterializeDownstream。而 screener 很容易
+// 因 model_error（传输层故障）被封成 blocked —— 那时：
+//   - tasks.instrument_id 可能还没写（选品失败的常见形态）
+//   - 下游 13 个节点**从未存在**
+//   - graph_overview 的 stage_graph_missing 会报出这一整批缺失
+//
+// 在补建工具存在之前，planner 对此毫无办法，只能派无 role 的通用意图「顶替」——
+// 而那两条意图拿不到选品员/分析师的 prompt，产出质量完全不同。
+// MaterializeDownstreamTool 构造 materialize_downstream 工具。
+//
+// 导出给 server 的 seed（只读 Name/Description/Schema，永不 Call）；
+// PlannerTools() 内部也直接用它。
+func (t *ToolSet) MaterializeDownstreamTool() actool.CoreTool {
+	return t.writeExpTool("materialize_downstream",
+		"补建本任务的阶段图（分析→辩论→研究→交易→风控→组合）。\n"+
+			"用于 graph_overview 的 stage_graph_missing 非空、且任务**已绑定标的**时 —— "+
+			"典型是选品阶段中途失败，下游十几个节点从未建出。\n"+
+			"任务未绑定标的时调用会报错：那种情况应先派 role=screener 的意图跑选品，"+
+			"它选定标的后会自动展开下游。\n"+
+			"已展开时调用是 no-op（返回 0，不会重复建节点）。",
+		obj(map[string]any{}),
+		func(_ context.Context, _ json.RawMessage) (actool.Result, error) {
+			if t.materializeDownstream == nil {
+				return actool.Errorf("materialize_downstream 当前不可用（未装配）"), nil
+			}
+			n, err := t.materializeDownstream()
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if n == 0 {
+				return actool.Text("阶段图已存在（无缺失），未新建节点"), nil
+			}
+			return actool.Text(fmt.Sprintf(
+				"已补建 %d 个阶段节点，它们会在下次派发时被领取", n)), nil
+		})
+}
+
 // steerWorkTool lets the planner inject a mid-run course-correction into a running
 // work WITHOUT killing it: the message reaches the worker before its next tool call,
 // which re-plans its next step (already-gathered context is kept). For in-intent
@@ -2187,7 +2397,7 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		// cold-digest §6.1: restore folded cold nodes (digest body → members → detail).
 		t.expandDigest(),
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.addIntent(), t.proveGoal(), t.goalMet(),
-		t.killWorkTool(), t.steerWorkTool(),
+		t.killWorkTool(), t.steerWorkTool(), t.MaterializeDownstreamTool(),
 		// report_finding：规划态势研判时若自身已确证漏洞，可直接登记（与 worker 同工具）。
 		t.addFinding(),
 		// list_companies：查看企业列表 + scope + 资产数（拿 company_id / 理解归属范围）。

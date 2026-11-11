@@ -699,12 +699,29 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 // 宁可漏判一次（人工看得见 Bash 调用），也不要因为一次查询失败
 // 让所有金融任务突然失去必要工具。
 func explorationIsFinancial(ts *db.ExplorationStore) bool {
+	return assetClassOfGraph(ts) != ""
+}
+
+// assetClassOfGraph 返回本探索阶段图的资产类别；空 = 非金融任务。
+//
+// 判据与 explorationIsFinancial 同源（那函数现在就是它的包装）：
+// Expand 把 asset_class 写进**每个**阶段节点的 payload，那是任务级稳定事实。
+// 比「这条意图有没有 role」可靠得多 —— planner 自建的意图两者都没有。
+//
+// # 为什么抽出来
+//
+// graph_overview 要靠它判断「本任务是不是金融任务、该有哪些角色」，
+// 从而报出 stage_graph_missing。两处各写一份解析逻辑必然分叉。
+//
+// 只扫前 50 条：阶段图节点在任务创建时集中插入、id 靠前，扫太多是浪费。
+// 失败返回空串（当作非金融），保持 explorationIsFinancial 原有的失败方向。
+func assetClassOfGraph(ts *db.ExplorationStore) string {
 	if ts == nil {
-		return false
+		return ""
 	}
 	nodes, err := ts.ListByKind(db.KindIntent, 50)
 	if err != nil {
-		return false
+		return ""
 	}
 	for _, n := range nodes {
 		if len(n.Payload) == 0 {
@@ -715,8 +732,8 @@ func explorationIsFinancial(ts *db.ExplorationStore) bool {
 			continue
 		}
 		if ac, _ := p["asset_class"].(string); strings.TrimSpace(ac) != "" {
-			return true
+			return strings.TrimSpace(ac)
 		}
 	}
-	return false
+	return ""
 }

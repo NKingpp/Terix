@@ -83,8 +83,9 @@ func (s *SetInstrumentToolSet) setTaskInstrument() actool.CoreTool {
 			"调用后，下游所有分析师会拿到这个标的（symbol/market/asset_class），\n" +
 			"不再出现「标的未知，无法分析」。\n" +
 			"\n" +
-			"⚠ 只在本任务**尚未绑定标的**时可用。任务已有标的时会被拒绝 ——\n" +
-			"那说明用户明确指定了，你不该覆盖。\n" +
+			"⚠ 只在本任务**尚未绑定标的**时用来**选**标的。\n" +
+			"任务已有标的时会拒绝改标的（那说明用户明确指定了，你不该覆盖）；\n" +
+			"但若上次恰好在下游展开时失败，再次调用会**补建**下游阶段而不是报错。\n" +
 			"\n" +
 			"调用前务必先用 get_quote 验证标的真实存在（能取到价格），\n" +
 			"否则会把不存在的代码写进任务，下游分析师全部白跑。",
@@ -137,13 +138,34 @@ func (s *SetInstrumentToolSet) runSetTaskInstrument(ctx context.Context, in json
 		return actool.Errorf(fmt.Sprintf("读取任务失败: %v", err)), nil
 	}
 	if current != nil && *current > 0 {
-		// 已有标的 —— 拒绝覆盖。
+		// 已有标的 —— 只放行「补建下游」，不放行改标的。
 		//
-		// 这是权限边界而不是技术限制：用户明确写了标的时，选品员不该改写它。
-		// 返回当前值让模型知道「不用你选了」，避免它反复重试。
-		return actool.Errorf(fmt.Sprintf(
-			"本任务已绑定标的（instrument_id=%d），不能覆盖。直接分析该标的即可，不要调用本工具",
-			*current)), nil
+		// # 为什么不能一律拒绝（2026-11-11 修）
+		//
+		// 上一次调用可能恰好在下游展开时失败（比如 MaterializeDownstream 报错）。
+		// 那时 tasks.instrument_id **已经落库**，而阶段图没建。
+		// 一律拒绝会让重试被挡在门外 —— 下游永远补不上，形成死锁。
+		//
+		// 改标的仍然是禁止的（那是权限边界：用户明确写了标的时选品员不该改写）。
+		// 幂等由 MaterializeDownstream 的 join 判据保证：下游已在就返回 0。
+		assetClass := agent.AssetClassStock
+		if instRow, e := s.pg.Instruments().GetInstrumentByID(*current); e == nil && instRow != nil && instRow.AssetClass != "" {
+			assetClass = instRow.AssetClass
+		}
+		created, mErr := MaterializeDownstream(ctx, s.pg, ri.ExplorationID, *current, assetClass)
+		if mErr != nil {
+			return actool.Errorf(fmt.Sprintf(
+				"标的已绑定（instrument_id=%d）但下游补建失败: %v。请重试或联系运维",
+				*current, mErr)), nil
+		}
+		if created == 0 {
+			return actool.Errorf(fmt.Sprintf(
+				"本任务已绑定标的（instrument_id=%d），阶段图也已展开，不能覆盖。"+
+					"直接分析该标的即可，不要调用本工具", *current)), nil
+		}
+		return actool.Text(fmt.Sprintf(
+			"标的已绑定（instrument_id=%d），已补建 %d 个下游阶段节点。"+
+				"分析师现在会针对该标的取数分析。", *current, created)), nil
 	}
 
 	// ② 查/建 instruments 行。

@@ -310,7 +310,33 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			if pin != nil {
 				llmIDs = []int64{*pin}
 			}
-			t, err := s.m.CreateTaskWithOptions(a.Description, a.Goal, db.TaskCreateOptions{
+			// 子任务也走金融路径（2026-11-11 修）。
+			//
+			// # 原来的问题
+			//
+			// spawn_task 从不传 InstrumentID 也不传 MaterializeGraph —— 于是
+			// 「分析 BTC-USDT 的资金费率」这类子任务全部落成通用 worker，
+			// 即便 goal 里白纸黑字写了标的。13 个金融角色一个都不会出现，
+			// 因为阶段图根本没建。
+			//
+			// # 为什么只查库、不打行情源
+			//
+			// resolveInstrumentFromTaskText 需要 *http.Request 且有 HTTP 往返
+			// （逐个候选验价）。编排是内部批量建任务的路径，不该为一个猜测
+			// 付 N 次行情调用；库里认不出就交给选品阶段（screener 会去打行情）。
+			inst, _ := ResolveInstrumentFromText(s.m.PG().Instruments(), a.Description, a.Goal)
+			if inst == nil && a.ParentRef != "" {
+				// 文本没提任何已登记标的 → 继承父任务的（同父系的子任务通常同票）。
+				//
+				// **文本优先**：子任务明确写了另一只票时，上面那步认出来的就是那只，
+				// 不会被父标的错误覆盖。
+				if pt, ok := s.m.Task(a.ParentRef); ok && pt.InstrumentID != nil && *pt.InstrumentID > 0 {
+					if pi, e := s.m.PG().Instruments().GetInstrumentByID(*pt.InstrumentID); e == nil {
+						inst = pi
+					}
+				}
+			}
+			opts := db.TaskCreateOptions{
 				// add_task 的 description 语义就是「简短标题」，直接当任务名用。
 				// 原先未设 Name → tasks.name 是空串，任务列表显示空白行。
 				Name:                 a.Description,
@@ -318,7 +344,19 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 				LLMProfileIDs:        llmIDs,
 				TimeoutSeconds:       a.TimeoutSeconds,
 				PlanHeartbeatSeconds: a.PlanHeartbeatSeconds,
-			})
+			}
+			// 金融任务（认得标的，或文本命中金融关键词）必须建阶段图 ——
+			// 否则即使 goal 写着「分析 BTC」，跑起来的也全是通用 worker。
+			if inst != nil || taskIsFinance(nil, a.Description, a.Goal) {
+				if inst != nil {
+					id := inst.ID
+					opts.InstrumentID = &id
+				}
+				// inst == nil 时也建图：无标金融任务只建 screener 阶段
+				// （ScreenerOnly），由选品员自己挑标的（见 createTask 同名注释）。
+				opts.MaterializeGraph = s.stageGraphMaterializer(inst)
+			}
+			t, err := s.m.CreateTaskWithOptions(a.Description, a.Goal, opts)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
@@ -479,7 +517,12 @@ func (s *Server) seedOrchestrationTools() {
 // reaches an old DB otherwise. Preserves each tool's agent binding + enabled flag.
 // Bump the flag whenever these tools' schemas/descriptions change in code.
 func (s *Server) refreshBuiltinToolSchemas() {
-	const flag = "tool_schema_refresh_v7_list_facts_paging"
+	// v8（2026-11-11）：add_intent 新增 role 参数（planner 可指定执行角色）。
+	//
+	// **必须 bump**：v7 在已部署库上早已 true。不换 flag 名，老库的 add_intent
+	// schema 永远不会更新 → 模型看不到 role 参数 → 本功能对已部署环境等于没做。
+	// 表现是「代码明明改了，但模型派意图还是不带角色」。
+	const flag = "tool_schema_refresh_v8_add_intent_role"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -497,7 +540,9 @@ func (s *Server) refreshBuiltinToolSchemas() {
 	//     SeedTool 首插入only，旧库已 seed 的 schema 否则收不到这个新参数。
 	//   - list_facts：改为分页，新增 limit/before/q 入参；旧库已 seed 的空 schema 否则
 	//     在工具管理页显示「无参数」，模型也拿不到这几个参数说明。
-	refreshBuiltin := map[string]bool{"goal_met": true, "insert_assets": true, "list_facts": true}
+	//   - add_intent：新增 role 入参（planner 可把意图交给指定执行角色）。旧库的
+	//     schema 没有 role，模型即使被 prompt 告知也传不了 —— 这次事故的镜像版。
+	refreshBuiltin := map[string]bool{"goal_met": true, "insert_assets": true, "list_facts": true, "add_intent": true}
 	for _, sd := range agent.BuiltinToolSeeds() {
 		if !refreshBuiltin[sd.Key] {
 			continue
@@ -595,7 +640,12 @@ func (s *Server) reseedMainAgentPrompt() {
 // 找回。settings flag 守卫 → 只做一次。全新库无需处理(SeedPromptIfEmpty 已 seed 最新默认)。与
 // reseedGoalsPrompt 完全同构。
 func (s *Server) reseedPlannerPrompt() {
-	const flag = "planner_prompt_compact_realistic_v2"
+	// v4（2026-11-11）：补 stage_graph_stalled 的处置说明 —— 光有 missing 不够，
+	// 「选品失败导致下游从未建出」这种形态只能靠 stalled 报出来。
+	//
+	// **必须 bump**：v3 已在本次部署的库上置 true。
+	// prompt 正文是 DB 快照（SeedPromptIfEmpty 首插入 only）。
+	const flag = "planner_prompt_role_dispatch_v4"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}

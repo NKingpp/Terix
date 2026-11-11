@@ -243,3 +243,89 @@ WHERE exploration_id=$1 AND kind='join'`, expID).Scan(&joins); err != nil {
 	}
 	return res.NodeCount, nil
 }
+
+// materializeTaskDownstream 是 planner 的 materialize_downstream 工具后端。
+//
+// # 为什么需要这个入口（2026-11-11 task 11）
+//
+// 下游节点的**唯一**创建路径是「screener 成功 → 调 set_task_instrument →
+// MaterializeDownstream」。screener 一旦被 model_error 封成 blocked，
+// 下游 13 个节点从未存在，而 planner 除了干等没有任何手段。
+//
+// 本函数把「补建」这件事暴露给 planner，让它在 stage_graph_missing 非空时自救。
+//
+// # 未绑标的时为什么报错而不是强行建图
+//
+// 下游每个节点的 payload 都带 instrument_id —— 没有标的时建出来的是一堆
+// 「标的未知」的分析师，它们只会立刻写 unavailable。那种情况下正确做法是
+// 重跑选品（role=screener），由它调 set_task_instrument 一次性选定标的并展开。
+func (s *Server) materializeTaskDownstream(taskID string) (int, error) {
+	t, ok := s.m.Task(taskID)
+	if !ok || t == nil {
+		return 0, fmt.Errorf("任务 %s 不存在", taskID)
+	}
+	if t.InstrumentID == nil || *t.InstrumentID <= 0 {
+		return 0, fmt.Errorf(
+			"本任务尚未绑定标的 —— 下游节点建出来也全是「标的未知」。" +
+				"请先派一条 role=screener 的意图跑选品，它调 set_task_instrument " +
+				"选定标的后会自动展开下游阶段")
+	}
+	assetClass := agent.AssetClassStock
+	if inst, err := s.m.pg.Instruments().GetInstrumentByID(*t.InstrumentID); err == nil && inst != nil {
+		if inst.AssetClass != "" {
+			assetClass = inst.AssetClass
+		}
+	}
+	return MaterializeDownstream(context.Background(), s.m.pg, t.ExpID, *t.InstrumentID, assetClass)
+}
+
+// stageGraphMaterializer 返回「在事务内建本任务阶段图」的回调。
+//
+// # 为什么抽出来（2026-11-11）
+//
+// HTTP createTask 与编排 spawn_task 都必须建图，而 db.CreateTaskWithOptions
+// 强制「有 InstrumentID 就必须有 MaterializeGraph」。两处各写一遍必然分叉：
+// 一处忘 ScreenerOnly（无标任务建出 13 个空标的节点）、
+// 一处忘 ApplyStageGraph 的幂等（重跑建两套）。
+//
+// inst == nil 表示「无标任务」：只建选品阶段，下游等 set_task_instrument。
+func (s *Server) stageGraphMaterializer(inst *db.Instrument) func(tx *sql.Tx, expID int64) error {
+	return func(tx *sql.Tx, expID int64) error {
+		assetClass := agent.AssetClassStock
+		var instID int64
+		if inst != nil {
+			if inst.AssetClass != "" {
+				assetClass = inst.AssetClass
+			}
+			instID = inst.ID
+		}
+		graph, expErr := agent.Expand(assetClass, agent.ExpandOpts{
+			InstrumentID: instID,
+			AsOf:         time.Now().UTC(),
+			// 无标的任务只建选品阶段：下游 13 个意图全都要 instrument_id，
+			// 而标的要等 screener 跑完才知道。先建出来只会是空标的节点，
+			// 分析师拿到 instrument_id=0 后全部判「标的无法分析」（实测）。
+			// 选定标的后由 set_task_instrument 补建（见 MaterializeDownstream）。
+			ScreenerOnly: inst == nil,
+		})
+		if expErr != nil {
+			return fmt.Errorf("展开 %s 的阶段图失败: %w", assetClass, expErr)
+		}
+		// # 为什么用 ApplyStageGraph 而不是直接 MaterializeGraph
+		//
+		// 三个理由：
+		//
+		//   ① 幂等：如果将来出现「任务重跑」或「补建图」，这里 no-op 而不是重复建。
+		//   ② 版本：模板升级后，版本标记让「重建」成为可能
+		//      （判据是 applied 版本 != 当前版本，而不是 applied 是否存在）。
+		//   ③ **调用路径必须存在**：零调用的函数是死代码，而它比死代码更糟 ——
+		//      153 行 + 8 个测试的实现会让人以为「阶段图落库已经有幂等保护了」，
+		//      实际从没执行过。
+		//
+		// 另外：ApplyStageGraph 还是「补建图」的唯一入口。
+		if _, _, matErr := ApplyStageGraph(tx, expID, graph); matErr != nil {
+			return fmt.Errorf("落库阶段图失败: %w", matErr)
+		}
+		return nil
+	}
+}

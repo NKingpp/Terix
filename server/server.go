@@ -343,6 +343,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		s.seedFinancialToolBindings()          // W5 金融角色默认工具绑定（一次性迁移，见 assembly.go）
 		s.seedTradeToolBindings()              // 交易执行工具绑定给 trader（提案 + 过闸，不含执行）
 		s.SeedSetInstrumentTool()              // 选品结果回填工具绑给 screener（见 set_instrument_tool.go）
+		s.SeedMaterializeDownstreamTool()      // 阶段图补建工具绑给 planner（见 materialize_tool.go）
 		s.refreshSourceQuoteToolDescriptions() // 按源行情工具描述刷成代码默认值（每次启动，见函数注释）
 		s.refreshComputeIndicatorDefaults()    // compute_indicator schema 对齐（每次启动，见函数注释）
 		seedPrompts(m.pg)                      // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
@@ -1742,51 +1743,9 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 
 	var materialize func(tx *sql.Tx, expID int64) error
 	if resolved != nil || financeNoInstrument {
-		// 闭包捕获 inst 与它的 asset_class，事务内展开并落库。
-		// 展开（Expand）是纯内存计算，不碰 DB，可以放在闭包里跑。
-		inst := resolved
-		materialize = func(tx *sql.Tx, expID int64) error {
-			assetClass := agent.AssetClassStock
-			var instID int64
-			if inst != nil {
-				assetClass = inst.AssetClass
-				instID = inst.ID
-			}
-			graph, expErr := agent.Expand(assetClass, agent.ExpandOpts{
-				InstrumentID: instID,
-				AsOf:         time.Now().UTC(),
-				// 无标的任务只建选品阶段：下游 13 个意图全都要 instrument_id，
-				// 而标的要等 screener 跑完才知道。先建出来只会是空标的节点，
-				// 分析师拿到 instrument_id=0 后全部判「标的无法分析」（实测）。
-				// 选定标的后由 set_task_instrument 补建（见 MaterializeDownstream）。
-				ScreenerOnly: inst == nil,
-			})
-			if expErr != nil {
-				return fmt.Errorf("展开 %s 的阶段图失败: %w", inst.AssetClass, expErr)
-			}
-			// # 为什么用 ApplyStageGraph 而不是直接 MaterializeGraph
-			//
-			// 三个理由：
-			//
-			//   ① 幂等：如果将来出现「任务重跑」或「补建图」，这里 no-op 而不是重复建。
-			//      当前 CreateTask 每次都新建 exploration，所以 applied 恒为 true ——
-			//      但这不意味着「用不上」，意味着「现在用不上，将来会用上」。
-			//
-			//   ② 版本：模板升级后，版本标记让「重建」成为可能
-			//      （判据是 applied 版本 != 当前版本，而不是 applied 是否存在）。
-			//
-			//   ③ **调用路径必须存在**：零调用的函数是死代码（见 L9）。
-			//      而它比死代码更糟 —— 153 行 + 8 个测试的实现会让人以为
-			//      「阶段图落库已经有幂等保护了」，实际从没执行过。
-			//
-			// 另外：ApplyStageGraph 还是「补建图」的唯一入口 ——
-			// 当 exploration 已有但没有阶段图时（InstrumentID 非空但 MaterializeGraph 为 nil
-			// 曾被拒绝，但历史数据可能存在），可以用它事后补建。
-			if _, _, matErr := ApplyStageGraph(tx, expID, graph); matErr != nil {
-				return fmt.Errorf("落库阶段图失败: %w", matErr)
-			}
-			return nil
-		}
+		// 建图逻辑抽到 stageGraphMaterializer —— 编排 spawn_task 也要用它，
+		// 两处各写一遍必然分叉（一处忘 ScreenerOnly、一处忘幂等）。
+		materialize = s.stageGraphMaterializer(resolved)
 	}
 
 	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{
