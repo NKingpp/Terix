@@ -32,9 +32,28 @@ RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@late
 WORKDIR /app
 # 预编译好的对应架构二进制（dist/amd64/artex 或 dist/arm64/artex）
 COPY dist/${TARGETARCH}/artex /app/artex
+
+# 内置 akshare sidecar（与 artex 同一个容器）。
+#
+# # 为什么改成内置而不是独立服务
+#
+# 原来 sidecar 是 compose 里的第二个 service，代价是：
+#   - 两套容器生命周期，排障要进两个容器；
+#   - AKSHARE_SIDECAR_ADDR 在两侧语义相反（一侧目标、一侧监听），
+#     配错就是全部 SIDECAR_UNREACHABLE，且错误只在运行时暴露；
+#   - 每次改 server.py 都要重建一个镜像并重启另一个容器。
+#
+# 合进来后：一个容器、一个进程树、127.0.0.1:8791 直连，没有跨容器地址问题。
+# 基础镜像本来就是 python:3.12-slim-bookworm（sidecar 也是），不额外增重。
+# 代价是镜像变大（pandas/numpy 约 150MB）且升级 artex 时依赖层走缓存，不重装。
+COPY sidecars/akshare/requirements.txt /app/akshare/requirements.txt
+RUN pip install --no-cache-dir -r /app/akshare/requirements.txt
+COPY sidecars/akshare/server.py /app/akshare/server.py
+
 # 守护启动脚本：进程退出后按退出码决定是否重新拉起，页面一键更新靠它完成换装。
 # 它同时负责把 SIGTERM 转发给 artex —— docker stop 只把信号发给 PID 1，
 # 不转发的话 artex 收不到、做不了优雅关闭，10 秒后被 SIGKILL 硬杀。
+# 现在它还负责拉起 akshare sidecar 并在退出时一并回收。
 COPY start.sh /app/start.sh
 RUN chmod +x /app/artex /app/start.sh
 COPY skills/ /app/skills/

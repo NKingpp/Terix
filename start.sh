@@ -32,9 +32,32 @@ RESTART_CODE=75
 MAX_DELAY=60
 
 child=0
+akshare_pid=0
 stopping=0
 
-# 转发停止信号给 artex 本体。
+# ── 内置 akshare sidecar ─────────────────────────────────────────────
+#
+# 有 server.py 就拉起；没有（旧镜像/精简部署）静默跳过，不影响 artex 启动。
+# 缺了它非加密标的全部报 SIDECAR_UNREACHABLE（crypto 走 OKX，不受影响）。
+#
+# 监听 127.0.0.1:8791：现在与 artex 同容器，不需要对外暴露，也不该对外暴露。
+# AKSHARE_SIDECAR_ADDR 由 compose 传给 artex 时也必须是 127.0.0.1:8791，
+# 两侧语义因此一致 —— 合并部署消掉了原来「一侧目标一侧监听」的坑。
+AKSHARE_DIR="${AKSHARE_DIR:-./akshare}"
+AKSHARE_LISTEN="${AKSHARE_LISTEN_ADDR:-127.0.0.1:8791}"
+
+start_akshare() {
+	[ -f "$AKSHARE_DIR/server.py" ] || return 0
+	[ -x "$(command -v python 2>/dev/null)" ] || {
+		echo "[akshare] 未找到 python，跳过 sidecar（非加密行情将不可用）" >&2
+		return 0
+	}
+	AKSHARE_SIDECAR_ADDR="$AKSHARE_LISTEN" python "$AKSHARE_DIR/server.py" &
+	akshare_pid=$!
+	echo "[akshare] sidecar 已启动 (pid=$akshare_pid, listen=$AKSHARE_LISTEN)"
+}
+
+# 转发停止信号给两个子进程。
 #
 # Docker 下这是必需的：docker stop 只把 SIGTERM 发给 PID 1（也就是本脚本），
 # 不会发给子进程。不转发的话 artex 收不到信号、做不了优雅关闭，10 秒后被 SIGKILL
@@ -44,8 +67,13 @@ forward() {
 	if [ "$child" -ne 0 ]; then
 		kill -TERM "$child" 2>/dev/null || true
 	fi
+	if [ "$akshare_pid" -ne 0 ]; then
+		kill -TERM "$akshare_pid" 2>/dev/null || true
+	fi
 }
 trap forward INT TERM
+
+start_akshare
 
 delay=1
 while :; do
@@ -65,6 +93,14 @@ while :; do
 	if [ "$stopping" -eq 1 ]; then
 		echo "[artex] 已停止"
 		exit 0
+	fi
+
+	# sidecar 死了要拉起来：它挂了不会让 artex 退出，但非加密行情会全部
+	# SIDECAR_UNREACHABLE —— 一个安静的能力退化，比直接崩更难查。
+	# 用 kill -0 探活（不发信号，只看进程在不在）。
+	if [ "$akshare_pid" -ne 0 ] && ! kill -0 "$akshare_pid" 2>/dev/null; then
+		echo "[akshare] sidecar 已退出，重新拉起" >&2
+		start_akshare
 	fi
 
 	case "$code" in

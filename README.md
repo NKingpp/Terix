@@ -269,7 +269,7 @@ arm64 目标改 `TARGETARCH=arm64` 并准备 `dist/arm64/artex`。其余细节�
 | 目标系统 | Linux / macOS / Windows；生产建议 Linux amd64/arm64 |
 | 源码构建 | **Go ≥ 1.26.3**（`go.mod`）、Node.js ≥ 20 + npm（Next 16）、`rsync`（`build.sh` 用它同步静态产物） |
 | 可选 sidecar | Python 3.10+ 与独立 venv（A 股 / 港股 / 美股行情需要） |
-| 端口 | `8787` HTTP UI/REST/SSE（**唯一必需**）；`8791` akshare sidecar（可选）；`8788` 只是 `-proxy` 兼容参数，**当前版本无监听**，不要拿它做健康检查 |
+| 端口 | `8787` HTTP UI/REST/SSE（**唯一必需**）；`8791` akshare sidecar（容器内回环，不对外映射）；`8788` 只是 `-proxy` 兼容参数，**当前版本无监听**，不要拿它做健康检查 |
 | 可写目录 | 二进制同级目录（`jwt.key`、`config.json`、`skills/`）、`data/`（SQLite 及 WAL） |
 
 ```bash
@@ -385,32 +385,40 @@ docker run -d --pull=never --name terix -p 8787:8787 \
 - `docker-compose.yml` 已是本地 `build` + `pull_policy: never`，直接 `docker compose up -d --build`；**不要**改回远程 `image`、不要配置镜像 tag、不要执行 `docker compose pull`。`POSTGRES_*` 是上游遗留，可删。
 - 唯一允许拉取的**容器镜像**是 `Dockerfile` 的官方基础镜像 `python:3.12-slim-bookworm`（构建时仍会按 `apt` / `npm` 下载依赖）；业务镜像必须本地构建，运行容器一律 `--pull=never`。
 - 镜像 `CMD` 自带 `-addr :8787 -proxy :8788`，8788 无监听，映射它无意义。
-- **akshare 两端共读 `AKSHARE_SIDECAR_ADDR`**（默认 `127.0.0.1:8791`）：Go 侧拿它当**目标**地址，sidecar 拿它当**监听**地址。跨容器时必须写成两个不同的值，否则连不上 —— 容器里配 `127.0.0.1` 指的是容器自己（没有 sidecar 进程），会全部报 `SIDECAR_UNREACHABLE`。`docker-compose.yml` 已按正确方式配好：artex 侧 `AKSHARE_SIDECAR_ADDR=akshare:8791`（服务名），sidecar 侧 `AKSHARE_SIDECAR_ADDR=0.0.0.0:8791`（监听全部网卡）。**不要**把两边都留默认值。
+- **akshare sidecar 与 artex 跑在同一个容器里**（由 `start.sh` 拉起，监听 `127.0.0.1:8791`）。Go 侧与 sidecar 共用同一个地址变量 `AKSHARE_SIDECAR_ADDR=127.0.0.1:8791`，语义一致，不再有「一侧目标一侧监听」的歧义。**不要**把它改成 `0.0.0.0` 或某个服务名 —— 那会让 artex 连不上自己的 sidecar。
+
+  > 历史：曾把 sidecar 拆成独立 compose 服务。那时该变量在两侧必须写成两个不同的值（`akshare:8791` vs `0.0.0.0:8791`），配错的表现是所有非加密行情 `SIDECAR_UNREACHABLE`，且只在运行时暴露。合并后这个坑消失。
 
 ### 5. akshare sidecar（A股/港股/美股行情）
 
 不装也能启动，但**只有加密（OKX 通道）能取行情**；`get_quote` / `get_kline` / `get_news` / `get_macro` 对 stock/etf/index 一律返回 `SIDECAR_UNREACHABLE`。这是「任务选品卡住、只拿到 BTC/ETH、美股完全取不到」的标准成因，不是模型问题。
 
-#### 5.1 容器部署（推荐，compose 已内置）
+#### 5.1 容器部署（推荐，已内置在 artex 镜像）
 
-`docker-compose.yml` 里的 `akshare` 服务就是它，无需额外操作：
+sidecar **不再是独立的 compose 服务**，它被打进 artex 主镜像，由 `start.sh` 作为子进程拉起。容器名 `Terix`：
 
 ```bash
-docker compose up -d akshare          # 或 up -d 全起
-docker compose ps akshare             # STATUS 要等到 (healthy)
-curl -s 127.0.0.1:8791/health         # data.warmup_done 必须为 true
+docker compose up -d --build
+docker ps --filter name=Terix         # STATUS 要等到 (healthy)
+docker exec Terix curl -s 127.0.0.1:8791/health   # data.warmup_done 必须为 true
 ```
 
-`sidecars/akshare/Dockerfile` 基于 `python:3.12-slim-bookworm`（与主镜像同一个官方镜像），镜像 tag `artex-akshare:20260901`。健康检查按 `warmup_done` 判，`start_period: 120s` —— 首次 `import akshare` + 预热要几十秒，端口通不等于可用。
+`start.sh` 负责：先拉 sidecar → 再拉 artex → 退出时把 SIGTERM 转发给两者 → sidecar 意外退出时自动重启。artex 异常退出重启循环同样保留。
 
-单独调试 sidecar：
+健康检查是**两个条件的与**：`/api/health` 通过 **且** sidecar `warmup_done=true`。只查 artex 端口是不够的 —— 那时非加密行情仍不可用，容器却是绿的。
+
+单独调试 sidecar（全部在容器内，无需暴露端口）：
 
 ```bash
-docker compose build akshare
-docker compose up -d --force-recreate akshare
-docker logs -f artex-akshare
-curl -s "127.0.0.1:8791/quote?market=us&symbol=AAPL"    # 宿主侧可见（端口只绑 127.0.0.1）
-docker exec artex-nas curl -s http://akshare:8791/health # 容器间走服务名
+docker exec Terix curl -s "127.0.0.1:8791/quote?market=us&symbol=AAPL"
+docker exec Terix python -c "import akshare; print(akshare.__version__)"
+docker logs Terix | grep akshare
+```
+
+改 `server.py` 后要重建镜像（它是 COPY 进去的，不是挂载）：
+
+```bash
+docker compose up -d --build
 ```
 
 #### 5.2 裸机 / 源码部署
@@ -424,9 +432,9 @@ until curl -fsS http://127.0.0.1:8791/health 2>/dev/null | python3 -c \
 do sleep 2; done
 ```
 
-裸机部署时 ARTeX 与 sidecar 同机，两端的 `AKSHARE_SIDECAR_ADDR` 都用默认 `127.0.0.1:8791` 即可。systemd 托管时给 sidecar 单独一个 unit，并在主服务里加 `After=`。
+裸机部署时两端的 `AKSHARE_SIDECAR_ADDR` 都是默认 `127.0.0.1:8791`。也可以用 `./start.sh` 让脚本一并拉起（它检测 `./akshare/server.py`，不存在则只跑 artex）。
 
-Windows venv 路径是 `Scripts/` 而非 `bin/`。**必须等 `warmup_done:true`**，端口通不等于可用（首次 `import akshare` / 预热可能几十秒）。东财 `*_em` 源被代码硬禁用，不要试图改配置启用。
+Windows venv 路径是 `Scripts/` 而非 `bin/`。**必须等 `warmup_done:true`**，端口通不等于可用（首次 `import akshare` / 预热可能几十秒）。东财 `*_em` 源被代码硬禁用，不要试图改配置启用（`stock_news_em` 是唯一的定点豁免，见 5.3）。
 
 #### 5.3 新闻源
 
