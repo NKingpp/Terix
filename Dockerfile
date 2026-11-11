@@ -57,6 +57,30 @@ COPY sidecars/akshare/server.py /app/akshare/server.py
 COPY start.sh /app/start.sh
 RUN chmod +x /app/artex /app/start.sh
 COPY skills/ /app/skills/
+
+# ── OKX 交易 CLI ─────────────────────────────────────────────────────
+#
+# # 为什么必须进镜像（2026-11-11 事故）
+#
+# `get_kline` 对加密标的报 `OKX_CLI_NOT_FOUND: 找不到 okx 命令`。
+# 排查发现镜像里既没有 /app/bin/okx 也没有 sidecars/okx —— 而 add_company_scope
+# 之外的路径全都正常，所以这个缺失只在调加密行情时才暴露。
+#
+# 根因：`.dockerignore` 里有 `**/node_modules`（本意是别把 web/ 的前端依赖
+# 塞进构建上下文），而 OKX CLI 的本体就在 sidecars/okx/node_modules 下。
+# 排掉之后 bin/okx 这个包装脚本即使 COPY 进去也是死的（它 exec 的 index.js 不存在）。
+#
+# 二进制 okx-auth / okx-pilot 来自 sidecars/okx/bin（git 跟踪）；
+# CLI 本体（npm 包）来自 sidecars/okx/node_modules（.dockerignore 已定点放行）。
+COPY bin/ /app/bin/
+COPY sidecars/okx/bin/ /app/sidecars/okx/bin/
+COPY sidecars/okx/node_modules/ /app/sidecars/okx/node_modules/
+COPY sidecars/okx/package.json /app/sidecars/okx/package.json
+RUN chmod +x /app/bin/okx /app/sidecars/okx/bin/*
+# 构建期就断言 CLI 本体在：否则镜像能建成功，运行时才报 OKX_CLI_NOT_FOUND。
+RUN test -f /app/sidecars/okx/node_modules/@okx_ai/okx-trade-cli/dist/index.js \
+    || { echo "[build] OKX CLI 本体缺失（sidecars/okx/node_modules 未进入构建上下文，检查 .dockerignore）" >&2; exit 1; }
+
 # data/（SQLite + jwt.key）持久化点
 VOLUME ["/app/data"]
 EXPOSE 8787 8788

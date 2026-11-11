@@ -1,5 +1,19 @@
 .git
 **/node_modules
+
+# okx CLI 是例外：它是**运行时依赖**，必须进镜像。
+#
+# 排除 node_modules 是为了别把 web/ 那几百 MB 前端依赖塞进构建上下文，
+# 但 OKX 交易 CLI（sidecars/okx/node_modules）是后端 exec 的实体 ——
+# 排掉它的表现是运行时 get_kline 报
+#   OKX_CLI_NOT_FOUND: 找不到 okx 命令（PATH 缺失且常见安装位置也没有）
+# 而且只在调加密行情时才暴露，其他路径全部正常。
+#
+# sidecars/okx/node_modules 总共 4.2MB（@okx_ai/okx-trade-cli + 三个传递依赖
+# pend/undici/yauzl，都是 CLI 运行时需要的），整目录放行即可。
+!sidecars/okx/node_modules
+!sidecars/okx/node_modules/**
+
 web/.next
 web/out
 server/webui/dist
