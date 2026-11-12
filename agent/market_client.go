@@ -58,6 +58,7 @@ type Quote struct {
 	Amount      string
 	IsPartial   bool
 	Channel     Channel
+	Timestamp   string // 实时报价的业务时间（RFC3339），与交易日分开
 }
 
 // Bar 是一根 K 线。价格全为字符串（NUMERIC 精度，禁 float）。
@@ -244,6 +245,7 @@ type IndicatorResult struct {
 	TS           string            `json:"ts"` // ISO8601（服务端返回毫秒则转成 ISO）
 	Values       map[string]string `json:"values"`
 	BacktestTime int64             `json:"backtest_time"`
+	Params       string            `json:"-"`
 	Source       string            `json:"source"` // "okx"
 }
 

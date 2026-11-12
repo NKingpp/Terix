@@ -92,6 +92,71 @@ func callWithCtx(t *testing.T, tool actool.CoreTool, ctx context.Context, in map
 }
 
 // ---------------------------------------------------------------------
+// Goal settlement
+// ---------------------------------------------------------------------
+
+func TestFinancialGoalSettlementRequiresManualVerification(t *testing.T) {
+	ts := newEmitTestSet(t)
+	instID := upsertTestInstrument(t, ts.ts.DB(), db.InstrumentInput{Symbol: "TGOAL-P1", Market: "us", AssetClass: "stock", Name: "Test"})
+	var taskID int64
+	if err := ts.ts.DB().QueryRow("INSERT INTO tasks(description,goal,exploration_id,instrument_id) VALUES($1,$2,$3,$4) RETURNING id", "金融目标", "净利润为正", ts.ts.ID(), instID).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+	ts.SetTaskID(taskID)
+	goalID, err := ts.ts.AddGoal(map[string]any{"text": "净利润为正"}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	factID, err := ts.ts.AddNode(db.KindFact, map[string]any{"summary": "收益率 +100%"}, 0, "confirmed", "test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, isErr := callWithCtx(t, ts.proveGoal(), context.Background(), map[string]any{"goal_id": goalID, "evidence_id": factID, "reason": "收益为正"})
+	if !isErr || !strings.Contains(out, "缺少结构化业务验收，需人工核验") {
+		t.Fatalf("金融目标应拒绝自动验收并要求人工核验，isErr=%v output=%q", isErr, out)
+	}
+	goal, err := ts.ts.GetNode(goalID)
+	if err != nil || goal.State != "open" {
+		t.Fatalf("金融 goal 状态必须保持 open，goal=%+v err=%v", goal, err)
+	}
+
+	out, isErr = callWithCtx(t, ts.goalMet(), context.Background(), map[string]any{"reason": "完成"})
+	if !isErr || !strings.Contains(out, "缺少结构化业务验收，需人工核验") || ts.GoalMet {
+		t.Fatalf("金融 goal_met 应拒绝自动完成，isErr=%v GoalMet=%v output=%q", isErr, ts.GoalMet, out)
+	}
+}
+
+func TestProveGoalUsesAtomicStoreAndChecksAllGoals(t *testing.T) {
+	ts := newEmitTestSet(t)
+	goalID, err := ts.ts.AddGoal(map[string]any{"text": "目标"}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	factID, err := ts.ts.AddNode(db.KindFact, map[string]any{"summary": "证据"}, 0, "confirmed", "test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, isErr := callWithCtx(t, ts.proveGoal(), context.Background(), map[string]any{"goal_id": goalID, "evidence_id": factID, "reason": "证据"})
+	if isErr || !strings.Contains(out, "marked met") || !ts.GoalMet {
+		t.Fatalf("有效非金融证明应成功并完成全部目标，isErr=%v GoalMet=%v output=%q", isErr, ts.GoalMet, out)
+	}
+	edges, err := ts.ts.Edges(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, edge := range edges {
+		if edge.From == factID && edge.To == goalID && edge.Rel == db.RelProves {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("prove_goal 未持久化证明边")
+	}
+}
+
+// ---------------------------------------------------------------------
 // emit_fact
 // ---------------------------------------------------------------------
 
@@ -546,6 +611,10 @@ func TestEmitNodeRoundtrip(t *testing.T) {
 	}
 	if p["role"] != "analyst_market" {
 		t.Errorf("payload.role = %v", p["role"])
+	}
+	var yielded int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_edges WHERE exploration_id=$1 AND src_id=$2 AND rel=$3 AND dst_id=$4`, eid, intentID, db.RelYields, res.NodeID).Scan(&yielded); err != nil || yielded != 1 {
+		t.Fatalf("worker fact should have intent yields edge: count=%d err=%v", yielded, err)
 	}
 	sids, ok := p["snapshot_ids"].([]any)
 	if !ok || len(sids) != 1 {

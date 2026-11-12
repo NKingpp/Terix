@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
 )
 
@@ -17,6 +16,8 @@ var (
 	ErrSnapshotInvalid = errors.New("invalid snapshot")
 	// ErrSnapshotNotFound 表示按去重键查不到快照。
 	ErrSnapshotNotFound = errors.New("snapshot not found")
+	// ErrSnapshotConflict 表示同去重键对应不同内容，不能返回旧证据 ID。
+	ErrSnapshotConflict = errors.New("snapshot content conflict")
 )
 
 // Snapshot is a row in the snapshots table.
@@ -94,9 +95,9 @@ func validateSnapshotInput(in SnapshotInput) error {
 }
 
 // InsertSnapshot 写入一条快照。
-// (source, endpoint, params_hash, collected_at 截断到秒) 冲突时不报错,
-// 而是返回已存在的那条记录 + created=false —— 采集侧重抓同一秒是常态,
-// 让调用方区分「新写入」与「命中去重」比抛错更有用。
+// (source, endpoint, params_hash, collected_at 截断到秒) 相同且 checksum 相同，
+// 返回已有记录 + created=false；内容不同时返回 ErrSnapshotConflict，
+// 防止新数据引用旧证据，已有快照不覆盖。
 //
 // SQLite 侧：时间列是 TEXT（ISO8601 UTC 毫秒），去重键里的
 // `date_trunc('second', collected_at)` 退化为 `substr(collected_at,1,19)`，
@@ -129,21 +130,9 @@ RETURNING `+snapshotColumns,
 	if err != nil {
 		return nil, false, err
 	}
-	// 内容冲突检测（KNOWN-LIMITATIONS L3）：同 dedup key 但 checksum 不同，
-	// 说明「同秒同参数但响应内容变了」，新内容被 DO NOTHING 静默丢弃。
-	// 不改数据语义（覆盖会让已引用旧快照的 evidence 失效，更糟），
-	// 但必须让这件事可见 —— 否则静默丢数据无人察觉。
 	if existing.Checksum != strings.TrimSpace(in.Checksum) {
-		slog.Warn("snapshot 内容冲突：同 dedup key 但 checksum 不同，新内容被丢弃",
-			"snapshot_id", existing.ID,
-			"source", in.Source,
-			"endpoint", in.Endpoint,
-			"params_hash", in.ParamsHash,
-			"collected_at", in.CollectedAt,
-			"existing_checksum", existing.Checksum,
-			"incoming_checksum", strings.TrimSpace(in.Checksum),
-			"limitation", "L3",
-		)
+		return nil, false, fmt.Errorf("%w: source=%s endpoint=%s collected_at=%s existing_id=%d",
+			ErrSnapshotConflict, in.Source, in.Endpoint, in.CollectedAt, existing.ID)
 	}
 	return existing, false, nil
 }

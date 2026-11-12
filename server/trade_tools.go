@@ -163,7 +163,8 @@ func (t *TradeToolSet) createOrderDraft() actool.CoreTool {
 			"  market: crypto | cn | hk | us\n"+
 			"  side:   buy | sell\n"+
 			"  qty:    数量（字符串，保留精度）\n"+
-			"  ref_price: 参考价（字符串，可选）\n\n"+
+			"  ref_price: 参考价（字符串，可选）\n"+
+			"  signal_id: 交易信号 ID（可选；提供时必须与标的匹配）\n\n"+
 			"本工具只写草案，**不会**真正下单。",
 		tradeObj(map[string]any{
 			"symbol":    tradeStr("标的代码，如 BTC / 600519 / AAPL"),
@@ -171,6 +172,7 @@ func (t *TradeToolSet) createOrderDraft() actool.CoreTool {
 			"side":      tradeStr("方向：buy|sell"),
 			"qty":       tradeStr("数量（字符串）"),
 			"ref_price": tradeStr("参考价（字符串，可空）"),
+			"signal_id": tradeInt("交易信号 ID（可选；必须与标的匹配）"),
 		}, "symbol", "market", "side", "qty"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			if err := t.guard(); err != nil {
@@ -182,6 +184,7 @@ func (t *TradeToolSet) createOrderDraft() actool.CoreTool {
 				Side     string `json:"side"`
 				Qty      string `json:"qty"`
 				RefPrice string `json:"ref_price"`
+				SignalID int64  `json:"signal_id"`
 			}
 			if err := json.Unmarshal(in, &a); err != nil {
 				return actool.Errorf(fmt.Sprintf("入参解析失败: %v", err)), nil
@@ -209,7 +212,19 @@ func (t *TradeToolSet) createOrderDraft() actool.CoreTool {
 					symbol, market, err)), nil
 			}
 
+			var signalID *int64
+			if a.SignalID < 0 {
+				return actool.Errorf("signal_id 无效"), nil
+			}
+			if a.SignalID > 0 {
+				signalID = &a.SignalID
+			}
+			if err := t.validateTradeContext(ctx, inst.ID, signalID); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+
 			draftID, err := t.pg.OrderDrafts().InsertDraft(db.OrderDraftInput{
+				SignalID:     signalID,
 				InstrumentID: &inst.ID,
 				Side:         side,
 				Qty:          qty,
@@ -265,6 +280,9 @@ func (t *TradeToolSet) authorizeOrder() actool.CoreTool {
 				return actool.Errorf("account_id 无效（需 > 0，取自 exec_accounts.id）"), nil
 			}
 
+			if err := t.validateDraftContext(ctx, a.DraftID); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
 			mode, err := t.pg.GetExecMode()
 			if err != nil {
 				return actool.Errorf(fmt.Sprintf("读执行模式失败: %v", err)), nil
@@ -325,6 +343,9 @@ func (t *TradeToolSet) executePaperOrder() actool.CoreTool {
 				return actool.Errorf("draft_id / account_id 无效"), nil
 			}
 
+			if err := t.validateDraftContext(ctx, a.DraftID); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
 			mode, err := t.pg.GetExecMode()
 			if err != nil {
 				return actool.Errorf(fmt.Sprintf("读执行模式失败: %v", err)), nil
@@ -351,6 +372,101 @@ func (t *TradeToolSet) executePaperOrder() actool.CoreTool {
 			})
 		},
 	)
+}
+
+func (t *TradeToolSet) validateDraftContext(ctx context.Context, draftID int64) error {
+	draft, err := t.pg.OrderDrafts().GetDraft(draftID)
+	if err != nil {
+		return fmt.Errorf("读取交易草案 %d 失败: %v", draftID, err)
+	}
+	if draft.InstrumentID == nil || *draft.InstrumentID <= 0 {
+		return fmt.Errorf("交易草案 %d 未明确 instrument_id", draftID)
+	}
+	return t.validateTradeContext(ctx, *draft.InstrumentID, draft.SignalID)
+}
+
+func (t *TradeToolSet) validateTradeContext(ctx context.Context, instrumentID int64, signalID *int64) error {
+	ri := agent.RunInfoFrom(ctx)
+	// 无任务的直接纸面调用保留；部分任务上下文不能按无上下文放行。
+	if ri.TaskID != 0 || ri.ExplorationID != 0 || ri.IntentID != 0 {
+		if ri.TaskID <= 0 || ri.ExplorationID <= 0 || ri.IntentID < 0 {
+			return fmt.Errorf("交易任务上下文无效，需明确 task_id 与 exploration_id")
+		}
+		task, err := t.pg.GetTask(ri.TaskID)
+		if err != nil {
+			return fmt.Errorf("读取交易任务 %d 失败: %v", ri.TaskID, err)
+		}
+		if task == nil {
+			return fmt.Errorf("交易任务上下文无效，任务 %d 不存在", ri.TaskID)
+		}
+		if task.ExplorationID != ri.ExplorationID {
+			return fmt.Errorf("交易任务 %d 与 exploration_id=%d 不一致", ri.TaskID, ri.ExplorationID)
+		}
+		if task.InstrumentID == nil || *task.InstrumentID <= 0 {
+			return fmt.Errorf("交易任务 %d 未明确 instrument_id，拒绝猜测标的", ri.TaskID)
+		}
+		if *task.InstrumentID != instrumentID {
+			return fmt.Errorf("交易任务 instrument_id=%d 与请求或草案标的不一致（instrument_id=%d）", *task.InstrumentID, instrumentID)
+		}
+		if ri.IntentID > 0 {
+			intentInstID, err := tradeIntentInstrumentID(t.pg, ri.ExplorationID, ri.IntentID)
+			if err != nil {
+				return err
+			}
+			if intentInstID <= 0 {
+				return fmt.Errorf("交易意图未明确 instrument_id，拒绝猜测标的；请先绑定明确标的")
+			}
+			if intentInstID != instrumentID {
+				return fmt.Errorf("交易意图 instrument_id=%d 与请求或草案标的不一致（instrument_id=%d）", intentInstID, instrumentID)
+			}
+		}
+	}
+	if signalID == nil {
+		return nil
+	}
+	sig, err := t.pg.Signals().GetSignal(*signalID)
+	if err != nil {
+		return fmt.Errorf("signal_id=%d 不存在或不可读: %v", *signalID, err)
+	}
+	if sig.InstrumentID == nil || *sig.InstrumentID != instrumentID {
+		return fmt.Errorf("signal_id=%d 与请求或草案标的不一致", *signalID)
+	}
+	if ri.TaskID > 0 && (sig.TaskID == nil || *sig.TaskID != ri.TaskID) {
+		return fmt.Errorf("signal_id=%d 不属于当前任务 %d", *signalID, ri.TaskID)
+	}
+	if sig.TaskID != nil {
+		task, err := t.pg.GetTask(*sig.TaskID)
+		if err != nil {
+			return fmt.Errorf("读取 signal_id=%d 所属任务失败: %v", *signalID, err)
+		}
+		if task == nil || task.InstrumentID == nil || *task.InstrumentID <= 0 {
+			return fmt.Errorf("signal_id=%d 所属任务未明确 instrument_id", *signalID)
+		}
+		if *task.InstrumentID != instrumentID {
+			return fmt.Errorf("signal_id=%d 与所属任务标的不一致", *signalID)
+		}
+	}
+	return nil
+}
+
+func tradeIntentInstrumentID(pg *db.DB, expID, intentID int64) (int64, error) {
+	if pg == nil || expID <= 0 || intentID <= 0 {
+		return 0, fmt.Errorf("交易意图上下文无效，拒绝猜测标的")
+	}
+	intent, err := pg.Exploration(expID).GetNode(intentID)
+	if err != nil {
+		return 0, fmt.Errorf("读取交易意图 %d 失败: %v", intentID, err)
+	}
+	if intent == nil || intent.Kind != db.KindIntent {
+		return 0, fmt.Errorf("交易意图 %d 不存在或类型无效", intentID)
+	}
+	var payload struct {
+		InstrumentID int64 `json:"instrument_id"`
+	}
+	if err := json.Unmarshal(intent.Payload, &payload); err != nil {
+		return 0, fmt.Errorf("读取交易意图 %d 标的失败: %v", intentID, err)
+	}
+	return payload.InstrumentID, nil
 }
 
 // 确保 agent 包被引用（buildDomainReg 用 agent.ToolSet，这里只是编译期锚点）。

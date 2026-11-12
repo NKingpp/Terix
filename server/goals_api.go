@@ -1,7 +1,9 @@
 package server
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -110,22 +112,19 @@ func (s *Server) editGoal(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "目标内容不能为空")
 		return
 	}
-	node, err := t.Store.GetNode(gid)
+	change, err := t.Store.UpdateGoalPayloadWithAudit(gid, text, strings.TrimSpace(body.VulnClass))
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, 404, "目标不存在")
+		} else {
+			writeErr(w, 500, err.Error())
+		}
 		return
 	}
-	if node == nil || node.Kind != db.KindGoal {
-		writeErr(w, 404, "目标不存在")
-		return
+	if change.Changed {
+		t.NotifyGoalEdited(change.OldText, change.NewText)
+		s.reviveTask(t)
 	}
-	oldText := goalDTO(node).Text
-	if err := t.Store.UpdateGoalPayload(gid, text, strings.TrimSpace(body.VulnClass)); err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	t.NotifyGoalEdited(oldText, text) // 记「人修改了目标由 old 变为 new」触发并唤醒 planner
-	s.reviveTask(t)                   // 与新增一致:复活任务据新目标重判
 	updated, _ := t.Store.GetNode(gid)
 	if updated == nil {
 		writeErr(w, 500, "目标更新后读取失败")

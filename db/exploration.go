@@ -231,6 +231,11 @@ func (s *ExplorationStore) Root() (description, goal string, err error) {
 // fact / signal / conclusion 可能由系统写入，没有 role 是合法的 ——
 // 那时 owner 落 NULL。而 sibling 场景必须有 role，由调用方保证。
 func (s *ExplorationStore) AddNode(kind string, payload map[string]any, priority int, state, origin string, anchors []int64) (int64, error) {
+	return s.AddNodeWithYield(kind, payload, priority, state, origin, anchors, 0)
+}
+
+// AddNodeWithYield atomically records an output and its producing intent.
+func (s *ExplorationStore) AddNodeWithYield(kind string, payload map[string]any, priority int, state, origin string, anchors []int64, intentID int64) (int64, error) {
 	raw, _ := json.Marshal(payload)
 
 	// 从 payload 提取 owner（= 产出该节点的角色）。
@@ -256,6 +261,15 @@ VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')) RETURNING id`,
 	}
 	for _, a := range anchors {
 		if _, err := tx.Exec(`INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT (node_id, asset_id) DO NOTHING`, id, a); err != nil {
+			return 0, err
+		}
+	}
+	if intentID > 0 {
+		var exists int
+		if err := tx.QueryRow(`SELECT 1 FROM exploration_nodes WHERE id=$1 AND exploration_id=$2 AND kind='intent'`, intentID, s.expID).Scan(&exists); err != nil {
+			return 0, fmt.Errorf("yield source intent %d is not in exploration %d: %w", intentID, s.expID, err)
+		}
+		if _, err := tx.Exec(`INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id) VALUES ($1,$2,$3,$4)`, s.expID, intentID, RelYields, id); err != nil {
 			return 0, err
 		}
 	}
@@ -355,23 +369,115 @@ func (s *ExplorationStore) SetNodeState(id int64, state string) error {
 	return err
 }
 
-// UpdateGoalPayload rewrites a goal node's payload text (and optional vulnclass);
-// scoped to kind='goal' so it can never mutate an intent/fact by id. Returns an
-// error if no such goal exists in this exploration.
-func (s *ExplorationStore) UpdateGoalPayload(id int64, text, vulnclass string) error {
-	payload := map[string]any{"text": text}
-	if vulnclass != "" {
-		payload["vulnclass"] = vulnclass
-	}
-	raw, _ := json.Marshal(payload)
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET payload=$1 WHERE id=$2 AND exploration_id=$3 AND kind='goal'`, string(raw), id, s.expID)
+// ProveGoal 原子写入证明边与 met 状态；证据只允许本任务或直接来源的事实/发现。
+func (s *ExplorationStore) ProveGoal(goalID, evidenceID int64) error {
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("目标不存在")
+	defer tx.Rollback()
+	var id int64
+	if err := tx.QueryRow(`SELECT id FROM exploration_nodes WHERE id=$1 AND exploration_id=$2 AND kind='goal'`, goalID, s.expID).Scan(&id); err != nil {
+		return fmt.Errorf("目标不存在: %w", err)
 	}
-	return nil
+	if err := tx.QueryRow(`SELECT evidence.id FROM exploration_nodes evidence
+		WHERE evidence.id=$1 AND evidence.kind IN ('fact','finding')
+		AND (evidence.exploration_id=$2 OR EXISTS (
+			SELECT 1 FROM tasks owner
+			JOIN task_relations relation ON relation.task_id=owner.id
+			JOIN tasks source ON source.id=relation.source_task_id AND source.deleted_at IS NULL
+			WHERE owner.exploration_id=$2 AND owner.deleted_at IS NULL
+			AND source.exploration_id=evidence.exploration_id))`, evidenceID, s.expID).Scan(&id); err != nil {
+		return fmt.Errorf("证据必须是本任务或直接来源的事实/发现: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id)
+		VALUES ($1,$2,'proves',$3) ON CONFLICT (exploration_id,src_id,rel,dst_id) DO NOTHING`, s.expID, evidenceID, goalID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE exploration_nodes SET state='met', blocked_reason=NULL, content_version=content_version+1
+		WHERE id=$1 AND exploration_id=$2 AND kind='goal'`, goalID, s.expID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// UpdateGoalPayload 保留旧调用签名；目标变更与审计在同一事务提交。
+func (s *ExplorationStore) UpdateGoalPayload(id int64, text, vulnclass string) error {
+	_, err := s.UpdateGoalPayloadWithAudit(id, text, vulnclass)
+	return err
+}
+
+type GoalPayloadUpdate struct {
+	OldText string
+	NewText string
+	Changed bool
+}
+
+// UpdateGoalPayloadWithAudit 返回事务内的前后文本，避免通知读取并发修改后的值。
+func (s *ExplorationStore) UpdateGoalPayloadWithAudit(id int64, text, vulnclass string) (GoalPayloadUpdate, error) {
+	var out GoalPayloadUpdate
+	tx, err := s.db.Begin()
+	if err != nil {
+		return out, err
+	}
+	defer tx.Rollback()
+
+	var oldRaw []byte
+	if err := tx.QueryRow(`SELECT payload FROM exploration_nodes WHERE id=$1 AND exploration_id=$2 AND kind='goal'`, id, s.expID).Scan(&oldRaw); err != nil {
+		if err == sql.ErrNoRows {
+			return out, fmt.Errorf("目标不存在: %w", err)
+		}
+		return out, err
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(oldRaw, &payload); err != nil {
+		return out, err
+	}
+	if payload == nil {
+		return out, fmt.Errorf("目标 payload 不是对象")
+	}
+	_ = json.Unmarshal(payload["text"], &out.OldText)
+	out.NewText = text
+	var oldVulnclass string
+	_ = json.Unmarshal(payload["vulnclass"], &oldVulnclass)
+	_, hasVulnclass := payload["vulnclass"]
+	if out.OldText == text && oldVulnclass == vulnclass && (vulnclass != "" || !hasVulnclass) {
+		return out, nil
+	}
+	payload["text"], _ = json.Marshal(text)
+	if vulnclass == "" {
+		delete(payload, "vulnclass")
+	} else {
+		payload["vulnclass"], _ = json.Marshal(vulnclass)
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return out, err
+	}
+	if _, err := tx.Exec(`UPDATE exploration_nodes SET payload=$1, content_version=content_version+1,
+		state='open', completed_at=NULL
+		WHERE id=$2 AND exploration_id=$3 AND kind='goal'`, string(raw), id, s.expID); err != nil {
+		return out, err
+	}
+	if _, err := tx.Exec(`DELETE FROM exploration_edges WHERE exploration_id=$1 AND dst_id=$2 AND rel='proves'`, s.expID, id); err != nil {
+		return out, err
+	}
+	metadata, err := json.Marshal(map[string]any{
+		"actor": "human", "source": "goals_api", "subject": "anonymous_shared", "goal_id": id,
+		"old": json.RawMessage(oldRaw), "new": json.RawMessage(raw),
+	})
+	if err != nil {
+		return out, err
+	}
+	if _, err := tx.Exec(`INSERT INTO activity(exploration_id, node_id, worker, kind, summary, metadata)
+		VALUES ($1,$2,'human','goal_updated',$3,$4)`, s.expID, id, "人工修改了目标", string(metadata)); err != nil {
+		return out, err
+	}
+	if err := tx.Commit(); err != nil {
+		return out, err
+	}
+	out.Changed = true
+	return out, nil
 }
 
 // DeleteGoal hard-deletes a goal node; scoped to kind='goal' so it can never drop

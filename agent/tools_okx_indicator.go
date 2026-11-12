@@ -114,14 +114,22 @@ func (m *MarketToolSet) getIndicatorOkx() actool.CoreTool {
 
 			// 落快照：与 get_kline/get_macro 同一套证据链。
 			// 落库失败**不阻断取数** —— 快照是附加证据，不是主功能。
+			snapshotWarning := ""
 			if m.db != nil {
 				if id, sErr := captureIndicatorSnapshot(m.db, res); sErr != nil {
+					snapshotWarning = sErr.Error()
 					slog.Warn("snapshot 落库失败（不阻断取数）",
 						"endpoint", "get_indicator_okx",
 						"indicator", res.Indicator, "symbol", res.Symbol, "err", sErr)
 				} else if id > 0 {
 					out["snapshot_id"] = id
 				}
+			} else {
+				snapshotWarning = "snapshot store 未配置"
+			}
+			if snapshotWarning != "" {
+				out["evidence_status"] = "not_captured"
+				out["snapshot_warning"] = snapshotWarning
 			}
 			return jsonResult(out)
 		})

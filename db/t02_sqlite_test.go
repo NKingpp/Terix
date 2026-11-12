@@ -12,6 +12,7 @@ package db
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -775,7 +776,7 @@ func TestT02SnapshotDedupTruncatesToSecond(t *testing.T) {
 	// 同一秒、不同毫秒 → 命中同一条（date_trunc('second') 语义）
 	in2 := in
 	in2.CollectedAt = "2026-01-02T03:04:05.900Z"
-	in2.Checksum = "c2"
+	in2.Checksum = in.Checksum
 	snap2, created2, err := store.InsertSnapshot(in2)
 	if err != nil {
 		t.Fatalf("second: %v", err)
@@ -786,6 +787,11 @@ func TestT02SnapshotDedupTruncatesToSecond(t *testing.T) {
 	if snap2.ID != snap.ID {
 		t.Fatalf("dedup returned id %d, want %d", snap2.ID, snap.ID)
 	}
+	inConflict := in2
+	inConflict.Checksum = "different-content"
+	if got, created, err := store.InsertSnapshot(inConflict); !errors.Is(err, ErrSnapshotConflict) || got != nil || created {
+		t.Fatalf("same-second different content must conflict: snap=%+v created=%v err=%v", got, created, err)
+	}
 	// 下一秒 → 新行
 	in3 := in
 	in3.CollectedAt = "2026-01-02T03:04:06.000Z"
@@ -794,7 +800,7 @@ func TestT02SnapshotDedupTruncatesToSecond(t *testing.T) {
 	} else if !created3 {
 		t.Fatal("next-second insert must be a new row")
 	}
-	if ids, err := store.ExistingIDs([]int64{snap.ID, snap.ID + 1 << 40}); err != nil {
+	if ids, err := store.ExistingIDs([]int64{snap.ID, snap.ID + 1<<40}); err != nil {
 		t.Fatalf("ExistingIDs: %v", err)
 	} else if !ids[snap.ID] {
 		t.Fatalf("ExistingIDs missing %d: %v", snap.ID, ids)

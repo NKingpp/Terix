@@ -1347,13 +1347,22 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		//   ③ owner 列 —— AddNode 会从 payload["role"] 派生它
 		//      （db/exploration.go 的 owner 派生 + schema 触发器兜底）
 		payload["role"] = role
-		// 角色执行者靠 payload.instrument_id 定位标的：各角色的 vars 构造器
-		// 读它决定取哪只票。planner 只管方向、不写标的，从图里抄 ——
-		// Expand 建阶段图时已把任务级标的写进每个节点。
-		//
-		// 不回填的后果：analyst_market 拿到 instrument_id=0 → 判「标的未知」
-		// → 直接写 unavailable，整条分析链白跑（比不派还浪费）。
-		if instID, ac := t.ts.InstrumentMeta(); instID > 0 {
+		// Registered tasks own the binding; old graph nodes may refer to a
+		// previous instrument. Graph-only explorations retain legacy behavior.
+		if t.taskID > 0 {
+			task, err := t.ts.DB().GetTask(t.taskID)
+			if err != nil || task == nil || task.ExplorationID != t.ts.ID() {
+				return 0, fmt.Errorf("无法核验任务标的：任务与探索上下文不匹配")
+			}
+			if task.InstrumentID != nil {
+				inst, err := t.ts.DB().Instruments().GetInstrumentByID(*task.InstrumentID)
+				if err != nil || inst == nil {
+					return 0, fmt.Errorf("无法核验任务标的：instrument_id=%d", *task.InstrumentID)
+				}
+				payload["instrument_id"] = inst.ID
+				payload["asset_class"] = inst.AssetClass
+			}
+		} else if instID, ac := t.ts.InstrumentMeta(); instID > 0 {
 			payload["instrument_id"] = instID
 			payload["asset_class"] = ac
 		}
@@ -1453,6 +1462,31 @@ func (t *ToolSet) listGoals() actool.CoreTool {
 		})
 }
 
+func (t *ToolSet) goalSettlementFinancial() (bool, error) {
+	if t.ts == nil || t.ts.DB() == nil {
+		return false, fmt.Errorf("缺少任务上下文，无法核验目标领域")
+	}
+	var registered, marked bool
+	err := t.ts.DB().QueryRow(`SELECT
+		EXISTS(SELECT 1 FROM tasks WHERE exploration_id=$1 AND deleted_at IS NULL AND instrument_id IS NOT NULL),
+		EXISTS(SELECT 1 FROM exploration_nodes n WHERE n.exploration_id=$1 AND (
+			COALESCE(json_extract(n.payload,'$.instrument_id'),0)>0 OR
+			COALESCE(TRIM(json_extract(n.payload,'$.asset_class')),'')<>''))`, t.ts.ID()).Scan(&registered, &marked)
+	if err != nil {
+		return false, fmt.Errorf("无法核验任务领域：%w", err)
+	}
+	if t.taskID > 0 {
+		var matches int
+		if err := t.ts.DB().QueryRow(`SELECT COUNT(*) FROM tasks WHERE id=$1 AND exploration_id=$2 AND deleted_at IS NULL`, t.taskID, t.ts.ID()).Scan(&matches); err != nil {
+			return false, fmt.Errorf("无法核验任务与探索上下文：%w", err)
+		}
+		if matches != 1 {
+			return false, fmt.Errorf("无法核验任务与探索上下文：不匹配")
+		}
+	}
+	return registered || marked || t.financeMode, nil
+}
+
 func (t *ToolSet) proveGoal() actool.CoreTool {
 	return t.writeExpTool("prove_goal", "当你判断某个发现/事实证明了某个目标达成时调用：把证据节点连到目标节点，并标记目标 met。",
 		obj(map[string]any{
@@ -1466,10 +1500,17 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 				EvidenceID json.RawMessage `json:"evidence_id"`
 				Reason     string          `json:"reason"`
 			}
-			_ = json.Unmarshal(in, &a)
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf("参数必须是有效 JSON: " + err.Error()), nil
+			}
 			goal, ev := pid(a.GoalID), pid(a.EvidenceID)
 			if goal == 0 || ev == 0 {
 				return actool.Errorf("goal_id 和 evidence_id 必填"), nil
+			}
+			if financial, err := t.goalSettlementFinancial(); err != nil {
+				return actool.Errorf("无法核验任务标的，拒绝自动验收: " + err.Error()), nil
+			} else if financial {
+				return actool.Errorf("缺少结构化业务验收，需人工核验"), nil
 			}
 			goalNode, err := t.ts.GetNode(goal)
 			if err != nil || goalNode == nil || goalNode.Kind != db.KindGoal {
@@ -1479,23 +1520,17 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf("evidence_id 必须是本任务或直接关联任务的事实/漏洞节点"), nil
 			}
-			_ = t.ts.Link(ev, db.RelProves, goal)
-			_ = t.ts.SetNodeState(goal, "met")
-			// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
-			// 任务完成（置 GoalMet），无需再依赖模型显式调 goal_met。
-			if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil && len(goals) > 0 {
-				allMet := true
-				for _, g := range goals {
-					if g.State != "met" {
-						allMet = false
-						break
-					}
-				}
-				if allMet {
-					t.GoalMet = true
-					t.Reason = fmt.Sprintf("所有 %d 个目标均已 met（最后由 goal %d 触发）", len(goals), goal)
-					return actool.Text(fmt.Sprintf("goal %d marked met；本任务所有目标均已达成，任务自动判定完成", goal)), nil
-				}
+			if err := t.ts.ProveGoal(goal, ev); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			total, unmet, err := t.goalSettlementCounts()
+			if err != nil {
+				return actool.Errorf("目标已证明，但无法核验全部目标状态: " + err.Error()), nil
+			}
+			if total > 0 && unmet == 0 {
+				t.GoalMet = true
+				t.Reason = fmt.Sprintf("所有 %d 个目标均已 met（最后由 goal %d 触发）", total, goal)
+				return actool.Text(fmt.Sprintf("goal %d marked met；本任务所有目标均已达成，任务自动判定完成", goal)), nil
 			}
 			return actool.Text(fmt.Sprintf("goal %d marked met", goal)), nil
 		})
@@ -1505,12 +1540,38 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 	return writeTool("goal_met", "【立即结束整个任务】——仅当你确认任务的【全部目标都已真正达成、整体收官】时才调（注意是任务【整体】完成；仅仅达成了其中某一个目标/某一个 flag/某一个漏洞【不算】——那种情况用 prove_goal 标记该目标即可）。⚠️它不是用来“结束本轮规划”的：本轮没有新意图要派、或在等 worker 产出，都【直接结束本轮即可，不要调本工具】（0 个意图是完全正常的）。正常判定优先用 prove_goal 逐个证明目标；goal_met 只是绕过逐个证明、直接从全局收官的手段。",
 		obj(map[string]any{"reason": str("达成理由（必须是目标真正达成的证据，不能是“本轮无新方向”这类结束本轮的理由）")}, "reason"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+			if financial, err := t.goalSettlementFinancial(); err != nil {
+				return actool.Errorf("无法核验任务标的，拒绝自动验收: " + err.Error()), nil
+			} else if financial {
+				return actool.Errorf("缺少结构化业务验收，需人工核验"), nil
+			}
+			if t.ts == nil {
+				return actool.Errorf("无法核验目标状态，拒绝自动验收"), nil
+			}
+			total, unmet, err := t.goalSettlementCounts()
+			if err != nil {
+				return actool.Errorf("无法核验目标状态，拒绝自动验收: " + err.Error()), nil
+			}
+			if total == 0 {
+				return actool.Errorf("本任务没有可验收目标"), nil
+			}
+			if unmet != 0 {
+				return actool.Errorf("仍有目标未达成，需逐个使用 prove_goal 提交证据"), nil
+			}
 			var a struct{ Reason string }
-			_ = json.Unmarshal(in, &a)
+			if err := json.Unmarshal(in, &a); err != nil || strings.TrimSpace(a.Reason) == "" {
+				return actool.Errorf("reason 必须是非空字符串，参数必须是有效 JSON"), nil
+			}
 			t.GoalMet = true
 			t.Reason = a.Reason
 			return actool.Text("acknowledged: goal marked met"), nil
 		})
+}
+
+func (t *ToolSet) goalSettlementCounts() (total, unmet int, err error) {
+	err = t.ts.DB().QueryRow(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN state='met' THEN 0 ELSE 1 END),0)
+		FROM exploration_nodes WHERE exploration_id=$1 AND kind=$2`, t.ts.ID(), db.KindGoal).Scan(&total, &unmet)
+	return
 }
 
 // --- worker write tools ---

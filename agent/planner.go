@@ -10,6 +10,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
+	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -21,28 +22,28 @@ import (
 // assets, judges whether the task goal is met, and emits 0..N exploration intents
 // into the frontier. It is the sole intent generator.
 type Planner struct {
-	findingRecorder   FindingRecorder
-	prov              llm.Provider
-	model             string
-	tx                *transcript.Store                      // raw LLM conversation persistence (nil = off)
-	window            int                                    // context window in tokens (for compaction)
-	windowFn          func() int                             // optional dynamic task-chain minimum
-	maxTurns          int                                    // max agent turns per run (0 = unlimited)
-	killWork          func(intentID int64) error             // engine callback to terminate a running work (nil = off)
-	steerWork         func(intentID int64, msg string) error // engine callback to steer a running work mid-run (nil = off)
+	findingRecorder FindingRecorder
+	prov            llm.Provider
+	model           string
+	tx              *transcript.Store                      // raw LLM conversation persistence (nil = off)
+	window          int                                    // context window in tokens (for compaction)
+	windowFn        func() int                             // optional dynamic task-chain minimum
+	maxTurns        int                                    // max agent turns per run (0 = unlimited)
+	killWork        func(intentID int64) error             // engine callback to terminate a running work (nil = off)
+	steerWork       func(intentID int64, msg string) error // engine callback to steer a running work mid-run (nil = off)
 	// materializeDownstream 是 server 的「补建阶段图」回调（nil = 工具不可用）。
 	// 见 SetMaterializeDownstream 的注释：screener 失败后下游节点从未建出，
 	// planner 需要自己能补，否则只能派无 role 的通用意图顶替。
 	materializeDownstream func() (int, error)
-	proxyAddr         string                                 // recording proxy for WebFetch (empty = direct)
-	proxyCACert       string                                 // recording proxy's CA cert path (HTTPS verify)
-	webSearch         WebSearchOpts                          // web_search tool backend selection (off by default)
-	workDir           string                                 // shared work dir (surfaced in prompt as artifact-output target)
-	injectConstraints func() bool                            // resolver: inject task operation constraints into system prompt? (nil = yes)
-	nonStreamingFn    func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
-	noaEnabledFn      func() bool                            // resolver: use experimental noa compaction? (nil = off)
-	maxTokensFn       func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
-	compactor         *Compactor                             // cold-node compaction (§7); nil = disabled
+	proxyAddr             string        // recording proxy for WebFetch (empty = direct)
+	proxyCACert           string        // recording proxy's CA cert path (HTTPS verify)
+	webSearch             WebSearchOpts // web_search tool backend selection (off by default)
+	workDir               string        // shared work dir (surfaced in prompt as artifact-output target)
+	injectConstraints     func() bool   // resolver: inject task operation constraints into system prompt? (nil = yes)
+	nonStreamingFn        func() bool   // resolver: use non-streaming (Complete) path? (nil = streaming)
+	noaEnabledFn          func() bool   // resolver: use experimental noa compaction? (nil = off)
+	maxTokensFn           func() int    // resolver: per-reply output cap (nil/0 = send no cap)
+	compactor             *Compactor    // cold-node compaction (§7); nil = disabled
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
@@ -441,7 +442,7 @@ func plannerSystem(goal, dataDir, workDir string) string {
 // and/or finding(s) reported (may be several — the engine debounces a burst; empty
 // for time/heartbeat wakes). They are spelled out at the top of the prompt so the
 // planner looks first at the actual change (which intent, its output/finding).
-func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, goal string, triggers []TriggerEvent, emit func(db.Activity)) (met bool, reason string, err error) {
+func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, goal string, triggers []TriggerEvent, emit func(db.Activity), hooks ...harness.HookRunner) (met bool, reason string, err error) {
 	// cold-digest §2.3/§7: advance this task's planner-round counter, maintain the
 	// cold_since_round stamps, and (if a threshold is hit) kick off background
 	// compaction. Synchronous part is cheap (a few queries); the LLM compaction
@@ -454,8 +455,8 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	}
 	tsx.SetTaskID(taskID)
 	tsx.SetCoverageEnabled(as == nil || as.CoverageEnabled(taskID))
-	tsx.killWork = p.killWork   // enable kill_work tool (nil = unavailable)
-	tsx.steerWork = p.steerWork // enable steer_work tool (nil = unavailable)
+	tsx.killWork = p.killWork                           // enable kill_work tool (nil = unavailable)
+	tsx.steerWork = p.steerWork                         // enable steer_work tool (nil = unavailable)
 	tsx.materializeDownstream = p.materializeDownstream // enable materialize_downstream (nil = unavailable)
 	if origin, _ := ts.OriginFactID(); origin > 0 {
 		tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)
@@ -463,6 +464,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
 	// 标的覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
 	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), actool.DefaultTools()...)
+	ctx = WithExplorationStore(ctx, ts)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
 	tools, def, cleanup := AugmentTools(ctx, "planner", base)
 	defer cleanup()
@@ -481,6 +483,10 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	taskDir := ensureRunDir(p.workDir, taskID, 0)
 	ctx = intercept.WithReviewContext(ctx, taskDir, intercept.ReviewBackground{})
 	sysBody := plannerSystem(goal, p.workDir, taskDir)
+	financialPlanner := plannerIsFinancial(ctx)
+	if financialPlanner {
+		sysBody += "\n\n【金融规划权限】本轮仅能使用阶段图、事实、目标与调度工具，没有 Bash、文件读写、Skill、MCP 或交易执行工具。禁止自行下单、撤单、平仓，也不得假设 worker 拥有你或其他角色的工具。执行能力不足必须报告阻塞，不得改走 CLI、其他标的或模拟盘。"
+	}
 	if p.wantConstraints() {
 		sysBody += constraintBlock(ts, "planner") // 操作约束(若有)注入系统提示,框定探索边界
 	}
@@ -500,25 +506,26 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,
 		PermissionMode:  permission.ModeBypass,
-		EnableWebFetch:  true, // 走记录代理留痕；载入代理 CA 验证 MITM 重签的 HTTPS 证书
+		EnableWebFetch:  !financialPlanner, // 走记录代理留痕；载入代理 CA 验证 MITM 重签的 HTTPS 证书
 		WebFetchProxy:   p.proxyAddr,
 		WebFetchCACert:  p.proxyCACert,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
 		// WebSearchProxy 是独立出口代理(http/https/socks5)，与记录流量的 MITM 代理无关；空则直连。
-		EnableWebSearch:       p.webSearch.Enabled,
-		WebSearchBackend:      p.webSearch.Backend,
-		BraveSearchAPIKey:     p.webSearch.BraveKey,
-		TavilySearchAPIKey:    p.webSearch.TavilyKey,
-		DeepSeekSearchBaseURL: p.webSearch.DeepSeekBaseURL,
-		DeepSeekSearchAPIKey:  p.webSearch.DeepSeekAPIKey,
-		DeepSeekSearchModel:   p.webSearch.DeepSeekModel,
-		WebSearchProxy:        p.webSearch.Proxy,
-		BashEnv:               proxyEnv(p.proxyAddr, p.proxyCACert), // Bash 子命令默认走代理+信任 CA
-		WorkingDir:            taskDir,                              // 本任务工作目录 <workDir>/tasks/<taskID>
-		ToolOutputDir:         cmdOutDir(taskDir),
-		MaxTurns:              p.maxTurns, // 0 = unlimited (configurable in agent management)
-		MaxDuration:           maxDur,     // 0=不限;有 deadline 时=距 deadline 剩余
-		Compaction:            compactionConfig(p.compactionWindow()),
+		EnableWebSearch:        p.webSearch.Enabled && !financialPlanner,
+		DisableBackgroundTasks: financialPlanner,
+		WebSearchBackend:       p.webSearch.Backend,
+		BraveSearchAPIKey:      p.webSearch.BraveKey,
+		TavilySearchAPIKey:     p.webSearch.TavilyKey,
+		DeepSeekSearchBaseURL:  p.webSearch.DeepSeekBaseURL,
+		DeepSeekSearchAPIKey:   p.webSearch.DeepSeekAPIKey,
+		DeepSeekSearchModel:    p.webSearch.DeepSeekModel,
+		WebSearchProxy:         p.webSearch.Proxy,
+		BashEnv:                proxyEnv(p.proxyAddr, p.proxyCACert), // Bash 子命令默认走代理+信任 CA
+		WorkingDir:             taskDir,                              // 本任务工作目录 <workDir>/tasks/<taskID>
+		ToolOutputDir:          cmdOutDir(taskDir),
+		MaxTurns:               p.maxTurns, // 0 = unlimited (configurable in agent management)
+		MaxDuration:            maxDur,     // 0=不限;有 deadline 时=距 deadline 剩余
+		Compaction:             compactionConfig(p.compactionWindow()),
 		// 跨唤醒共享的规划待办：让串行链在多轮之间保留（session 是新的，store 不是）。
 		Todos: p.todoFor(ts.ID()),
 		// 命中【本轮】步数预算→ SDK 跑收尾:把本轮已想清楚的结论落地(该派的 add_intent、
@@ -527,6 +534,14 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		Settlement:   settle,
 		NonStreaming: p.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:    p.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
+	}
+	if plannerIsFinancial(ctx) {
+		opts.EnableWebFetch = false
+		opts.EnableWebSearch = false
+		opts.DisableBackgroundTasks = true
+	}
+	if len(hooks) > 0 {
+		opts.Hooks = hooks[0]
 	}
 	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
 		opts.Transcript = p.tx

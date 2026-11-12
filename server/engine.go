@@ -111,15 +111,15 @@ type Engine struct {
 
 	bc *Broadcaster // live activity pub/sub (SSE)
 
-	started  sync.Map // taskID -> bool, so Run is idempotent per task
+	started sync.Map // taskID -> bool, so Run is idempotent per task
 	// planner waiting：本轮零产出时给任务一个降频冷却（见 planner_waiting.go）。
 	waitMu    sync.Mutex
 	waitUntil map[string]time.Time
-	lastAct  sync.Map // taskID -> int64 unix, last planner/worker activity (heartbeat)
-	llmCalls sync.Map // taskID -> *int64, actual planner/worker/main-agent LLM calls
-	paused   sync.Map // taskID -> bool, user-paused (planner + workers idle but loops alive)
-	deleting sync.Map // taskID -> bool, delete barrier (no new task-owned writes)
-	dropCnt  sync.Map // taskID -> *int64, running count of dropped (unpersistable) activity records
+	lastAct   sync.Map // taskID -> int64 unix, last planner/worker activity (heartbeat)
+	llmCalls  sync.Map // taskID -> *int64, actual planner/worker/main-agent LLM calls
+	paused    sync.Map // taskID -> bool, user-paused (planner + workers idle but loops alive)
+	deleting  sync.Map // taskID -> bool, delete barrier (no new task-owned writes)
+	dropCnt   sync.Map // taskID -> *int64, running count of dropped (unpersistable) activity records
 
 	// deleteMu makes installing the delete barrier atomic with registering a new
 	// task operation. Once BeginDelete returns, every admitted writer is reflected
@@ -866,7 +866,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// met→cancelExec 杀掉用户经主 agent 直投的意图。是否结束改由 frontier 决定：
 		// 还有 open/running 意图 → 保持 running、静默等待；意图已全部跑干 → 落 done。
 		// 整段纯 Go、不触发任何 LLM 调用，也不打规划轮 marker。
-		if open, err := t.Store.HasOpenGoal(); err == nil && !open {
+		if open, err := t.Store.HasOpenGoal(); err == nil && !open && !taskMayRequireFinancialSettlement(t) {
 			t.drainTriggers() // 丢弃累积的 done/finding 触发，避免 goalless 长会话里无界增长
 			if active, err := t.Store.HasActiveIntent(); err == nil && !active {
 				// frontier 抽干且无在跑意图 → 收尾。用 Guarded 版做 CAS，避免踩到并发的
@@ -902,7 +902,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
 		beforeIntents := intentCount(t.Store)
 		e.BeginLLMCall(t.ID)
-		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
+		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit, t.Guard.Hooks())
 		e.EndLLMCall(t.ID)
 		// 本轮没有真正产出新意图（重复方向已被抑制）→ 进入等待降频。
 		// 目标已判定达成或 Plan 出错时不进入，避免掩盖终态或故障。
@@ -1002,6 +1002,164 @@ func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker
 	}
 	log.Printf("[worker %s] task %s 领取意图 #%d", name, t.ID, intent.ID)
 	return e.runIntent(ctx, t, name, worker, intent, "", "")
+}
+
+func settleWorkerIntent(t *Task, intent *db.Node, reason harness.TerminalReason, runErr error) (string, error) {
+	state, blockedReason := workerIntentOutcome(t, intent, reason, runErr)
+	if state == "blocked" && blockedReason == "llm_quota_exhausted" {
+		return state, t.Store.SetIntentBlockedReason(intent.ID, db.IntentBlockedLLMQuota)
+	}
+	if state == "blocked" && blockedReason != "" {
+		return state, t.Store.SetIntentBlockedReason(intent.ID, blockedReason)
+	}
+	return state, transitionIntentState(t.Store, intent.ID, "running", state)
+}
+
+func intentHasRequiredOutput(store *db.ExplorationStore, intentID int64, role string, instrumentID *int64, taskID int64) (bool, string, error) {
+	if store == nil || store.DB() == nil {
+		return false, "产出核验失败: DB 不可用", errors.New("exploration DB unavailable")
+	}
+	switch {
+	case strings.HasPrefix(role, "analyst_"):
+		// analyst 的 unavailable fact 也是有效结构化结果。
+	case role == agent.RoleDebateBull || role == agent.RoleDebateBear || role == agent.RoleResearchManager ||
+		role == agent.RoleRiskAggressive || role == agent.RoleRiskConservative || role == agent.RoleRiskNeutral:
+	case role == agent.RoleTrader:
+		if instrumentID == nil {
+			return false, "trader task has no instrument binding", nil
+		}
+		rows, err := store.DB().Query(`SELECT 1 FROM signals WHERE task_id=$1 AND instrument_id=$2 AND node_id=$3 LIMIT 1`, taskID, *instrumentID, intentID)
+		if err != nil {
+			return false, "查询交易信号失败", err
+		}
+		defer rows.Close()
+		if rows.Next() {
+			return true, "", nil
+		}
+		if err := rows.Err(); err != nil {
+			return false, "读取交易信号失败", err
+		}
+		return false, "trader 未产出当前任务、标的及 intent 对应的 signal（不代表成交）", nil
+	case role == agent.RolePortfolioManager:
+		if instrumentID == nil {
+			return false, "portfolio_manager task has no instrument binding", nil
+		}
+		rating, err := store.DB().Ratings().GetLatestRatingByIntent(intentID)
+		if err != nil {
+			return false, "查询最新评级失败", err
+		}
+		if rating != nil && rating.TaskID != nil && *rating.TaskID == taskID && rating.InstrumentID != nil && instrumentID != nil && *rating.InstrumentID == *instrumentID {
+			return true, "", nil
+		}
+		return false, "portfolio_manager 未产出当前任务及标的对应的最新评级", nil
+	case agent.IsFinancialRole(role):
+		return false, fmt.Sprintf("金融角色 %s 尚无可核验的产出契约", role), nil
+	default:
+		return true, "", nil
+	}
+
+	edges, err := store.Edges(5000)
+	if err != nil {
+		return false, "查询 intent 血缘失败", err
+	}
+	wantKind := db.KindFact
+	if !strings.HasPrefix(role, "analyst_") {
+		wantKind = db.KindThesis
+	}
+	for _, edge := range edges {
+		if edge.From != intentID || edge.Rel != db.RelYields {
+			continue
+		}
+		node, err := store.GetNode(edge.To)
+		if err != nil {
+			return false, "查询 intent 产出失败", err
+		}
+		if node != nil && node.Kind == wantKind {
+			return true, "", nil
+		}
+	}
+	return false, fmt.Sprintf("%s 未产出通过 yields 关联的 %s", role, wantKind), nil
+}
+
+func workerIntentOutcome(t *Task, intent *db.Node, reason harness.TerminalReason, runErr error) (string, string) {
+	switch {
+	case runErr != nil:
+		if isTaskLLMChainExhausted(runErr) {
+			return "blocked", db.IntentBlockedLLMQuota
+		}
+		return "blocked", "worker_error: " + runErr.Error()
+	case reason == harness.ReasonMaxTurns || reason == harness.ReasonTimeout:
+		return "exhausted", ""
+	case reason != harness.ReasonCompleted:
+		return "blocked", fmt.Sprintf("worker_terminal_reason: %s", reason)
+	}
+
+	if t.Store == nil || t.Store.DB() == nil {
+		return "blocked", "产出核验失败: DB 不可用"
+	}
+	var taskID int64
+	taskID, err := strconv.ParseInt(t.ID, 10, 64)
+	if err != nil || taskID <= 0 {
+		return "blocked", "产出核验失败: task id 无效"
+	}
+	storedTask, err := t.Store.DB().GetTask(taskID)
+	if err != nil || storedTask == nil {
+		return "blocked", fmt.Sprintf("产出核验失败: 查询权威任务绑定失败: %v", err)
+	}
+	// 未绑定金融标的的 intent 与 screener 目前没有可通用验证的成果契约。
+	// 只有明确金融阶段角色默认无产出不能判 done；原有通用/渗透与 screener 保持行为。
+	role := strings.TrimSpace(intent.Owner)
+	if role == "" {
+		return "done", ""
+	}
+	if storedTask.InstrumentID == nil {
+		if agent.IsFinancialRole(role) && role != agent.RoleScreener {
+			return "blocked", fmt.Sprintf("金融角色 %s 无标的绑定，无法核验产出", role)
+		}
+		return "done", ""
+	}
+
+	valid, why, err := intentHasRequiredOutput(t.Store, intent.ID, role, storedTask.InstrumentID, taskID)
+	if err != nil {
+		return "blocked", fmt.Sprintf("产出核验失败: %s: %v", why, err)
+	}
+	if !valid {
+		return "blocked", why
+	}
+	return "done", ""
+}
+
+func taskMayRequireFinancialSettlement(t *Task) bool {
+	if t == nil {
+		return true
+	}
+	if taskIsFinance(t.InstrumentID, t.Description, t.Goal) {
+		return true
+	}
+	if t.Store == nil || t.Store.DB() == nil {
+		return true
+	}
+	if taskID, err := strconv.ParseInt(t.ID, 10, 64); err != nil || taskID <= 0 {
+		return true
+	} else {
+		var matches int
+		if err := t.Store.DB().QueryRow(`SELECT COUNT(*) FROM tasks WHERE id=$1 AND exploration_id=$2 AND deleted_at IS NULL`, taskID, t.Store.ID()).Scan(&matches); err != nil || matches != 1 {
+			return true
+		}
+	}
+	taskID, err := strconv.ParseInt(t.ID, 10, 64)
+	if err != nil || taskID <= 0 {
+		return true
+	}
+	var marked bool
+	if err := t.Store.DB().QueryRow(`SELECT
+		EXISTS(SELECT 1 FROM tasks WHERE id=$2 AND exploration_id=$1 AND deleted_at IS NULL AND instrument_id IS NOT NULL) OR
+		EXISTS(SELECT 1 FROM exploration_nodes WHERE exploration_id=$1 AND (
+			COALESCE(json_extract(payload,'$.instrument_id'),0)>0 OR
+			COALESCE(TRIM(json_extract(payload,'$.asset_class')),'')<>''))`, t.Store.ID(), taskID).Scan(&marked); err != nil {
+		return true
+	}
+	return marked
 }
 
 // runIntent executes and fully settles one already-claimed (state=running) intent.
@@ -1196,23 +1354,24 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	// terminal分流：撞步数上限 ≠ 完成。max_turns→exhausted（规划者据此知道这个方向
 	// 试过但没真正做完、需换角度，而非当成已覆盖永久跳过）；出错→blocked；正常→done。
-	state := "done"
-	switch {
-	case err != nil:
-		state = "blocked"
-	case reason == harness.ReasonMaxTurns:
-		state = "exhausted"
+	state, blockedReason := workerIntentOutcome(t, intent, reason, err)
+	if blockedReason != "" {
+		log.Printf("[worker %s] task %s 意图 #%d blocked: %s", name, t.ID, intent.ID, blockedReason)
+	}
+	if state == "exhausted" && reason == harness.ReasonMaxTurns {
 		log.Printf("[worker %s] intent %d 撞步数上限(exhausted)，本次写回 %s", name, intent.ID, wrote)
-	case reason == harness.ReasonTimeout:
-		state = "exhausted"
+	}
+	if state == "exhausted" && reason == harness.ReasonTimeout {
 		log.Printf("[worker %s] intent %d 运行超时(exhausted)，收尾后写回 %s", name, intent.ID, wrote)
 	}
-	if state == "blocked" && isTaskLLMChainExhausted(err) {
-		_ = t.Store.SetIntentBlockedReason(intent.ID, db.IntentBlockedLLMQuota)
+	var stateErr error
+	if state == "blocked" && blockedReason != "" {
+		stateErr = t.Store.SetIntentBlockedReason(intent.ID, blockedReason)
 	} else {
-		if stateErr := transitionIntentState(t.Store, intent.ID, "running", state); stateErr != nil {
-			log.Printf("[worker %s] task %s 意图 #%d 终态 %s 落库失败: %v", name, t.ID, intent.ID, state, stateErr)
-		}
+		stateErr = transitionIntentState(t.Store, intent.ID, "running", state)
+	}
+	if stateErr != nil {
+		log.Printf("[worker %s] task %s 意图 #%d 终态 %s 落库失败: %v", name, t.ID, intent.ID, state, stateErr)
 	}
 	log.Printf("[worker %s] task %s 意图 #%d 结束: %s (写回 %s)", name, t.ID, intent.ID, state, wrote)
 

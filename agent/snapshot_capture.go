@@ -19,8 +19,8 @@ package agent
 //
 // # 已知限制
 //
-// ON CONFLICT DO NOTHING 在「同秒同参数但内容不同」时静默丢弃后者（L3）。
-// InsertSnapshot 会记 warn 让这事可见，但不改数据语义。
+// 同秒同参数但内容不同时返回冲突错误，调用方省略 snapshot_id。
+// 旧快照保持不变，新内容不会错引旧证据。
 
 import (
 	"crypto/sha256"
@@ -30,7 +30,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -197,11 +196,10 @@ func captureKlineSnapshot(
 // captureQuoteSnapshot 为行情响应落一条快照，返回 snapshot id。
 //
 // collected_at 的取值分两种情况：
-//   - crypto（okx）：用 TradingDate（由 ticker 的 ts 毫秒时间戳转出），秒精度
+//   - crypto（okx）：用 Timestamp（ticker 的 ts），保留毫秒
 //   - 其余（akshare 日线）：用 TradingDate，天精度
 //
-// 为什么 crypto 是秒精度：OKX ticker 是真·实时，每次 ts 都不同，
-// 每次都是不同的市场状态，不该去重。
+// 实时报价没有 Timestamp 时不落快照，不能用交易日冒充报价时刻。
 //
 // is_partial=true 时**不落快照**（返回 0, nil）：盘中取日线时当日 bar 未收盘，
 // 落库会撞 dedup key。
@@ -216,14 +214,12 @@ func captureQuoteSnapshot(store *db.DB, q *Quote) (snapshotID int64, err error) 
 		// 见 closedBars 注释：未收盘的数据不落快照，避免 dedup key 碰撞。
 		return 0, nil
 	}
-	if strings.TrimSpace(q.TradingDate) == "" {
-		// 没有业务时间就无法构造稳定的 dedup key，宁可不落也不要用采集时间冒充。
-		return 0, nil
-	}
-
-	source := "akshare"
+	source, collectedAt := "akshare", q.TradingDate
 	if q.Market == "crypto" {
-		source = "okx"
+		source, collectedAt = "okx", q.Timestamp
+	}
+	if strings.TrimSpace(collectedAt) == "" {
+		return 0, nil
 	}
 	params := map[string]string{
 		"symbol":  q.Symbol,
@@ -234,7 +230,7 @@ func captureQuoteSnapshot(store *db.DB, q *Quote) (snapshotID int64, err error) 
 		Source:      source,
 		Endpoint:    "/quote",
 		ParamsHash:  snapshotParamsHash("quote", params),
-		CollectedAt: q.TradingDate,
+		CollectedAt: collectedAt,
 		Checksum:    quoteChecksum(q),
 	})
 	if err != nil {
@@ -242,9 +238,6 @@ func captureQuoteSnapshot(store *db.DB, q *Quote) (snapshotID int64, err error) 
 	}
 	return snap.ID, nil
 }
-
-// 确保 time 被引用（collected_at 的精度语义在注释里讨论，实现用字符串）。
-var _ = time.Second
 
 // captureMacroSnapshot 为宏观指标落一条快照。
 //
@@ -313,7 +306,7 @@ func captureIndicatorSnapshot(store *db.DB, r *IndicatorResult) (int64, error) {
 		"indicator":     r.Indicator,
 		"symbol":        r.Symbol,
 		"bar":           r.Bar,
-		"params":        "", // 传进来的 Params 未回传到 Result（服务端默认值未知），
+		"params":        r.Params,
 		"backtest_time": strconv.FormatInt(r.BacktestTime, 10),
 	}
 	snap, _, err := store.Snapshots().InsertSnapshot(db.SnapshotInput{

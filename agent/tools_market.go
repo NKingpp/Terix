@@ -193,11 +193,11 @@ func (m *MarketToolSet) Tools() []actool.CoreTool {
 		m.getVolatility(),
 		m.getCryptoFlow(),
 		m.getAccountBalance(), // 交易账户余额（需凭证，见 tools_account_balance.go）
-		m.getIndicatorOkx(), // 服务端指标（需 OKX 网络）
-		m.getNews(),         // 新闻（只走 akshare，见 market_news.go）
-		m.getFundamentals(), // 财报（只走 akshare，仅 A 股）
-		m.mxQuery(),         // 妙想自然语言问句（行情/财务，见 tools_mx.go）
-		m.mxNews(),          // 妙想资讯（新闻/公告/研报）
+		m.getIndicatorOkx(),   // 服务端指标（需 OKX 网络）
+		m.getNews(),           // 新闻（只走 akshare，见 market_news.go）
+		m.getFundamentals(),   // 财报（只走 akshare，仅 A 股）
+		m.mxQuery(),           // 妙想自然语言问句（行情/财务，见 tools_mx.go）
+		m.mxNews(),            // 妙想资讯（新闻/公告/研报）
 		// 按数据源拆分的行情工具（2026-11-02 用户需求）。
 		//
 		// 「在可用时提供」在这里体现：sourceQuoteTools() 内部按
@@ -502,14 +502,18 @@ func (m *MarketToolSet) getQuote() actool.CoreTool {
 			// 失败不阻断取数 —— 快照是附加证据链，不是主功能。
 			// 未收盘数据（is_partial）刻意不落库，返回 0（见 snapshot_capture.go）。
 			snapshotID := int64(0)
+			snapshotWarning := ""
 			if m.db != nil {
 				if id, sErr := captureQuoteSnapshot(m.db, q); sErr != nil {
+					snapshotWarning = sErr.Error()
 					slog.Warn("snapshot 落库失败（不阻断取数）",
 						"endpoint", "get_quote", "symbol", q.Symbol, "market", q.Market,
 						"err", sErr, "limitation", "L4")
 				} else {
 					snapshotID = id
 				}
+			} else {
+				snapshotWarning = "snapshot store 未配置"
 			}
 
 			out := map[string]any{
@@ -531,6 +535,9 @@ func (m *MarketToolSet) getQuote() actool.CoreTool {
 			}
 			if snapshotID > 0 {
 				out["snapshot_id"] = snapshotID
+			} else if snapshotWarning != "" {
+				out["evidence_status"] = "not_captured"
+				out["snapshot_warning"] = snapshotWarning
 			} else if q.IsPartial {
 				// 与 emit_fact 的 snapshot_absence_reason 同一语义：
 				// 未收盘数据不落快照，但要说明原因，不能让调用方以为是漏了。

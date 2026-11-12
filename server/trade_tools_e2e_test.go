@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/exec"
 	actool "github.com/Autumn-27/norma/tool"
@@ -91,12 +92,16 @@ func (e *tradeE2E) tool(t *testing.T, name string) actool.CoreTool {
 
 // call 调用工具，返回 flatten 后的文本。
 func (e *tradeE2E) call(t *testing.T, name string, args map[string]any) string {
+	return e.callCtx(t, context.Background(), name, args)
+}
+
+func (e *tradeE2E) callCtx(t *testing.T, ctx context.Context, name string, args map[string]any) string {
 	t.Helper()
 	raw, err := json.Marshal(args)
 	if err != nil {
 		t.Fatalf("序列化: %v", err)
 	}
-	res, err := e.tool(t, name).Call(context.Background(), raw, nil)
+	res, err := e.tool(t, name).Call(ctx, raw, nil)
 	if err != nil {
 		t.Fatalf("%s 返回 error: %v", name, err)
 	}
@@ -175,6 +180,282 @@ func TestTradeChainCreateAuthExecute(t *testing.T) {
 	}
 }
 
+// TestCreateOrderDraftRejectsIntentInstrumentMismatch 交易意图标的与请求标的不一致时拒绝。
+func TestCreateOrderDraftRejectsIntentInstrumentMismatch(t *testing.T) {
+	e := newTradeE2E(t)
+	otherID, _, err := e.pg.Instruments().UpsertInstrument(db.InstrumentInput{
+		Market: "crypto", Symbol: "E2EOTHER-USDT", Name: "其他测试标的", AssetClass: "crypto",
+	})
+	if err != nil {
+		t.Fatalf("建其他标的: %v", err)
+	}
+	t.Cleanup(func() { _, _ = e.pg.Exec(`DELETE FROM instruments WHERE id=$1`, otherID) })
+	exp, err := e.pg.CreateTask("trade", "trade", nil, 0, 0)
+	if err != nil {
+		t.Skipf("创建任务失败: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := e.pg.DeleteTask(exp.ID); err != nil {
+			t.Errorf("清理任务: %v", err)
+		}
+	})
+	if _, err := e.pg.Exec(`UPDATE tasks SET instrument_id=$1 WHERE id=$2`, otherID, exp.ID); err != nil {
+		t.Fatalf("绑定任务标的: %v", err)
+	}
+	store := e.pg.Exploration(exp.ExplorationID)
+	intentID, err := store.AddNode(db.KindIntent, map[string]any{"role": "trader", "instrument_id": e.instID}, 1, "open", "test", nil)
+	if err != nil {
+		t.Fatalf("建意图: %v", err)
+	}
+	ctx := agent.WithRunInfo(context.Background(), agent.RunInfo{TaskID: exp.ID, ExplorationID: exp.ExplorationID, IntentID: intentID})
+	out := e.callCtx(t, ctx, "create_order_draft", map[string]any{
+		"symbol": "E2EOTHER-USDT", "market": "crypto", "side": "buy", "qty": "1",
+	})
+	if strings.Contains(out, "draft_id") {
+		t.Fatalf("意图标的不一致时不应创建草案: %s", out)
+	}
+	if !strings.Contains(out, "instrument") && !strings.Contains(out, "标的") {
+		t.Fatalf("应明确说明标的不一致: %s", out)
+	}
+}
+
+// TestCreateOrderDraftRejectsIntentWithoutInstrument 禁止从无标的意图猜测旧标的。
+func TestCreateOrderDraftRejectsIntentWithoutInstrument(t *testing.T) {
+	e := newTradeE2E(t)
+	exp, err := e.pg.CreateTask("trade", "trade", nil, 0, 0)
+	if err != nil {
+		t.Skipf("创建任务失败: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := e.pg.DeleteTask(exp.ID); err != nil {
+			t.Errorf("清理任务: %v", err)
+		}
+	})
+	if _, err := e.pg.Exec(`UPDATE tasks SET instrument_id=$1 WHERE id=$2`, e.instID, exp.ID); err != nil {
+		t.Fatalf("绑定任务标的: %v", err)
+	}
+	store := e.pg.Exploration(exp.ExplorationID)
+	intentID, err := store.AddNode(db.KindIntent, map[string]any{"role": "trader"}, 1, "open", "test", nil)
+	if err != nil {
+		t.Fatalf("建意图: %v", err)
+	}
+	ctx := agent.WithRunInfo(context.Background(), agent.RunInfo{TaskID: exp.ID, ExplorationID: exp.ExplorationID, IntentID: intentID})
+	out := e.callCtx(t, ctx, "create_order_draft", map[string]any{
+		"symbol": "E2ETEST-USDT", "market": "crypto", "side": "buy", "qty": "1",
+	})
+	if strings.Contains(out, "draft_id") {
+		t.Fatalf("无明确交易标的意图不应创建草案: %s", out)
+	}
+}
+
+func TestTradeChainWithTaskContext(t *testing.T) {
+	e := newTradeE2E(t)
+	ri := e.runInfo(t, &e.instID)
+	signalID, err := e.pg.Signals().InsertSignal(db.SignalInput{
+		TaskID: &ri.TaskID, InstrumentID: &e.instID, SignalType: "technical", Direction: "long",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = e.pg.Exec(`DELETE FROM paper_orders WHERE signal_id=$1`, signalID)
+		_, _ = e.pg.Exec(`DELETE FROM orders_draft WHERE signal_id=$1`, signalID)
+		_, _ = e.pg.Exec(`DELETE FROM signals WHERE id=$1`, signalID)
+	})
+	ctx := agent.WithRunInfo(context.Background(), ri)
+	out := e.callCtx(t, ctx, "create_order_draft", map[string]any{
+		"symbol": "E2ETEST-USDT", "market": "crypto", "side": "buy", "qty": "1", "ref_price": "100", "signal_id": signalID,
+	})
+	var result struct {
+		DraftID int64 `json:"draft_id"`
+	}
+	if err := json.Unmarshal([]byte(out), &result); err != nil || result.DraftID <= 0 {
+		t.Fatalf("上下文一致应创建草案: %s", out)
+	}
+	args := map[string]any{"draft_id": result.DraftID, "account_id": e.acctID}
+	if out := e.callCtx(t, ctx, "authorize_order", args); !strings.Contains(out, `"decision":"allow"`) {
+		t.Fatalf("上下文一致应允许授权: %s", out)
+	}
+	if out := e.callCtx(t, ctx, "execute_paper_order", args); !strings.Contains(out, "paper_order_id") {
+		t.Fatalf("上下文一致应允许纸面执行: %s", out)
+	}
+}
+
+func (e *tradeE2E) runInfo(t *testing.T, instrumentID *int64) agent.RunInfo {
+	t.Helper()
+	task, err := e.pg.CreateTask("trade context test", "trade", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("建任务: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := e.pg.DeleteTask(task.ID); err != nil {
+			t.Errorf("清理任务: %v", err)
+		}
+	})
+	if _, err := e.pg.Exec(`UPDATE tasks SET instrument_id=$1 WHERE id=$2`, instrumentID, task.ID); err != nil {
+		t.Fatalf("绑定任务标的: %v", err)
+	}
+	intentID, err := e.pg.Exploration(task.ExplorationID).AddNode(db.KindIntent,
+		map[string]any{"role": "trader", "instrument_id": e.instID}, 1, "open", "test", nil)
+	if err != nil {
+		t.Fatalf("建意图: %v", err)
+	}
+	return agent.RunInfo{TaskID: task.ID, ExplorationID: task.ExplorationID, IntentID: intentID}
+}
+
+func TestTradeToolsRejectInvalidTaskContext(t *testing.T) {
+	e := newTradeE2E(t)
+	ri := e.runInfo(t, &e.instID)
+	other := e.runInfo(t, &e.instID)
+	unbound := e.runInfo(t, nil)
+	draftID, err := e.pg.OrderDrafts().InsertDraft(db.OrderDraftInput{
+		InstrumentID: &e.instID, Side: "buy", Qty: "1", RefPrice: "100",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := e.call(t, "authorize_order", map[string]any{"draft_id": draftID, "account_id": e.acctID}); !strings.Contains(out, `"decision":"allow"`) {
+		t.Fatalf("预先授权失败: %s", out)
+	}
+	cases := []struct {
+		name string
+		info agent.RunInfo
+		want string
+	}{
+		{"缺任务", agent.RunInfo{ExplorationID: ri.ExplorationID, IntentID: ri.IntentID}, "上下文"},
+		{"缺 exploration", agent.RunInfo{TaskID: ri.TaskID, IntentID: ri.IntentID}, "上下文"},
+		{"任务不存在", agent.RunInfo{TaskID: 9223372036854775807, ExplorationID: ri.ExplorationID}, "上下文"},
+		{"负任务 ID", agent.RunInfo{TaskID: -1, ExplorationID: ri.ExplorationID}, "上下文"},
+		{"任务无标的绑定", unbound, "未明确 instrument_id"},
+		{"任务配旧 exploration 和 intent", agent.RunInfo{TaskID: ri.TaskID, ExplorationID: other.ExplorationID, IntentID: other.IntentID}, "exploration"},
+		{"当前 exploration 配旧 intent", agent.RunInfo{TaskID: ri.TaskID, ExplorationID: ri.ExplorationID, IntentID: other.IntentID}, "交易意图"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := agent.WithRunInfo(context.Background(), tc.info)
+			for _, name := range tradeToolNames {
+				out := e.callCtx(t, ctx, name, map[string]any{
+					"symbol": "E2ETEST-USDT", "market": "crypto", "side": "buy", "qty": "1",
+					"draft_id": draftID, "account_id": e.acctID,
+				})
+				if !strings.Contains(out, tc.want) {
+					t.Errorf("%s 应拒绝并包含 %q，实际: %s", name, tc.want, out)
+				}
+			}
+		})
+	}
+	var n int
+	if err := e.pg.QueryRow(`SELECT count(*) FROM paper_orders WHERE account_id=$1`, e.acctID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("拒绝后不应记账: count=%d err=%v", n, err)
+	}
+}
+
+func TestTradeToolsRejectCrossInstrumentDraft(t *testing.T) {
+	e := newTradeE2E(t)
+	otherID, _, err := e.pg.Instruments().UpsertInstrument(db.InstrumentInput{
+		Market: "crypto", Symbol: "E2ECROSS-USDT", Name: "跨标的测试", AssetClass: "crypto",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = e.pg.Exec(`DELETE FROM instruments WHERE id=$1`, otherID) })
+	ri := e.runInfo(t, &otherID)
+	ctx := agent.WithRunInfo(context.Background(), ri)
+	out := e.callCtx(t, ctx, "create_order_draft", map[string]any{
+		"symbol": "E2ETEST-USDT", "market": "crypto", "side": "buy", "qty": "1",
+	})
+	if !strings.Contains(out, "任务") || !strings.Contains(out, "不一致") {
+		t.Fatalf("任务与旧 intent/request 同标的也必须拒绝: %s", out)
+	}
+	draftID, err := e.pg.OrderDrafts().InsertDraft(db.OrderDraftInput{
+		InstrumentID: &e.instID, Side: "buy", Qty: "1", RefPrice: "100",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := e.call(t, "authorize_order", map[string]any{"draft_id": draftID, "account_id": e.acctID}); !strings.Contains(out, `"decision":"allow"`) {
+		t.Fatalf("预先授权失败: %s", out)
+	}
+	payload, err := json.Marshal(map[string]any{"role": "trader", "instrument_id": otherID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.pg.Exec(`UPDATE exploration_nodes SET payload=$1 WHERE id=$2`, string(payload), ri.IntentID); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"authorize_order", "execute_paper_order"} {
+		out := e.callCtx(t, ctx, name, map[string]any{"draft_id": draftID, "account_id": e.acctID})
+		if !strings.Contains(out, "不一致") {
+			t.Errorf("%s 必须拒绝其他标的草案: %s", name, out)
+		}
+	}
+}
+
+func TestTradeToolsValidateSignalTaskBinding(t *testing.T) {
+	e := newTradeE2E(t)
+	otherID, _, err := e.pg.Instruments().UpsertInstrument(db.InstrumentInput{
+		Market: "crypto", Symbol: "E2ESIGNAL-USDT", Name: "信号任务测试", AssetClass: "crypto",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = e.pg.Exec(`DELETE FROM instruments WHERE id=$1`, otherID) })
+	ri := e.runInfo(t, &e.instID)
+	other := e.runInfo(t, &e.instID)
+	unbound := e.runInfo(t, nil)
+	mismatched := e.runInfo(t, &otherID)
+	for _, tc := range []struct {
+		name         string
+		taskID       *int64
+		instrumentID *int64
+		want         string
+		noContext    bool
+	}{
+		{"其他任务信号", &other.TaskID, &e.instID, "不属于当前任务", false},
+		{"信号无标的", &ri.TaskID, nil, "不一致", false},
+		{"信号无任务", nil, &e.instID, "不属于当前任务", false},
+		{"信号任务无绑定", &unbound.TaskID, &e.instID, "未明确 instrument_id", true},
+		{"信号标的与所属任务冲突", &mismatched.TaskID, &e.instID, "与所属任务标的不一致", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			signalID, err := e.pg.Signals().InsertSignal(db.SignalInput{
+				TaskID: tc.taskID, InstrumentID: tc.instrumentID, SignalType: "technical", Direction: "long",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_, _ = e.pg.Exec(`DELETE FROM orders_draft WHERE signal_id=$1`, signalID)
+				_, _ = e.pg.Exec(`DELETE FROM signals WHERE id=$1`, signalID)
+			})
+			draftID, err := e.pg.OrderDrafts().InsertDraft(db.OrderDraftInput{
+				SignalID: &signalID, InstrumentID: &e.instID, Side: "buy", Qty: "1", RefPrice: "100",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 先正常过闸，避免 execute 因缺授权而误通过拒绝测试。
+			verdict, err := e.tts.gate.Authorize(context.Background(), exec.GateRequest{DraftID: draftID, AccountID: e.acctID, Mode: db.ExecModePaper})
+			if err != nil || verdict.Decision != exec.DecisionAllow {
+				t.Fatalf("预先授权失败: verdict=%+v err=%v", verdict, err)
+			}
+			ctx := agent.WithRunInfo(context.Background(), ri)
+			if tc.noContext {
+				ctx = context.Background()
+			}
+			for _, name := range tradeToolNames {
+				out := e.callCtx(t, ctx, name, map[string]any{
+					"symbol": "E2ETEST-USDT", "market": "crypto", "side": "buy", "qty": "1", "signal_id": signalID,
+					"draft_id": draftID, "account_id": e.acctID,
+				})
+				if !strings.Contains(out, tc.want) {
+					t.Errorf("%s 应拒绝并包含 %q，实际: %s", name, tc.want, out)
+				}
+			}
+		})
+	}
+}
+
 // TestTradeExecuteRequiresAuthorization 未过闸就执行必须失败。
 //
 // # 这条是「拦截」的核心断言
@@ -222,25 +503,31 @@ func TestTradeToolsRejectInvalidIDs(t *testing.T) {
 func TestTradeExecuteRefusesLive(t *testing.T) {
 	e := newTradeE2E(t)
 	t.Cleanup(func() { _, _, _ = e.pg.ForceSetExecMode(db.ExecModePaper) })
-
-	if _, _, err := e.pg.ForceSetExecMode(db.ExecModeLiveManual); err != nil {
-		t.Fatalf("置 live: %v", err)
-	}
-
 	draftID, err := e.pg.OrderDrafts().InsertDraft(db.OrderDraftInput{
 		InstrumentID: &e.instID, Side: "buy", Qty: "1", RefPrice: "100",
 	})
 	if err != nil {
 		t.Fatalf("建草案: %v", err)
 	}
-
-	out := e.call(t, "execute_paper_order", map[string]any{
-		"draft_id": draftID, "account_id": e.acctID,
-	})
-	if strings.Contains(out, "paper_order_id") {
-		t.Fatalf("live 模式下不该执行 paper 单，实际: %s", out)
+	if out := e.call(t, "authorize_order", map[string]any{"draft_id": draftID, "account_id": e.acctID}); !strings.Contains(out, `"decision":"allow"`) {
+		t.Fatalf("预先授权失败: %s", out)
 	}
-	if !strings.Contains(out, "只执行 paper") {
-		t.Errorf("应明确说明只执行 paper，实际: %s", out)
+	for _, mode := range []db.ExecMode{db.ExecModeLiveManual, db.ExecModeLiveWhitelist, db.ExecModeLiveAuto} {
+		t.Run(string(mode), func(t *testing.T) {
+			if err := e.pg.SetSetting(db.ExecModeKey, string(mode)); err != nil {
+				t.Fatalf("置 live: %v", err)
+			}
+			if actual, err := e.pg.GetExecMode(); err != nil || actual != mode {
+				t.Fatalf("模式未切换: actual=%s err=%v", actual, err)
+			}
+			out := e.call(t, "execute_paper_order", map[string]any{"draft_id": draftID, "account_id": e.acctID})
+			if !strings.Contains(out, "只执行 paper") || !strings.Contains(out, string(mode)) {
+				t.Fatalf("已授权草案也应明确因 live 模式拒绝: %s", out)
+			}
+			var n int
+			if err := e.pg.QueryRow(`SELECT count(*) FROM paper_orders WHERE account_id=$1`, e.acctID).Scan(&n); err != nil || n != 0 {
+				t.Fatalf("live 拒绝后不应记账: count=%d err=%v", n, err)
+			}
+		})
 	}
 }

@@ -156,6 +156,37 @@ func TestAddIntentRoleInheritsInstrument(t *testing.T) {
 	}
 }
 
+func TestAddIntentIgnoresStaleGraphInstrument(t *testing.T) {
+	d := testDB(t)
+	t.Cleanup(func() { d.Close() })
+	inst := upsertTestInstrument(t, d, db.InstrumentInput{Symbol: "TINSTR-P0-SOL", Market: "crypto", AssetClass: "crypto", Name: "SOL"})
+	task, err := d.CreateTask("p0", "test", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		d.Exec("DELETE FROM tasks WHERE id=$1", task.ID)
+		d.Exec("DELETE FROM explorations WHERE id=$1", task.ExplorationID)
+	})
+	if _, err = d.Exec("UPDATE tasks SET instrument_id=$1 WHERE id=$2", inst, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	es := d.Exploration(task.ExplorationID)
+	if _, err = es.AddNode(db.KindIntent, map[string]any{"instrument_id": 99999, "asset_class": "stock"}, 1, "done", "system", nil); err != nil {
+		t.Fatal(err)
+	}
+	ts := NewToolSet(es, "planner")
+	ts.SetTaskID(task.ID)
+	id, err := ts.addOneIntent(intentItem{Summary: "复核本标的", Role: RoleTrader})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := readIntentPayload(t, d, id)
+	if p["instrument_id"] != float64(inst) || p["asset_class"] != "crypto" {
+		t.Fatalf("inherited stale graph binding: %v", p)
+	}
+}
+
 // TestAddIntentRoleWithoutInstrumentStillWorks 无标的任务（尚未选品）不报错。
 //
 // 这是合法状态：screener 就是靠「无标的」工作的。回填拿不到就跳过，

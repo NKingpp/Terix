@@ -328,7 +328,7 @@ func (c *OkxClient) FetchQuote(ctx context.Context, symbol, market string, ch Ch
 		Market: "crypto",
 		// OKX ticker 是**实时**报价，不是日线收盘价 —— 与 akshare 通道不同。
 		PriceKind: "realtime",
-		// TradingDate 用 ts 的日期部分（毫秒时间戳转 UTC 日期）。
+		// TradingDate 保持交易日语义；Timestamp 单独保存实时行情的精确业务时间。
 		TradingDate: tsToDate(r.TS),
 		Last:        r.Last,
 		High:        r.High24h,
@@ -339,6 +339,7 @@ func (c *OkxClient) FetchQuote(ctx context.Context, symbol, market string, ch Ch
 		Volume:      r.Vol24h,
 		Amount:      r.VolCcy,
 		Channel:     ChannelOKX,
+		Timestamp:   tsToTimestamp(r.TS),
 	}, nil
 }
 
@@ -496,6 +497,14 @@ func tsToDate(ts string) string {
 		return ""
 	}
 	return time.UnixMilli(ms).UTC().Format("2006-01-02")
+}
+
+func tsToTimestamp(ts string) string {
+	ms, err := strconv.ParseInt(strings.TrimSpace(ts), 10, 64)
+	if err != nil || ms <= 0 {
+		return ""
+	}
+	return time.UnixMilli(ms).UTC().Format(time.RFC3339Nano)
 }
 
 // FetchMacro OKX 无宏观数据。
@@ -704,7 +713,7 @@ func (c *OkxClient) FetchIndicator(ctx context.Context, in IndicatorQuery) (*Ind
 	if err != nil {
 		return nil, err
 	}
-	return parseOkxIndicator(raw, indicator, symbol, bar, in.BacktestTime)
+	return parseOkxIndicator(raw, indicator, symbol, bar, in.BacktestTime, in.Params)
 }
 
 // FetchBalance 用 `okx account balance --json` 取交易账户资产。
@@ -813,6 +822,7 @@ func isZeroAmount(s string) bool {
 }
 
 // parseOkxIndicator 解析 OKX indicator 的嵌套响应。
+// params 保留请求参数，用于快照身份哈希。
 //
 // 响应形状（实测，2026-10）：
 //
@@ -825,7 +835,7 @@ func isZeroAmount(s string) bool {
 //
 // **为什么取最后一条而不是第一条**：返回可能含多条历史（配合 --limit），
 // 最新的一定在最后（服务端按时间升序）。取第一条会拿到最旧的值。
-func parseOkxIndicator(raw []byte, indicator, symbol, bar string, backtestTime int64) (*IndicatorResult, error) {
+func parseOkxIndicator(raw []byte, indicator, symbol, bar string, backtestTime int64, params string) (*IndicatorResult, error) {
 	body := trimToJSON(raw)
 	var outer []struct {
 		Data []struct {
@@ -895,6 +905,7 @@ func parseOkxIndicator(raw []byte, indicator, symbol, bar string, backtestTime i
 		TS:           ts,
 		Values:       last.Values,
 		BacktestTime: backtestTime,
+		Params:       params,
 		Source:       "okx",
 	}, nil
 }

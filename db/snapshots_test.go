@@ -48,7 +48,7 @@ func TestSnapshotRoundtripAndDedup(t *testing.T) {
 		ParamsHash:  "hash-abc",
 		CollectedAt: "2026-03-01T09:30:15.750Z",
 		BodyRef:     "s3://bucket/other.json",
-		Checksum:    "sha256:other",
+		Checksum:    in.Checksum,
 	})
 	if err != nil {
 		t.Fatalf("insert dup: %v", err)
@@ -104,6 +104,26 @@ func TestSnapshotRoundtripAndDedup(t *testing.T) {
 	// 最新在前。
 	if list[0].ID != snap3.ID {
 		t.Errorf("list not ordered by collected_at desc: first id %d", list[0].ID)
+	}
+}
+
+func TestSnapshotContentConflictRejectsOldEvidence(t *testing.T) {
+	d, store := snapshotsSetup(t)
+	source := uniqueName(t, "conflict")
+	defer d.Exec(`DELETE FROM snapshots WHERE source=$1`, source)
+	in := SnapshotInput{Source: source, Endpoint: "/quote", ParamsHash: "conflict", CollectedAt: "2026-03-01T09:30:15.001Z", Checksum: "original"}
+	first, _, err := store.InsertSnapshot(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.CollectedAt, in.Checksum = "2026-03-01T09:30:15.999Z", "changed"
+	snap, created, err := store.InsertSnapshot(in)
+	if err == nil || snap != nil || created {
+		t.Fatalf("内容冲突不能返回旧证据: snap=%+v created=%v err=%v", snap, created, err)
+	}
+	got, err := store.GetSnapshotByDedupKey(in.Source, in.Endpoint, in.ParamsHash, in.CollectedAt)
+	if err != nil || got.ID != first.ID || got.Checksum != "original" {
+		t.Fatalf("旧证据必须保持不变: snap=%+v err=%v", got, err)
 	}
 }
 

@@ -2,10 +2,373 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
+
+func TestUpdateGoalPayloadAudit(t *testing.T) {
+	d := testOpen(t)
+	expID, err := d.CreateExploration("目标编辑审计", "至少1000个结果")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	es := d.Exploration(expID)
+	goal, err := es.AddGoal(map[string]any{
+		"text": "至少1000个结果", "vulnclass": "old", "source": "manual", "threshold": 1000,
+	}, "human")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := es.AddNode(KindFact, map[string]any{"text": "旧证据"}, 0, "confirmed", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := es.Link(proof, RelProves, goal); err != nil {
+		t.Fatal(err)
+	}
+	if err := es.Link(proof, RelSpawns, goal); err != nil {
+		t.Fatal(err)
+	}
+	if err := es.SetNodeState(goal, "met"); err != nil {
+		t.Fatal(err)
+	}
+	var beforeVersion int
+	if err := d.QueryRow(`SELECT content_version FROM exploration_nodes WHERE id=$1`, goal).Scan(&beforeVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := es.UpdateGoalPayload(goal, "至少100个结果", "new"); err != nil {
+		t.Fatal(err)
+	}
+	activities, _, err := es.ActivityList(&goal, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(activities) != 1 || activities[0].Kind != "goal_updated" {
+		t.Fatalf("目标编辑必须留下审计: %+v", activities)
+	}
+	var metadata struct {
+		Actor   string         `json:"actor"`
+		Source  string         `json:"source"`
+		Subject string         `json:"subject"`
+		GoalID  int64          `json:"goal_id"`
+		Old     map[string]any `json:"old"`
+		New     map[string]any `json:"new"`
+	}
+	if err := json.Unmarshal(activities[0].Metadata, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Actor != "human" || metadata.Source != "goals_api" || metadata.Subject != "anonymous_shared" || metadata.GoalID != goal ||
+		metadata.Old["text"] != "至少1000个结果" || metadata.New["text"] != "至少100个结果" {
+		t.Fatalf("审计主体或前后值错误: %+v", metadata)
+	}
+	if metadata.Old["vulnclass"] != "old" || metadata.New["vulnclass"] != "new" {
+		t.Fatalf("审计遗漏类别修改: %+v", metadata)
+	}
+	node, err := es.GetNode(goal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(node.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["source"] != "manual" || payload["threshold"] != float64(1000) || payload["text"] != "至少100个结果" {
+		t.Fatalf("目标元数据被覆盖: %s", node.Payload)
+	}
+	if node.State != "open" {
+		t.Fatalf("文本修改后旧 met 必须失效: %s", node.State)
+	}
+	var version, proves, spawns int
+	if err := d.QueryRow(`SELECT content_version FROM exploration_nodes WHERE id=$1`, goal).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_edges WHERE dst_id=$1 AND rel='proves'`, goal).Scan(&proves); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_edges WHERE dst_id=$1 AND rel='spawns'`, goal).Scan(&spawns); err != nil {
+		t.Fatal(err)
+	}
+	if version != beforeVersion+1 || proves != 0 || spawns != 1 {
+		t.Fatalf("目标版本或证明边错误: version=%d before=%d proves=%d spawns=%d", version, beforeVersion, proves, spawns)
+	}
+	_, root, err := es.Root()
+	if err != nil || root != "至少1000个结果" {
+		t.Fatalf("root goal 不应变动: root=%q err=%v", root, err)
+	}
+
+	if err := es.UpdateGoalPayload(goal, "至少10个结果", ""); err != nil {
+		t.Fatal(err)
+	}
+	activities, _, err = es.ActivityList(&goal, 0, 100)
+	if err != nil || len(activities) != 2 {
+		t.Fatalf("连续修改审计: %+v err=%v", activities, err)
+	}
+	metadata.Old, metadata.New = nil, nil
+	if err := json.Unmarshal(activities[1].Metadata, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Old["text"] != "至少100个结果" || metadata.New["text"] != "至少10个结果" {
+		t.Fatalf("连续修改未构成链: %+v", metadata)
+	}
+	if _, ok := metadata.New["vulnclass"]; ok {
+		t.Fatalf("空类别应清除: %+v", metadata.New)
+	}
+	if err := es.UpdateGoalPayload(goal, "至少10个结果", ""); err != nil {
+		t.Fatal(err)
+	}
+	activities, _, err = es.ActivityList(&goal, 0, 100)
+	if err != nil || len(activities) != 2 {
+		t.Fatalf("无变化不应新增审计: %+v err=%v", activities, err)
+	}
+	if err := d.QueryRow(`SELECT content_version FROM exploration_nodes WHERE id=$1`, goal).Scan(&version); err != nil || version != beforeVersion+2 {
+		t.Fatalf("无变化不应增加版本: version=%d err=%v", version, err)
+	}
+}
+
+func TestUpdateGoalPayloadAuditRollbackAndScope(t *testing.T) {
+	d := testOpen(t)
+	expID, err := d.CreateExploration("目标审计回滚", "root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	es := d.Exploration(expID)
+	goal, err := es.AddGoal(map[string]any{"text": "旧目标", "custom": true}, "human")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := es.AddNode(KindFact, map[string]any{"text": "证据"}, 0, "confirmed", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := es.Link(proof, RelProves, goal); err != nil {
+		t.Fatal(err)
+	}
+	if err := es.SetNodeState(goal, "met"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := es.GetNode(goal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var beforeVersion int
+	if err := d.QueryRow(`SELECT content_version FROM exploration_nodes WHERE id=$1`, goal).Scan(&beforeVersion); err != nil {
+		t.Fatal(err)
+	}
+	trigger := fmt.Sprintf("fail_goal_audit_%d", expID)
+	if _, err := d.Exec(fmt.Sprintf(`CREATE TRIGGER %s BEFORE INSERT ON activity
+		WHEN NEW.kind='goal_updated' AND NEW.exploration_id=%d
+		BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END`, trigger, expID)); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DROP TRIGGER ` + trigger)
+	if err := es.UpdateGoalPayload(goal, "新目标", ""); err == nil || !strings.Contains(err.Error(), "audit unavailable") {
+		t.Fatalf("审计失败应返回错误: %v", err)
+	}
+	after, err := es.GetNode(goal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version, proves int
+	if err := d.QueryRow(`SELECT content_version FROM exploration_nodes WHERE id=$1`, goal).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_edges WHERE dst_id=$1 AND rel='proves'`, goal).Scan(&proves); err != nil {
+		t.Fatal(err)
+	}
+	if string(after.Payload) != string(before.Payload) || after.State != "met" || version != beforeVersion || proves != 1 {
+		t.Fatalf("审计失败未完整回滚: before=%+v after=%+v version=%d proves=%d", before, after, version, proves)
+	}
+	otherID, err := d.CreateExploration("其他探索", "root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, otherID)
+	if err := d.Exploration(otherID).UpdateGoalPayload(goal, "越界目标", ""); err == nil {
+		t.Fatal("跨 exploration 修改应拒绝")
+	}
+	if err := es.UpdateGoalPayload(proof, "非目标", ""); err == nil {
+		t.Fatal("非 goal 修改应拒绝")
+	}
+	activities, _, err := es.ActivityList(nil, 0, 100)
+	if err != nil || len(activities) != 0 {
+		t.Fatalf("失败操作不应留下审计: %+v err=%v", activities, err)
+	}
+}
+
+func TestUpdateGoalPayloadVulnclassInvalidatesProof(t *testing.T) {
+	d := testOpen(t)
+	expID, err := d.CreateExploration("类别修改", "root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	es := d.Exploration(expID)
+	goal, err := es.AddGoal(map[string]any{"text": "目标", "vulnclass": "old"}, "human")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := es.AddNode(KindFact, map[string]any{"text": "证据"}, 0, "confirmed", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := es.Link(proof, RelProves, goal); err != nil {
+		t.Fatal(err)
+	}
+	if err := es.SetNodeState(goal, "met"); err != nil {
+		t.Fatal(err)
+	}
+	if err := es.UpdateGoalPayload(goal, "目标", "new"); err != nil {
+		t.Fatal(err)
+	}
+	node, err := es.GetNode(goal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var proves int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_edges WHERE dst_id=$1 AND rel='proves'`, goal).Scan(&proves); err != nil {
+		t.Fatal(err)
+	}
+	if node.State != "open" || proves != 0 {
+		t.Fatalf("类别变化应使旧证明失效: state=%s proves=%d", node.State, proves)
+	}
+}
+
+func TestUpdateGoalPayloadConcurrentAuditChain(t *testing.T) {
+	d := testOpen(t)
+	expID, err := d.CreateExploration("并发目标编辑", "root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	es := d.Exploration(expID)
+	goal, err := es.AddGoal(map[string]any{"text": "原目标"}, "human")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		change GoalPayloadUpdate
+		err    error
+	}
+	results := make(chan result, 2)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, text := range []string{"目标A", "目标B"} {
+		wg.Go(func() {
+			<-start
+			change, err := es.UpdateGoalPayloadWithAudit(goal, text, "")
+			results <- result{change, err}
+		})
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	changes := map[string]string{}
+	for result := range results {
+		if result.err != nil || !result.change.Changed {
+			t.Fatalf("并发修改失败: %+v err=%v", result.change, result.err)
+		}
+		changes[result.change.NewText] = result.change.OldText
+	}
+	activities, _, err := es.ActivityList(&goal, 0, 100)
+	if err != nil || len(activities) != 2 {
+		t.Fatalf("并发修改审计缺失: %+v err=%v", activities, err)
+	}
+	previous := "原目标"
+	for _, activity := range activities {
+		var metadata struct {
+			Old struct{ Text string } `json:"old"`
+			New struct{ Text string } `json:"new"`
+		}
+		if err := json.Unmarshal(activity.Metadata, &metadata); err != nil {
+			t.Fatal(err)
+		}
+		if metadata.Old.Text != previous || changes[metadata.New.Text] != metadata.Old.Text {
+			t.Fatalf("事务返回值或审计不是串行链: previous=%q metadata=%+v changes=%+v", previous, metadata, changes)
+		}
+		previous = metadata.New.Text
+	}
+}
+
+func TestProveGoalAtomicAndScope(t *testing.T) {
+	d := testOpen(t)
+	grand, err := d.CreateTask("间接来源", "root", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(grand.ID)
+	source, err := d.CreateTaskWithOptions("直接来源", "root", TaskCreateOptions{SourceTaskIDs: []int64{grand.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(source.ID)
+	current, err := d.CreateTaskWithOptions("目标证明", "root", TaskCreateOptions{SourceTaskIDs: []int64{source.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(current.ID)
+	es := d.Exploration(current.ExplorationID)
+	goal, err := es.AddGoal(map[string]any{"text": "目标"}, "human")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addFact := func(expID int64) int64 {
+		t.Helper()
+		id, err := d.Exploration(expID).AddNode(KindFact, map[string]any{"text": "证据"}, 0, "confirmed", "worker", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	localFact, sourceFact, grandFact := addFact(current.ExplorationID), addFact(source.ExplorationID), addFact(grand.ExplorationID)
+	if err := es.ProveGoal(goal, grandFact); err == nil {
+		t.Fatal("不可引用间接来源证据")
+	}
+	if err := es.ProveGoal(localFact, sourceFact); err == nil {
+		t.Fatal("不可证明非 goal 节点")
+	}
+	if err := es.ProveGoal(goal, goal); err == nil {
+		t.Fatal("不可使用 goal 作为证据")
+	}
+	trigger := fmt.Sprintf("fail_prove_goal_%d", goal)
+	if _, err := d.Exec(fmt.Sprintf(`CREATE TRIGGER %s BEFORE UPDATE OF state ON exploration_nodes
+		WHEN NEW.id=%d AND NEW.state='met' BEGIN SELECT RAISE(ABORT, 'proof unavailable'); END`, trigger, goal)); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DROP TRIGGER IF EXISTS ` + trigger)
+	if err := es.ProveGoal(goal, localFact); err == nil {
+		t.Fatal("状态更新失败必须回滚")
+	}
+	var proves int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_edges WHERE dst_id=$1 AND rel='proves'`, goal).Scan(&proves); err != nil || proves != 0 {
+		t.Fatalf("失败事务残留证明边: proves=%d err=%v", proves, err)
+	}
+	if _, err := d.Exec(`DROP TRIGGER ` + trigger); err != nil {
+		t.Fatal(err)
+	}
+	for _, evidence := range []int64{localFact, sourceFact} {
+		if err := es.ProveGoal(goal, evidence); err != nil {
+			t.Fatalf("本地或直接来源证明失败: %v", err)
+		}
+	}
+	node, err := es.GetNode(goal)
+	if err != nil || node.State != "met" {
+		t.Fatalf("目标未达成: node=%+v err=%v", node, err)
+	}
+	if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_edges WHERE exploration_id=$1 AND dst_id=$2 AND rel='proves'`, current.ExplorationID, goal).Scan(&proves); err != nil || proves != 2 {
+		t.Fatalf("证明边不完整: proves=%d err=%v", proves, err)
+	}
+	if _, err := d.Exec(`DELETE FROM task_relations WHERE task_id=$1 AND source_task_id=$2`, current.ID, source.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := es.ProveGoal(goal, sourceFact); err == nil {
+		t.Fatal("已解除关联来源不可继续证明")
+	}
+}
 
 func TestExplorationFlow(t *testing.T) {
 	d := testOpen(t)

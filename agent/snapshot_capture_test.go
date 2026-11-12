@@ -1,6 +1,11 @@
 package agent
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -213,6 +218,7 @@ func TestCaptureQuoteSnapshotCryptoUsesOKXSource(t *testing.T) {
 	q := &Quote{
 		Symbol: "BTC-USDT", Market: "crypto", TradingDate: "2026-10-26",
 		Last: "80412.1", PriceKind: "realtime", Channel: ChannelOKX,
+		Timestamp: "2026-10-26T12:00:00Z",
 	}
 	id, err := captureQuoteSnapshot(d, q)
 	if err != nil {
@@ -228,7 +234,7 @@ func TestCaptureQuoteSnapshotCryptoUsesOKXSource(t *testing.T) {
 		snapshotParamsHash("quote", map[string]string{
 			"symbol": "BTC-USDT", "market": "crypto", "channel": "okx",
 		}),
-		"2026-10-26",
+		q.Timestamp,
 	)
 	if err != nil {
 		t.Fatalf("查快照: %v", err)
@@ -264,9 +270,8 @@ func TestSnapshotNilDB(t *testing.T) {
 	}
 }
 
-// TestSnapshotChecksumConflictWarns 同 dedup key 但 checksum 不同时应命中已有记录
-// （created=false），内容不覆盖。warn 日志由 db 层打印，此处验证数据语义。
-func TestSnapshotChecksumConflictKeepsExisting(t *testing.T) {
+// 同业务时间的不同内容必须拒绝旧 ID，已有证据保持不变。
+func TestSnapshotChecksumConflictRejectsExistingID(t *testing.T) {
 	d := testDB(t)
 	t.Cleanup(func() { d.Close() })
 
@@ -291,18 +296,12 @@ func TestSnapshotChecksumConflictKeepsExisting(t *testing.T) {
 	second := base
 	second.Checksum = "checksum-B"
 	snap2, created2, err := d.Snapshots().InsertSnapshot(second)
-	if err != nil {
-		t.Fatalf("第二次: %v", err)
+	if err == nil || snap2 != nil || created2 {
+		t.Fatalf("内容冲突必须返回错误且不返回旧证据: snap=%+v created=%v err=%v", snap2, created2, err)
 	}
-	if created2 {
-		t.Error("同 dedup key 应命中去重（created=false）")
-	}
-	if snap2.ID != snap1.ID {
-		t.Errorf("应返回已有记录的 id: %d vs %d", snap1.ID, snap2.ID)
-	}
-	// 内容不被覆盖（L3 语义：丢弃新内容而非覆盖）
-	if snap2.Checksum != "checksum-A" {
-		t.Errorf("内容被覆盖了（checksum=%q），L3 语义是丢弃新内容", snap2.Checksum)
+	existing, err := d.Snapshots().GetSnapshotByDedupKey(base.Source, base.Endpoint, base.ParamsHash, base.CollectedAt)
+	if err != nil || existing.ID != snap1.ID || existing.Checksum != "checksum-A" {
+		t.Fatalf("已有证据被修改: snap=%+v err=%v", existing, err)
 	}
 }
 
@@ -341,6 +340,155 @@ func TestHandlersOmitSnapshotIDWhenNoDB(t *testing.T) {
 		}
 		if strings.Contains(out, "snapshot_id") {
 			t.Errorf("%s 未注入 DB 时不应输出 snapshot_id: %s", name, out)
+		}
+	}
+}
+
+// 测试 CLI 只回放本地 JSON，不访问真实 OKX。
+func snapshotReplayOKX(t *testing.T, response string) *OkxClient {
+	t.Helper()
+	dir := t.TempDir()
+	body := filepath.Join(dir, "response.json")
+	if err := os.WriteFile(body, []byte(response), 0600); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "okx")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexec /bin/cat \"$SNAPSHOT_REPLAY_JSON\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SNAPSHOT_REPLAY_JSON", body)
+	return NewOkxClient(bin)
+}
+
+func TestOKXQuoteSnapshotBusinessTime(t *testing.T) {
+	d := testDB(t)
+	t.Cleanup(func() { d.Close() })
+	symbol := "P1-QUOTE-USDT"
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM snapshots WHERE source='okx' AND endpoint='/quote' AND params_hash=$1`, snapshotParamsHash("quote", map[string]string{"symbol": symbol, "market": "crypto", "channel": "okx"}))
+	})
+	var firstID int64
+	for i, ts := range []string{"1793059200123", "1793059201123"} {
+		cli := snapshotReplayOKX(t, fmt.Sprintf(`[{"instId":%q,"last":%q,"ts":%q}]`, symbol, fmt.Sprint(100+i), ts))
+		q, err := cli.FetchQuote(context.Background(), symbol, "crypto", ChannelOKX)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if q.TradingDate != "2026-10-27" {
+			t.Fatalf("交易日语义被改变: %q", q.TradingDate)
+		}
+		id, err := captureQuoteSnapshot(d, q)
+		if err != nil || id == 0 || id == firstID {
+			t.Fatalf("不同业务秒应返回各自证据: id=%d first=%d err=%v", id, firstID, err)
+		}
+		var collectedAt, checksum string
+		if err := d.QueryRow(`SELECT collected_at, checksum FROM snapshots WHERE id=$1`, id).Scan(&collectedAt, &checksum); err != nil {
+			t.Fatal(err)
+		}
+		wantTime := []string{"2026-10-27T00:00:00.123Z", "2026-10-27T00:00:01.123Z"}[i]
+		parsed, parseErr := time.Parse(time.RFC3339Nano, collectedAt)
+		want, _ := time.Parse(time.RFC3339Nano, wantTime)
+		if parseErr != nil || !parsed.Equal(want) || checksum != quoteChecksum(q) {
+			t.Fatalf("证据未对应返回数据: time=%q checksum=%q", collectedAt, checksum)
+		}
+		again, err := captureQuoteSnapshot(d, q)
+		if err != nil || again != id {
+			t.Fatalf("相同数据应复用: id=%d again=%d err=%v", id, again, err)
+		}
+		firstID = id
+	}
+}
+
+func TestOKXSnapshotToolsOmitConflictingEvidence(t *testing.T) {
+	for _, endpoint := range []string{"quote", "indicator"} {
+		t.Run(endpoint, func(t *testing.T) {
+			d := testDB(t)
+			t.Cleanup(func() { d.Close() })
+			symbol := "P1-" + strings.ToUpper(endpoint) + "-CONFLICT"
+			paramsHash := ""
+			if endpoint == "quote" {
+				paramsHash = snapshotParamsHash("quote", map[string]string{"symbol": symbol, "market": "crypto", "channel": "okx"})
+			} else {
+				paramsHash = snapshotParamsHash("indicator", map[string]string{"indicator": "rsi", "symbol": symbol, "bar": "1Dutc", "params": "", "backtest_time": "0"})
+			}
+			t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM snapshots WHERE params_hash=$1`, paramsHash) })
+			// 两个不同毫秒落在同一秒，指标则固定为同一根 bar。
+			var firstID int64
+			for i := range 2 {
+				var response, toolName, input string
+				if endpoint == "quote" {
+					response = fmt.Sprintf(`[{"last":%q,"ts":%q}]`, fmt.Sprint(100+i), fmt.Sprint(1793059300123+i))
+					toolName, input = "get_quote", fmt.Sprintf(`{"symbol":%q,"market":"crypto"}`, symbol)
+				} else {
+					response = fmt.Sprintf(`[{"data":[{"timeframes":{"1Dutc":{"indicators":{"RSI":[{"ts":"1793059300123","values":{"14":%q}}]}}}}]}]`, fmt.Sprint(40+i))
+					toolName, input = "get_indicator_okx", fmt.Sprintf(`{"indicator":"rsi","symbol":%q,"bar":"1Dutc"}`, symbol)
+				}
+				mts := NewMarketToolSetWithCrypto(nil, snapshotReplayOKX(t, response))
+				mts.SetDB(d)
+				res, err := findMarketTool(t, mts, toolName).Call(context.Background(), []byte(input), nil)
+				if err != nil || res.IsError {
+					t.Fatalf("行情仍应返回: res=%+v err=%v", res, err)
+				}
+				var out map[string]any
+				if err := json.Unmarshal([]byte(res.Flatten()), &out); err != nil {
+					t.Fatal(err)
+				}
+				if endpoint == "quote" && out["last"] != fmt.Sprint(100+i) {
+					t.Fatalf("未返回最新行情: %v", out)
+				}
+				if endpoint == "indicator" && out["values"].(map[string]any)["14"] != fmt.Sprint(40+i) {
+					t.Fatalf("未返回最新指标: %v", out)
+				}
+				if i == 0 {
+					id, ok := out["snapshot_id"].(float64)
+					if !ok || id <= 0 {
+						t.Fatalf("首份数据缺快照: %v", out)
+					}
+					firstID = int64(id)
+				} else if _, ok := out["snapshot_id"]; ok {
+					t.Fatalf("新内容错引旧证据 %d: %v", firstID, out)
+				} else if out["evidence_status"] != "not_captured" || out["snapshot_warning"] == "" {
+					t.Fatalf("未标明新内容未留证: %v", out)
+				}
+			}
+		})
+	}
+}
+
+func TestOKXIndicatorSnapshotIncludesRequestParams(t *testing.T) {
+	d := testDB(t)
+	t.Cleanup(func() { d.Close() })
+	hash14 := snapshotParamsHash("indicator", map[string]string{"indicator": "rsi", "symbol": "P1-PARAMS-USDT", "bar": "1Dutc", "params": "14", "backtest_time": "0"})
+	hash28 := snapshotParamsHash("indicator", map[string]string{"indicator": "rsi", "symbol": "P1-PARAMS-USDT", "bar": "1Dutc", "params": "28", "backtest_time": "0"})
+	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM snapshots WHERE params_hash IN ($1,$2)`, hash14, hash28) })
+	cli := snapshotReplayOKX(t, `[{"data":[{"timeframes":{"1Dutc":{"indicators":{"RSI":[{"ts":"1793059300123","values":{"rsi":"40"}}]}}}}]}]`)
+	mts := NewMarketToolSetWithCrypto(nil, cli)
+	mts.SetDB(d)
+	var firstID int64
+	for _, params := range []string{"14", "28"} {
+		res, err := mts.getIndicatorOkx().Call(context.Background(), []byte(fmt.Sprintf(`{"indicator":"rsi","symbol":"P1-PARAMS-USDT","params":%q}`, params)), nil)
+		if err != nil || res.IsError {
+			t.Fatalf("指标调用失败: res=%+v err=%v", res, err)
+		}
+		var out map[string]any
+		if err := json.Unmarshal([]byte(res.Flatten()), &out); err != nil {
+			t.Fatal(err)
+		}
+		id, ok := out["snapshot_id"].(float64)
+		if !ok || id <= 0 {
+			t.Fatalf("指标缺快照: %v", out)
+		}
+		if int64(id) == firstID {
+			t.Fatalf("不同 params 错误复用证据 %d", firstID)
+		}
+		firstID = int64(id)
+		var got string
+		if err := d.QueryRow(`SELECT params_hash FROM snapshots WHERE id=$1`, firstID).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		want := snapshotParamsHash("indicator", map[string]string{"indicator": "rsi", "symbol": "P1-PARAMS-USDT", "bar": "1Dutc", "params": params, "backtest_time": "0"})
+		if got != want {
+			t.Fatalf("params 未进入请求哈希: got=%s want=%s", got, want)
 		}
 	}
 }

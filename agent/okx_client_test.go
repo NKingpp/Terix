@@ -31,6 +31,15 @@ func TestOkxCandlesParsing(t *testing.T) {
 	}
 
 	// ① 必须已反转成升序
+	if got := tsToTimestamp("1793059200123"); got != "2026-10-27T00:00:00.123Z" {
+		t.Errorf("quote timestamp = %q", got)
+	}
+	if got := tsToDate("1793059200123"); got != "2026-10-27" {
+		t.Errorf("trading date = %q", got)
+	}
+	if got := tsToTimestamp("invalid"); got != "" {
+		t.Errorf("invalid quote timestamp = %q, want empty", got)
+	}
 	if bars[0].TradingDate >= bars[1].TradingDate {
 		t.Errorf("未反转成升序：bars[0].date=%s bars[1].date=%s", bars[0].TradingDate, bars[1].TradingDate)
 	}

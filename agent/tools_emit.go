@@ -322,7 +322,11 @@ func (t *ToolSet) emitFact() actool.CoreTool {
 
 			// state='confirmed'：分析师产出的事实视为已确认（辩论阶段可引用）。
 			// 注意不能用 "pending" —— ck_node_state 对 fact 只允许 confirmed/dismissed/origin。
-			id, err := t.ts.AddNode(db.KindFact, payload, 5, "confirmed", "worker", nil)
+			_, intentID, err := intentRoleFromCtx(ctx, t.ts)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			id, err := t.ts.AddNodeWithYield(db.KindFact, payload, 5, "confirmed", "worker", nil, intentID)
 			if err != nil {
 				return actool.Errorf(fmt.Sprintf("写入 fact 失败: %v", err)), nil
 			}
@@ -410,7 +414,11 @@ func (t *ToolSet) emitThesis() actool.CoreTool {
 			}
 
 			// state='open'：刚写入待评（ck_node_state 允许 open/standing/refuted/superseded）
-			id, err := t.ts.AddNode(KindThesisStr, payload, 10, "open", "worker", nil)
+			_, intentID, err := intentRoleFromCtx(ctx, t.ts)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			id, err := t.ts.AddNodeWithYield(KindThesisStr, payload, 10, "open", "worker", nil, intentID)
 			if err != nil {
 				return actool.Errorf(fmt.Sprintf("写入 thesis 失败: %v", err)), nil
 			}
