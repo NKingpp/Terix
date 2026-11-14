@@ -494,3 +494,25 @@ func notionalValue(qty, price string) (float64, error) {
 	}
 	return q * p, nil
 }
+
+// Guards 报告「现在能不能自动下单」，把降级与授权两件事集中到一处。
+//
+// TradeLoop 用它做每轮的前置检查：抽出来是为了让「什么情况下不许自动交易」
+// 只有一个定义 —— 两处各写一份判断必然分叉，而分叉的后果是一边放行、
+// 一边拒绝，排查时两边日志互相矛盾。
+func (a *AutoTrader) Guards(ctx context.Context, accountID int64) (bool, string, error) {
+	if a == nil {
+		return false, "自动交易器未装配", nil
+	}
+	if degraded, why := a.Degraded(); degraded {
+		return false, "已降级：" + why, nil
+	}
+	ok, err := a.hasLiveAutoAuth(ctx, accountID)
+	if err != nil {
+		return false, "", err
+	}
+	if !ok {
+		return false, "该账户没有 live_auto 授权（先 POST /api/exec/authorize）", nil
+	}
+	return true, "", nil
+}

@@ -82,7 +82,7 @@ func newExecTickerEnv(t *testing.T, tag string) *execTickerEnv {
 	// querier / auto 均为 nil：只跑超时扫描（这是「渠道未接入」的真实状态）。
 	// 自动交易器传 nil 意味着这些测试不会触发下单 —— 那正是想要的：
 	// 调度器的对账/超时逻辑应与自动交易解耦。
-	tk := newExecTicker(pg, nil, nil)
+	tk := newExecTicker(pg, nil, nil, nil)
 	return &execTickerEnv{T: t, pg: pg, ticker: tk, acct: acct}
 }
 
@@ -162,7 +162,7 @@ func TestExecTickerNilQuerierSkipsReconcile(t *testing.T) {
 // TestExecTickerHasQuerierEnablesReconcile 传了 querier 时，reconciler 应被构造。
 func TestExecTickerHasQuerierEnablesReconcile(t *testing.T) {
 	pg := execTestDBForTicker(t)
-	tk := newExecTicker(pg, &fakeQuerierForTicker{}, nil)
+	tk := newExecTicker(pg, &fakeQuerierForTicker{}, nil, nil)
 	if tk.reconciler == nil {
 		t.Fatal("传了 querier 时应构造 reconciler")
 	}
@@ -174,7 +174,7 @@ func TestExecTickerHasQuerierEnablesReconcile(t *testing.T) {
 // 通道会被打爆。这个测试固定「两条调度线节奏不同」这个设计决定。
 func TestExecTickerIntervalIs60s(t *testing.T) {
 	pg := execTestDBForTicker(t)
-	tk := newExecTicker(pg, nil, nil)
+	tk := newExecTicker(pg, nil, nil, nil)
 	if tk.interval != 60*time.Second {
 		t.Errorf("执行层间隔应为 60s（对账要查通道，有速率限制），实际 %v", tk.interval)
 	}

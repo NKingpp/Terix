@@ -198,3 +198,39 @@ func (s *Server) reseedScreenerPrompt() {
 	}
 	log.Printf("[prompts] screener 提示词已切换到含任务目标的版本（旧版本保留在历史）")
 }
+
+// reseedTraderPrompt 把交易员提示词刷成「工具直接下单」版本。
+//
+// # 为什么必须迁移（2026-11-14）
+//
+// 旧版教模型 create_order_draft + authorize_order，并写着「无人值守交易
+// 循环会在下一轮自动下发」。那个循环（TradeLoop）已下线 ——
+// 于是实盘模式下草案**再也不会被执行**，模型却以为只要过闸就成交。
+// 这是最坏的一类错误：模型报告「已完成」，实际什么都没发生。
+//
+// seedPrompts 是首插入 only，存量库永远是旧快照，所以单独做一次迁移。
+func (s *Server) reseedTraderPrompt() {
+	const flag = "trader_prompt_direct_tools_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }()
+
+	tmpl := agent.BuiltinPromptSeeds()[agent.RoleTrader]
+	if tmpl == "" {
+		log.Printf("[prompts] trader 无代码默认，跳过迁移")
+		return
+	}
+	a, err := s.m.pg.GetAgentByKey(agent.RoleTrader)
+	if err != nil || a == nil {
+		return // 新库：seedPrompts 会用最新默认
+	}
+	if cur, err := s.m.pg.CurrentPrompt(a.ID); err == nil && cur == tmpl {
+		return
+	}
+	if _, err := s.m.pg.ResetPromptToDefault(a.ID, tmpl); err != nil {
+		log.Printf("[prompts] trader 重刷失败: %v", err)
+		return
+	}
+	log.Printf("[prompts] trader 提示词已切换到「工具直接下单」版本（旧版本保留在历史）")
+}

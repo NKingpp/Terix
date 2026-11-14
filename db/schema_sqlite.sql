@@ -1371,3 +1371,197 @@ BEGIN
        AND task_id NOT IN (SELECT CAST(value AS INTEGER) FROM json_each(NEW.task_ids));
 END;
 
+
+-- ============================================================
+-- 交易循环侧表（手工追加；tools_schema 生成器未覆盖）
+--
+-- 为什么用侧表而不是给 orders_draft / exec_accounts 加列：
+--   SQLite 不支持 ADD COLUMN IF NOT EXISTS，而 db/db.go 每次启动整段执行本文件
+--   （全部 CREATE TABLE IF NOT EXISTS 才幂等）。侧表天然幂等、零迁移代码。
+--   历史行没有对应侧表记录时，读侧返回零值（market / 无 TP-SL / net / cross / lever 3），
+--   行为与加列前完全一致。
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS exec_account_params (
+    account_id INTEGER PRIMARY KEY NOT NULL,
+    pos_mode   TEXT NOT NULL DEFAULT 'net'   CHECK (pos_mode IN ('net','long_short')),
+    mgn_mode   TEXT NOT NULL DEFAULT 'cross' CHECK (mgn_mode IN ('cross','isolated')),
+    lever      TEXT NOT NULL DEFAULT '3',
+    updated_at TIMESTAMP NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CONSTRAINT exec_account_params_account_id_fkey FOREIGN KEY (account_id) REFERENCES exec_accounts(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS draft_exec_params (
+    draft_id    INTEGER PRIMARY KEY NOT NULL,
+    order_type  TEXT NOT NULL DEFAULT 'market' CHECK (order_type IN ('market','limit')),
+    pos_side    TEXT NOT NULL DEFAULT ''       CHECK (pos_side IN ('','long','short','net')),
+    reduce_only INTEGER NOT NULL DEFAULT 0,
+    tp_price    TEXT,
+    sl_price    TEXT,
+    created_at  TIMESTAMP NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CONSTRAINT draft_exec_params_draft_id_fkey FOREIGN KEY (draft_id) REFERENCES orders_draft(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS live_positions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    account_id    INTEGER NOT NULL,
+    inst_id       TEXT NOT NULL,
+    pos_side      TEXT NOT NULL DEFAULT 'net',
+    qty           TEXT NOT NULL,
+    avg_px        TEXT,
+    draft_id      INTEGER,
+    opened_at     TIMESTAMP NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    closed_at     TIMESTAMP,
+    close_clordid TEXT,
+    last_seen_at  TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_live_positions_open ON live_positions(account_id, inst_id, pos_side) WHERE closed_at IS NULL;
+
+-- ============================================================
+-- 成交明细（手工追加；tools_schema 生成器未覆盖）
+--
+-- 为什么要独立一张表而不是只靠 orders_execution.avg_price：
+--   ① 手续费只在 fills 里（orders_execution 无 fee 列，加列在 SQLite 不幂等）；
+--   ② 分批成交每笔价格不同，均价 × 总量算不出净盈亏；
+--   ③ 平仓后的已实现盈亏要按「逐笔配对」算，只有逐笔数据能算对。
+--
+-- fill_id 是 OKX 侧的成交 ID，UNIQUE 让它天然幂等：同一个窗口重复拉取
+-- 只会命中冲突，不会重复记账（重复记会让盈亏翻倍，且看起来只是「赚多了」）。
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS trade_fills (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    fill_id     TEXT NOT NULL,
+    account_id  INTEGER NOT NULL,
+    inst_id     TEXT NOT NULL,
+    side        TEXT NOT NULL,
+    pos_side    TEXT NOT NULL DEFAULT 'net',
+    fill_px     TEXT NOT NULL,
+    fill_sz     TEXT NOT NULL,
+    fee         TEXT NOT NULL DEFAULT '0',
+    fee_ccy     TEXT,
+    ord_id      TEXT,
+    cl_ord_id   TEXT,
+    draft_id    INTEGER,
+    filled_at   TIMESTAMP NOT NULL,
+    created_at  TIMESTAMP NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CHECK ((side IN ('buy', 'sell'))),
+    CONSTRAINT trade_fills_fill_id_key UNIQUE (fill_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trade_fills_inst ON trade_fills(account_id, inst_id, filled_at);
+CREATE INDEX IF NOT EXISTS idx_trade_fills_clord ON trade_fills(cl_ord_id);
+CREATE INDEX IF NOT EXISTS idx_trade_fills_draft ON trade_fills(draft_id);
+
+-- ============================================================
+-- 模拟盘持仓计划（手工追加）
+--
+-- 为什么需要这张表：paper_orders 是「成交流水」，它记不下「这一仓打算在
+-- 哪里止盈止损」。而没有 TP/SL，模拟盘的仓位永远不会平 ——
+-- 已实现盈亏永远为 0，模拟盘就只是个空转的记账本。
+--
+-- 所以开仓时把 TP/SL 存进计划表，TradeLoop 每轮拿最新价比对，
+-- 触发就写一笔反向 paper_order 并标记 closed_at。
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS paper_trade_plans (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    account_id    INTEGER NOT NULL,
+    instrument_id INTEGER NOT NULL,
+    pos_side      TEXT NOT NULL DEFAULT 'long' CHECK (pos_side IN ('long', 'short')),
+    qty           TEXT NOT NULL,
+    tp_price      TEXT,
+    sl_price      TEXT,
+    draft_id      INTEGER,
+    opened_at     TIMESTAMP NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    closed_at     TIMESTAMP,
+    close_reason  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_paper_trade_plans_open
+    ON paper_trade_plans(account_id, instrument_id) WHERE closed_at IS NULL;
+
+-- ============================================================
+-- 止盈止损改价审计（手工追加，2026-11-14）
+--
+-- 为什么单独一张表：改 TP/SL 是**同步**动作（不走草案队列），
+-- 所以它不会在 orders_draft / orders_execution 里留下任何痕迹。
+-- 没有这张表，事后无法回答「是谁在什么时候把止损从 161 挪到 158 的」——
+-- 而挪止损恰恰是最容易造成大额亏损的操作。
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS bracket_amendments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    account_id INTEGER,
+    inst_id    TEXT NOT NULL,
+    pos_side   TEXT,
+    algo_id    TEXT,
+    old_tp     TEXT,
+    old_sl     TEXT,
+    new_tp     TEXT,
+    new_sl     TEXT,
+    operator   TEXT NOT NULL DEFAULT '',
+    reason     TEXT,
+    result     TEXT NOT NULL,
+    error      TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_bracket_amendments_inst
+    ON bracket_amendments(inst_id, created_at);
+
+-- ============================================================
+-- 工具级交易台账（手工追加，2026-11-14）
+--
+-- # 为什么不用 orders_draft / orders_execution
+--
+-- 那两张表是「无人值守循环」的产物：草案必须绑定 signal 才有 task 归属，
+-- 执行单的 draft_id 是 NOT NULL 外键。而现在的模型是 LLM 直接调工具下单 ——
+-- 一次工具调用没有草案、也不需要先走一遍信号链路。
+--
+-- 硬塞进去只能造一张「假草案」，那会让审计链上出现一批没有信号的空壳，
+-- 事后分不清「哪笔是策略出的、哪笔是人让它下的」。
+--
+-- # task_id 必须在这里（而不是靠 signal 反查）
+--
+-- 台账要回答「这个任务赚了多少」。旧路径的归属是
+-- trade_fills → cl_ord_id → orders_execution → draft → signal → task，
+-- 五跳里任何一环断了盈亏就归不上账（实测任务 21/22 的平仓腿就是这样丢的）。
+-- 工具调用当场就知道自己在哪个任务里，直接落一列，五跳变一跳。
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS trade_records (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    -- task_id 为 NULL 表示「不在任务上下文里的手工调用」（人对主 agent 直接喊单）。
+    -- 这类记录仍要留：它产生了真实资金流水，只是不归属任何任务的 KPI。
+    task_id          INTEGER,
+    account_id       INTEGER NOT NULL,
+    instrument_id    INTEGER,
+    inst_id          TEXT NOT NULL,
+    -- action: open（增敞口）| close（减敞口）| set_leverage（无资金流水）
+    action           TEXT NOT NULL,
+    side             TEXT,
+    pos_side         TEXT,
+    qty              TEXT,
+    ord_type         TEXT,
+    px               TEXT,
+    leverage         TEXT,
+    tp_price         TEXT,
+    sl_price         TEXT,
+    reduce_only      INTEGER NOT NULL DEFAULT 0,
+    client_order_id  TEXT,
+    channel_order_id TEXT,
+    -- state: submitted | filled | failed（无资金流水的 set_leverage 也用它记成功/失败）
+    state            TEXT NOT NULL,
+    error            TEXT,
+    mode             TEXT NOT NULL,
+    operator         TEXT NOT NULL DEFAULT 'agent',
+    -- position_effect 记录「这一单对持仓做了什么」：open | scale_in | reduce | reverse。
+    -- 它回答 action 回答不了的问题：同样是 action='open'，「新开一仓」与
+    -- 「在已有仓上加仓」的资金含义、成本口径、后续平仓方式都不同。
+    -- close / set_leverage 恒为空（它们的语义已经由 action 表达完）。
+    position_effect  TEXT,
+    created_at       TIMESTAMP NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CHECK (action IN ('open', 'close', 'set_leverage')),
+    CHECK (state IN ('submitted', 'filled', 'failed')),
+    CONSTRAINT trade_records_client_order_id_key UNIQUE (client_order_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trade_records_task ON trade_records(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_trade_records_acct ON trade_records(account_id, created_at);

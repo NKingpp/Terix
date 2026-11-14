@@ -37,8 +37,8 @@ var marketToolNames = []string{
 
 // TestBuildDomainRegIncludesMarketTools domainReg 必须包含全部金融工具。
 func TestBuildDomainRegIncludesMarketTools(t *testing.T) {
-	mts := agent.NewMarketToolSet(nil)        // nil client 足够：这里只读 Name()
-	reg := buildDomainReg(nil, mts, nil, nil) // nil as / nil tts 都可以（只要 mts 非 nil）
+	mts := agent.NewMarketToolSet(nil)             // nil client 足够：这里只读 Name()
+	reg := buildDomainReg(nil, mts, nil, nil, nil) // nil as / nil tts 都可以（只要 mts 非 nil）
 
 	if reg == nil {
 		t.Fatal("domainReg 为 nil —— 即使 as 为 nil，有 mts 时也该返回非 nil")
@@ -65,7 +65,7 @@ func TestBuildDomainRegIncludesMarketTools(t *testing.T) {
 // 需要 as 非 nil 才会注册。所以这里分两段断言，明确「哪段来源负责哪些工具」。
 func TestDomainRegCoversAllFinancialToolNames(t *testing.T) {
 	// 第一段：mts 来源（as=nil 也能查）
-	regOnlyMts := buildDomainReg(nil, agent.NewMarketToolSet(nil), nil, nil)
+	regOnlyMts := buildDomainReg(nil, agent.NewMarketToolSet(nil), nil, nil, nil)
 	fromMts := []string{
 		"get_quote", "get_kline", "compute_indicator",
 		"get_macro", "get_volatility", "get_crypto_flow",
@@ -102,7 +102,7 @@ func TestDomainRegCoversAllFinancialToolNames(t *testing.T) {
 // 保留它：ToolSet 的工具大多需要 AssetStore 或 ExplorationStore，task-less 的
 // 实例调它们只会报「缺少上下文」。注册一堆注定报错的工具等于给 UI 制造假象。
 func TestBuildDomainRegSkipsToolSetWhenAssetStoreNil(t *testing.T) {
-	reg := buildDomainReg(nil, agent.NewMarketToolSet(nil), nil, nil)
+	reg := buildDomainReg(nil, agent.NewMarketToolSet(nil), nil, nil, nil)
 	for _, name := range []string{"add_intent", "list_facts", "emit_fact"} {
 		if _, ok := reg[name]; ok {
 			t.Errorf("as 为 nil 时不该注册 ToolSet 工具 %q（会让 UI 显示可勾选但调用必失败）", name)
@@ -115,7 +115,7 @@ func TestBuildDomainRegSkipsToolSetWhenAssetStoreNil(t *testing.T) {
 // 返回空 map 而非 nil 的理由：ToolResolve 里有 `if len(domainReg) > 0` 的守卫，
 // nil 和空 map 行为一致，但空 map 让调用方少一层 nil 判断。
 func TestBuildDomainRegNilBoth(t *testing.T) {
-	reg := buildDomainReg(nil, nil, nil, nil)
+	reg := buildDomainReg(nil, nil, nil, nil, nil)
 	if reg == nil {
 		t.Fatal("应返回空 map 而不是 nil")
 	}
@@ -131,7 +131,7 @@ func TestBuildDomainRegNilBoth(t *testing.T) {
 // 「注入逻辑能找到」。
 func TestToolResolveInjectsMarketToolForAnalyst(t *testing.T) {
 	// 模拟 ToolResolve 的注入判定（与 server/assembly.go 里的逻辑一致）
-	reg := buildDomainReg(nil, agent.NewMarketToolSet(nil), nil, nil)
+	reg := buildDomainReg(nil, agent.NewMarketToolSet(nil), nil, nil, nil)
 
 	// 模拟 tools 表里 get_quote 绑定到 analyst_market
 	boundAgents := []string{"analyst_market", "worker"}
@@ -168,7 +168,7 @@ func TestToolResolveInjectsMarketToolForAnalyst(t *testing.T) {
 // 的工具是原样放行的（`if !known { out = append(out, t); continue }`）。
 // 把它们放进 domainReg 会让覆盖逻辑从「放行」变成「按行过滤」，改变既有行为。
 func TestDefaultToolsNotInDomainReg(t *testing.T) {
-	reg := buildDomainReg(nil, agent.NewMarketToolSet(nil), nil, nil)
+	reg := buildDomainReg(nil, agent.NewMarketToolSet(nil), nil, nil, nil)
 
 	defaultNames := map[string]bool{}
 	for _, t := range actool.DefaultTools() {
@@ -210,8 +210,16 @@ func TestFinancialToolBindingsMatchSpec(t *testing.T) {
 		// 这是规格变更（不是实现漂移），所以同步更新这张对照表。
 		// 2026-11-09 新增 get_account_balance：任务目标是「使用全部账户余额」，
 		// 没有余额工具就无法算仓位（任务 #4 因此卡住）。这也是规格变更。
+		// 2026-11-14 新增 get_positions / get_task_trades / modify_bracket：
+		// LLM 要「根据市场变化实时开仓平仓、改 TP/SL」就必须看得见真实持仓与
+		// 已实现盈亏，并且能在秒级挪止损（走草案队列要等 15s，失去意义）。
+		// 2026-11-14 架构变更：TradeLoop 下线，下单改由 open_position /
+		// close_position / set_leverage 同步完成（调用即拿回执，无草案中间态）。
+		// 旧草案三件套保留但不再是主路径。
 		"trader": {"get_quote", "mx_query", "list_thesis", "emit_signal",
-			"create_order_draft", "authorize_order", "get_account_balance"},
+			"create_order_draft", "authorize_order", "get_account_balance",
+			"get_positions", "get_task_trades", "modify_bracket",
+			"open_position", "close_position", "set_leverage"},
 		"risk_aggressive":   {"list_thesis", "list_facts", "emit_thesis"},
 		"risk_neutral":      {"list_thesis", "list_facts", "emit_thesis"},
 		"risk_conservative": {"list_thesis", "list_facts", "emit_thesis"},

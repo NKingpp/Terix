@@ -189,17 +189,21 @@ func TestReconcileStateOnlyDoesNotFreeze(t *testing.T) {
 	}
 }
 
-// ---- ② 边界：state 变了但量不一致 → 判 amount（不是 state_only）----
-
+// ---- ② 边界：成交量超过下单量 → 判 amount（不是 state_only）----
+//
+// 判据是「回执自相矛盾」而不是「本地 0 vs 远端 N」。
+// 后者是每张新单第一次对账时的正常状态（成交量要等回执才知道），
+// 按 amount 处理会冻结账户并降级 —— 2026-11-14 实测就是这样翻车的。
+// 部分成交（0.5 / 1）属于正常推进，见 TestReconcilePartialFillIsStateOnly。
 func TestReconcileStateChangedWithQtyMismatchIsAmount(t *testing.T) {
 	e := newReconcileEnv(t, "recon-qtymismatch")
 	o := e.mkSubmittedOrder(t, time.Now())
 
-	// 通道说 filled，但成交量是 0.5 而本地是 0 —— 量价对不上。
+	// 通道说成交 1.5，但下单量只有 1 —— 回执自相矛盾。
 	e.f.acks[o.ClientOrderID] = ChannelAck{
 		Found:     true,
 		State:     db.ExecStateFilled,
-		FilledQty: "0.5",
+		FilledQty: "1.5",
 		AvgPrice:  "100",
 		Raw:       json.RawMessage(`{"src":"fake"}`),
 	}
@@ -682,5 +686,64 @@ WHERE action='exec_frozen' AND json_extract(detail, '$.account_id')=$1`,
 	}
 	if n != 0 {
 		t.Errorf("审计失败时不该有 exec_frozen 记录，实际 %d 条", n)
+	}
+}
+
+// 新单第一次对账不能被判成 amount 差异。
+//
+// 下单只落 submitted / filled_qty=0 / avg_price=NULL；成交量要等下一轮
+// 才知道。若当成不一致，每张新单都会冻结账户并降级（2026-11-14 实测）。
+func TestLocalFillUnknownNotAmountDiff(t *testing.T) {
+	zero := "0"
+	o := &db.ExecOrder{State: db.ExecStateSubmitted, FilledQty: zero, AvgPrice: nil, Qty: "0.1"}
+	if !localFillUnknown(o) {
+		t.Fatal("filled_qty=0 且 avg_price 空应判为「还不知道」")
+	}
+	if exceedsOrderQty("0.1", "0.1") {
+		t.Fatal("成交 0.1 / 下单 0.1 不该算超限")
+	}
+	if !exceedsOrderQty("0.2", "0.1") {
+		t.Fatal("成交超过下单量应算超限（走保守分支）")
+	}
+
+	// 曾收到过部分回执 → 不是「还不知道」
+	px := "100"
+	o2 := &db.ExecOrder{State: db.ExecStatePartial, FilledQty: "0.05", AvgPrice: &px, Qty: "0.1"}
+	if localFillUnknown(o2) {
+		t.Fatal("有部分成交时不该判为「还不知道」")
+	}
+	// filled_qty 非 0 但均价为空 → 也不是「还不知道」
+	o3 := &db.ExecOrder{State: db.ExecStateSubmitted, FilledQty: "0.05", AvgPrice: nil, Qty: "0.1"}
+	if localFillUnknown(o3) {
+		t.Fatal("filled_qty 非 0 时不该判为「还不知道」")
+	}
+}
+
+// 部分成交（成交量 <= 下单量）对「本地还不知道成交量」的单属于正常推进。
+//
+// 这不是宽松：成交量的唯一可信来源就是回执，本地 0 只代表「还没收到」。
+// 若按 amount 处理，每一张新单都会在第一次对账时冻结账户。
+func TestReconcilePartialFillIsStateOnly(t *testing.T) {
+	e := newReconcileEnv(t, "recon-partialfill")
+	o := e.mkSubmittedOrder(t, time.Now())
+
+	e.f.acks[o.ClientOrderID] = ChannelAck{
+		Found:     true,
+		State:     db.ExecStatePartial,
+		FilledQty: "0.5",
+		AvgPrice:  "100",
+		Raw:       json.RawMessage(`{"src":"fake"}`),
+	}
+
+	res, err := e.r.Run(t.Context(), e.acct.ID)
+	_ = err
+	if res.Amount != 0 {
+		t.Errorf("部分成交不该判 amount，实际 res=%+v", res)
+	}
+	if res.StateOnly != 1 {
+		t.Errorf("部分成交应判 state_only，实际 res=%+v", res)
+	}
+	if e.isBlocked(t) {
+		t.Fatal("部分成交不该冻结账户 —— 否则每张新单都会冻结一次")
 	}
 }

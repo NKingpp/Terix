@@ -334,7 +334,7 @@ func contains(ss []string, v string) bool {
 // (they only need the AssetStore); the exploration-graph tools refuse with a
 // clear message via ToolSet.needExploration. Binding one of them to a task-less
 // agent in the tools table is therefore a useless tool, not a crash.
-func buildDomainReg(as *db.AssetStore, mts *agent.MarketToolSet, tts *TradeToolSet, sits *SetInstrumentToolSet) map[string]actool.CoreTool {
+func buildDomainReg(as *db.AssetStore, mts *agent.MarketToolSet, tts *TradeToolSet, ets *ExecToolSet, sits *SetInstrumentToolSet) map[string]actool.CoreTool {
 	reg := make(map[string]actool.CoreTool)
 
 	// Asset/company + 探索图工具。
@@ -390,6 +390,20 @@ func buildDomainReg(as *db.AssetStore, mts *agent.MarketToolSet, tts *TradeToolS
 	// 表现是「UI 能勾选但 agent 永远拿不到」。
 	if tts != nil {
 		for _, t := range tts.Tools() {
+			reg[t.Name()] = t
+		}
+	}
+
+	// 同步交易工具（open_position / close_position / set_leverage）。
+	//
+	// # 为什么与 tts 分开注册
+	//
+	// tts 是「草案模型」的三个工具（提案 → 过闸 → 纸面执行），
+	// 那条链的每一步都是异步的：草案进库后要等后台消费。
+	// 2026-11-14 起下单改由模型直接调这组工具同步完成 —— 没有中间态，
+	// 调用即拿回执。旧工具保留是为了既有任务不立刻失能，但新任务只用这组。
+	if ets != nil {
+		for _, t := range ets.Tools() {
 			reg[t.Name()] = t
 		}
 	}
@@ -538,7 +552,9 @@ var financialToolBindings = map[string]toolBinding{
 	},
 	"trader": {
 		Tools: []string{"get_quote", "mx_query", "list_thesis", "emit_signal",
-			"create_order_draft", "authorize_order", "get_account_balance"},
+			"create_order_draft", "authorize_order", "get_account_balance",
+			"get_positions", "get_task_trades", "modify_bracket",
+			"open_position", "close_position", "set_leverage"},
 		Notes: map[string]string{
 			"list_thesis": "读 research_manager 的裁决（含 conclusion 与 confidence），作为发信号的唯一依据",
 			"get_quote":   "确认最新价，判断信号的可执行性（不重新分析）",
@@ -646,7 +662,23 @@ func (s *Server) seedFinancialToolBindings() {
 // 见 financialToolBindings["trader"] 的注释：交易员提案 + 过闸，
 // 执行权留给用户。若未来引入「自动执行角色」，在那个角色上单独绑第 3 个工具。
 func (s *Server) seedTradeToolBindings() {
-	const flag = "trade_tool_bindings_v1"
+	// v3（2026-11-14）：新增 open_position / close_position / set_leverage。
+	//
+	// **必须 bump**：v2 已置 true。不换 flag，三个工具行写不进 tools 表，
+	// 绑定更新 0 行，agent 永远拿不到（ToolResolve 静默跳过）。
+	//
+	// 这是「TradeLoop 下线」的配套：后台循环不在了，下单能力全在这三个工具上。
+	// 只绑 trader —— 持仓与下单的决定权属于交易员，主 agent 只读 + 改保护。
+	//
+	// v4：v3 只绑了 trader，结果「人对主 agent 喊单」这条路走不通 ——
+	// 实测主 agent 算完 TP/SL 才发现自己没有 open_position，只能停在那里。
+	// 主 agent 也必须有：它是人最直接的入口，而工具内部的护栏
+	// （必须带 TP/SL、方向校验、禁同向重复开仓）对两边同样生效。
+	const flag = "trade_tool_bindings_v4"
+	//
+	// **必须 bump**：v1 在已部署的库上早已置 true。不换 flag 名，新工具的
+	// tools 行写不进去 → AddAgentToToolBinding 更新 0 行 → agent 永远拿不到
+	// （ToolResolve 对「DB 没行」的工具是静默跳过，不报错）。
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -655,8 +687,9 @@ func (s *Server) seedTradeToolBindings() {
 	// 没有这一步，AddAgentToToolBinding 会更新 0 行（绑定语句按 key 匹配），
 	// 而它不报错 —— 表现就是「flag 设了、绑定看起来做了、agent 还是没工具」。
 	// 这是 SeedTool 的 ON CONFLICT DO NOTHING 语义决定的：已存在的行保留用户编辑。
-	tts := NewTradeToolSet(nil, nil) // 只需要工具名与描述，nil 依赖足够
-	for _, tl := range tts.Tools() {
+	// 两组工具都要 seed 进 tools 表：旧草案三件套 + 新同步三件套。
+	allTools := append(NewTradeToolSet(nil, nil).Tools(), NewExecToolSet(nil, nil, nil).Tools()...)
+	for _, tl := range allTools {
 		schema, _ := json.Marshal(tl.InputSchema())
 		// agents 列先留空：实际绑定由下一步 AddAgentToToolBinding 完成，
 		// 这里写死会让「用户后来解绑」被下次 seed 覆盖。
@@ -666,13 +699,60 @@ func (s *Server) seedTradeToolBindings() {
 		}
 	}
 
-	// ② 只给 trader。executor 类角色当前不存在，将来有了在这里加。
-	if err := s.m.pg.AddAgentToToolBinding("trader",
-		[]string{"create_order_draft", "authorize_order"}); err != nil {
+	// ② 绑定的角色分工。
+	//
+	//	trader      —— 提案 + 过闸 + **改保护**（它才是持仓的责任人）
+	//	mainagent   —— 只读（人问「现在赚多少/有没有裸仓」要能答；
+	//	               改保护也给它，因为「把止损挪到成本价」是人常见的口头指令）
+	//
+	// 两边都不给 execute_paper_order：执行权不该在对话侧。
+	if err := s.m.pg.AddAgentToToolBinding("trader", []string{
+		"open_position", "close_position", "set_leverage",
+		"get_positions", "get_task_trades", "modify_bracket",
+		// 旧草案链路保留：既有任务可能在用，但不再是主路径。
+		"create_order_draft", "authorize_order",
+	}); err != nil {
 		log.Printf("[trade] trader 交易工具绑定失败: %v", err)
 		return
 	}
+	if err := s.m.pg.AddAgentToToolBinding("mainagent", []string{
+		"get_positions", "get_task_trades", "modify_bracket",
+		"open_position", "close_position", "set_leverage",
+	}); err != nil {
+		log.Printf("[trade] mainagent 交易工具绑定失败: %v", err)
+		return
+	}
 	_ = s.m.pg.SetSetting(flag, "true")
+}
+
+// refreshTradeToolDefaults 每次启动把交易工具的 description + schema 刷成代码默认值。
+//
+// # 为什么必须每次启动都刷（2026-11-14 任务 29 全链路卡死）
+//
+// SeedTool 是 ON CONFLICT DO NOTHING —— 行已存在时新 schema 写不进去。
+// create_order_draft 后来加了 tp_price / sl_price / action / pos_side /
+// reduce_only 五个参数，但 DB 里还是第一次 seed 的旧 schema（只有
+// symbol/market/side/qty/ref_price）。
+//
+// 后果是**工具契约与实现矛盾**：模型看到的 schema 说没有 tp_price，
+// 于是它不传；而代码里 ValidateBracket 要求「开仓必须 TP/SL 必填」，
+// 于是每次都失败。实测模型连续重试 4 次后放弃，还猜「这是工具层约束冲突」——
+// 那个判断是准确的。
+//
+// 与 refreshSourceQuoteToolDescriptions 同理：RefreshToolDefaults 只更新
+// description + schema，**保留用户改过的 agents 绑定与 enabled 开关**。
+func (s *Server) refreshTradeToolDefaults() {
+	all := append(NewTradeToolSet(nil, nil).Tools(), NewExecToolSet(nil, nil, nil).Tools()...)
+	for _, tl := range all {
+		schema, err := json.Marshal(tl.InputSchema())
+		if err != nil {
+			log.Printf("[trade] 序列化 %s schema 失败: %v", tl.Name(), err)
+			continue
+		}
+		if err := s.m.pg.RefreshToolDefaults(tl.Name(), tl.Description(), schema); err != nil {
+			log.Printf("[trade] 刷新 %s 默认值失败: %v", tl.Name(), err)
+		}
+	}
 }
 
 // refreshSourceQuoteToolDescriptions 每次启动把按源行情工具的描述刷成代码默认值。

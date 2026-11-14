@@ -139,3 +139,26 @@ WHERE a.key = 'planner'`).Scan(&plannerVars); err != nil {
 		}
 	}
 }
+
+// ensureColumn 必须幂等：第二次调用不能因为列已存在而报错。
+//
+// # 为什么这条重要
+//
+// schema_sqlite.sql 每次启动整段重跑，而 ALTER TABLE ADD COLUMN 不幂等。
+// 如果不先探测列是否已存在，第二次启动整个 schema 事务就会失败 ——
+// 症状是「服务起不来」，而不是某个功能坏掉。
+func TestEnsureColumnIdempotent(t *testing.T) {
+	d := testOpen(t)
+	for i := 0; i < 2; i++ {
+		if err := ensureColumn(d, "trade_records", "position_effect", "TEXT"); err != nil {
+			t.Fatalf("第 %d 次调用失败: %v", i+1, err)
+		}
+	}
+	var n int
+	if err := d.QueryRow(`SELECT count(*) FROM pragma_table_info('trade_records') WHERE name='position_effect'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("position_effect 列应存在且只有一列，count=%d", n)
+	}
+}

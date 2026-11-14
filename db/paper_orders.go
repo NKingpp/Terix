@@ -498,3 +498,46 @@ RETURNING id`,
 	}
 	return id, nil
 }
+
+// InsertClosingOrder 落一笔**平仓**纸面单（不绑定草案）。
+//
+// # 为什么不能复用 InsertFilledOrder
+//
+// 那个方法的本质是「执行草案」：它用 `UPDATE orders_draft SET executed_note`
+// 做抢占式去重，所以 draft_id 必须为正。而平仓单没有草案 ——
+// 它是 TradeLoop 按止盈止损触发的动作。
+//
+// 去重责任在调用方：paper_trade_plans.closed_at 的条件 UPDATE 已经保证
+// 同一笔仓位只会被平一次。
+func (s *PaperOrderStore) InsertClosingOrder(in PaperOrderInput, note string) (int64, error) {
+	if in.AccountID == nil || *in.AccountID <= 0 {
+		return 0, fmt.Errorf("%w: account_id 不能为空", ErrOrderInvalid)
+	}
+	if !validOrderModes[strings.TrimSpace(in.Mode)] {
+		return 0, fmt.Errorf("%w: mode %q 不合法", ErrOrderInvalid, in.Mode)
+	}
+	if !validOrderSides[strings.TrimSpace(in.Side)] {
+		return 0, fmt.Errorf("%w: side %q 不合法", ErrOrderInvalid, in.Side)
+	}
+	if !validDecimalLiteral(in.Qty) {
+		return 0, fmt.Errorf("%w: qty %q 不是合法十进制数", ErrOrderInvalid, in.Qty)
+	}
+	price := strings.TrimSpace(in.Price)
+	if price == "" || !validDecimalLiteral(price) {
+		return 0, fmt.Errorf("%w: 已成交的单必须有合法 price，收到 %q", ErrOrderInvalid, in.Price)
+	}
+	var id int64
+	if err := s.db.QueryRow(`
+INSERT INTO paper_orders(task_id, signal_id, instrument_id, account_id, mode, side,
+                         qty, price, filled_qty, avg_fill_price, status, submitted_at, filled_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $7, $8, $9, now(), now())
+RETURNING id`,
+		in.TaskID, in.SignalID, in.InstrumentID, in.AccountID, in.Mode, in.Side,
+		normalizeDecimalInput(in.Qty, decimalScaleAmount),
+		NormalizeDecimal(price, decimalScaleAmount), OrderStatusFilled,
+	).Scan(&id); err != nil {
+		return 0, err
+	}
+	_ = note // 平仓原因记在 paper_trade_plans.close_reason
+	return id, nil
+}

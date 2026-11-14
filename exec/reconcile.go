@@ -304,6 +304,22 @@ func (r *Reconciler) reconcileOne(ctx context.Context, o *db.ExecOrder, res *Rec
 	dqty := qtyDiff(o.FilledQty, ack.FilledQty)
 	dprice := priceDiff(o.AvgPrice, ack.AvgPrice)
 
+	// 本地还**没有**任何成交信息时，远端报出的量价属于「我第一次得知」，
+	// 不是「账对不上」。
+	//
+	// # 为什么必须区分（2026-11-14 实测踩过）
+	//
+	// 下单只落 state=submitted / filled_qty=0 / avg_price=NULL —— 市场单的
+	// 成交量要等下一轮对账才知道。若把它当成量价不一致，则**每一张新单**
+	// 都会在第一次对账时判 amount 差异 → 冻结账户 → 降级回 paper。
+	// 实测就是这样：live 单成功发出去了，一分钟后账户被冻结、模式被降级。
+	//
+	// 判据要求远端成交量不超过下单量：超过说明通道回执本身有问题，
+	// 那种情况仍要走 amount 差异（保守方向不变）。
+	if localFillUnknown(o) && !exceedsOrderQty(ack.FilledQty, o.Qty) {
+		dqty, dprice = 0, 0
+	}
+
 	switch {
 	case !dStateChanged && dqty == 0 && dprice < amountPriceEpsilon:
 		// 完全一致 —— 无变化不写库（避免 60s × N 单的垃圾行）。
@@ -477,4 +493,34 @@ func parseDecimalFloat(s string) (float64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// localFillUnknown 判断本地是否「还不知道」这张单的成交情况。
+//
+// 判据是两个字段都空：filled_qty 为 0 且 avg_price 为空。
+// 只有其中之一为空说明曾经收到过部分回执（那是真的不一致）。
+func localFillUnknown(o *db.ExecOrder) bool {
+	if o == nil {
+		return false
+	}
+	if !isZeroDecimal(o.FilledQty) {
+		return false
+	}
+	return o.AvgPrice == nil || strings.TrimSpace(*o.AvgPrice) == ""
+}
+
+// isZeroDecimal 判断十进制字面量是否为 0（无法解析时按「不是 0」处理，保守）。
+func isZeroDecimal(s string) bool {
+	v, ok := parseDecimalFloat(s)
+	return ok && v == 0
+}
+
+// exceedsOrderQty 判断成交量是否超过下单量（超过说明回执不可信）。
+func exceedsOrderQty(filled, qty string) bool {
+	f, fok := parseDecimalFloat(filled)
+	q, qok := parseDecimalFloat(qty)
+	if !fok || !qok {
+		return true // 算不出来就当作超限，走保守分支
+	}
+	return f > q+amountPriceEpsilon
 }

@@ -33,7 +33,7 @@ func setupToolResolve(t *testing.T) *db.DB {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
 	t.Cleanup(func() { m.Close() })
-	reg := buildDomainReg(m.Assets(), agent.NewMarketToolSet(nil), nil, nil)
+	reg := buildDomainReg(m.Assets(), agent.NewMarketToolSet(nil), nil, nil, nil)
 	wireTools(m.pg, reg)
 	t.Cleanup(func() { agent.ToolResolve = nil })
 	return m.pg

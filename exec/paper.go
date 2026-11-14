@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/Autumn-27/artex/db"
@@ -179,6 +180,33 @@ func (g *Gate) ExecutePaper(ctx context.Context, draftID, accountID int64) (pape
 	}, draftID, note)
 	if err != nil {
 		return 0, err
+	}
+
+	// 登记止盈止损计划 —— 没有它，模拟盘的仓位永远不会平。
+	//
+	// # 为什么失败不让整个执行失败
+	//
+	// 成交已经入账（上面那步），钱的事已定。计划只是「退出条件」，
+	// 缺了它的后果是「这一仓变成不死仓」，而不是「账错了」。
+	// 所以记日志但不回滚 —— 回滚会把已经成交的单也撤销，那是更严重的问题。
+	if draft.InstrumentID != nil && *draft.InstrumentID > 0 {
+		params, pErr := g.db.GetDraftExecParams(draftID)
+		if pErr == nil && (params.TpPrice != "" || params.SlPrice != "") {
+			posSide := "long"
+			if strings.EqualFold(draft.Side, "sell") {
+				posSide = "short"
+			}
+			if params.PosSide == "long" || params.PosSide == "short" {
+				posSide = params.PosSide
+			}
+			if _, insErr := g.db.InsertPaperTradePlan(db.PaperTradePlan{
+				AccountID: accountID, InstrumentID: *draft.InstrumentID,
+				PosSide: posSide, Qty: draft.Qty,
+				TpPrice: params.TpPrice, SlPrice: params.SlPrice, DraftID: draftID,
+			}); insErr != nil {
+				log.Printf("[paper] 登记止盈止损计划失败（该仓将无自动平仓）: draft=%d err=%v", draftID, insErr)
+			}
+		}
 	}
 	return paperOrderID, nil
 }

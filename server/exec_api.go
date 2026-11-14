@@ -492,18 +492,22 @@ func (s *Server) pgExecUnfreeze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ---- 当前必须是 frozen ----
+	// ---- 判据是「这个账户本身是否 blocked」，不是「模式是否 frozen」----
+	//
+	// # 为什么不能只看模式（2026-11-14 实测的死锁）
+	//
+	// FreezeAccountTx 一次做三件事：降模式到 frozen + 撤授权 + 封账户。
+	// 但进程重启时 DowngradeOnStartup 会再把模式从 frozen 改成 paper ——
+	// 账户的 blocked_at 却留着。
+	//
+	// 那时模式是 paper、账户仍 blocked，而原实现要求「必须是 frozen 才能
+	// 解冻」→ **这个账户从此解不开**，只能进库手改。这比不解冻更糟：
+	// 用户看到「账户已被冻结」却点不动任何按钮。
+	//
+	// 正确的判据是账户状态：既然要点「解除冻结」，那被冻结的主体就是账户。
 	cur, mErr := s.m.pg.GetExecMode()
 	if mErr != nil {
 		writeErrCode(w, 500, "读取当前模式失败", "EXEC_MODE_READ_FAILED")
-		return
-	}
-	if cur != db.ExecModeFrozen {
-		// 409 而不是 400：请求本身合法，只是当前状态不允许 ——
-		// 客户端刷新状态后会看到「本来就没冻结」。
-		writeErrCode(w, 409,
-			fmt.Sprintf("当前模式是 %s，不是 frozen —— 无需解冻", cur),
-			"EXEC_NOT_FROZEN")
 		return
 	}
 
@@ -514,6 +518,14 @@ func (s *Server) pgExecUnfreeze(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeErrCode(w, 500, fmt.Sprintf("读取账户失败：%v", aErr), "EXEC_ACCOUNT_READ_FAILED")
+		return
+	}
+	if acct.BlockedAt == nil {
+		// 409 而不是 400：请求本身合法，只是当前状态不允许 ——
+		// 客户端刷新状态后会看到「本来就没冻结」。
+		writeErrCode(w, 409,
+			fmt.Sprintf("账户 %d 未处于冻结状态（当前模式 %s）—— 无需解冻", accountID, cur),
+			"EXEC_NOT_FROZEN")
 		return
 	}
 

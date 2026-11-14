@@ -42,17 +42,20 @@ var validSignalDirections = map[string]bool{
 // Confidence 用 *string 承载 NUMERIC(5,4):NUMERIC 扫 float64 会丢精度,
 // 且 0 与 NULL 语义不同(0 是「确信度为零」,NULL 是「未评」)。
 type Signal struct {
-	ID           int64   `json:"id"`
-	TaskID       *int64  `json:"task_id,omitempty"`
-	InstrumentID *int64  `json:"instrument_id,omitempty"`
-	NodeID       *int64  `json:"node_id,omitempty"`
-	SignalType   string  `json:"signal_type"`
-	Direction    string  `json:"direction"`
-	Confidence   *string `json:"confidence,omitempty"`
-	Horizon      *string `json:"horizon,omitempty"`
-	Rationale    *string `json:"rationale,omitempty"`
-	Status       string  `json:"status"`
-	CreatedAt    string  `json:"created_at"`
+	ID           int64  `json:"id"`
+	TaskID       *int64 `json:"task_id,omitempty"`
+	InstrumentID *int64 `json:"instrument_id,omitempty"`
+	NodeID       *int64 `json:"node_id,omitempty"`
+	SignalType   string `json:"signal_type"`
+	// Action 是准备执行的动作（entry/exit/scale_in/scale_out/hold/review）。
+	// 之前只有写路径，读路径漏了这一列 —— 平仓语义因此在执行层完全丢失。
+	Action     string  `json:"action,omitempty"`
+	Direction  string  `json:"direction"`
+	Confidence *string `json:"confidence,omitempty"`
+	Horizon    *string `json:"horizon,omitempty"`
+	Rationale  *string `json:"rationale,omitempty"`
+	Status     string  `json:"status"`
+	CreatedAt  string  `json:"created_at"`
 }
 
 // SignalInput 是 InsertSignal 的入参。
@@ -80,7 +83,7 @@ type SignalStore struct{ db *DB }
 func (d *DB) Signals() *SignalStore { return &SignalStore{db: d} }
 
 // signalColumns 与 scanSignal 的扫描顺序必须一致。
-const signalColumns = `id, task_id, instrument_id, node_id, signal_type, direction,
+const signalColumns = `id, task_id, instrument_id, node_id, signal_type, COALESCE(action,''), direction,
 	confidence, horizon, rationale, status, created_at`
 
 // scanSignal 从一行结果读出一条 Signal。
@@ -95,7 +98,7 @@ func scanSignal(row interface{ Scan(...any) error }) (*Signal, error) {
 		rational sql.NullString
 	)
 	if err := row.Scan(
-		&s.ID, &taskID, &instID, &nodeID, &s.SignalType, &s.Direction,
+		&s.ID, &taskID, &instID, &nodeID, &s.SignalType, &s.Action, &s.Direction,
 		&conf, &horizon, &rational, &s.Status, &s.CreatedAt,
 	); err != nil {
 		return nil, err

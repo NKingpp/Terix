@@ -56,19 +56,25 @@ type execTicker struct {
 	//
 	// 装了它也不代表会下单 —— 每轮都会先检查执行模式是否为 paper 或
 	// live_auto，其它模式直接跳过。「装配」与「启用」仍是两件事。
-	auto     *exec.AutoTrader
+	auto *exec.AutoTrader
+	// fills 把成交明细同步进 trade_fills（可能为 nil）。
+	//
+	// 与执行模式无关：切回 paper 之后仍要能看历史成交与盈亏，
+	// 所以它不在 runAuto 的模式闸之后，而是在 step 开头就跑。
+	fills    *exec.FillsSyncer
 	interval time.Duration
 }
 
 // newExecTicker 构造执行层调度。
 //
 // querier 为 nil 时只跑超时扫描（对账跳过）。
-func newExecTicker(pg *db.DB, querier exec.ChannelQuerier, auto *exec.AutoTrader) *execTicker {
+func newExecTicker(pg *db.DB, querier exec.ChannelQuerier, auto *exec.AutoTrader, fills *exec.FillsSyncer) *execTicker {
 	t := &execTicker{
 		pg:       pg,
 		timeout:  exec.NewTimeoutScanner(pg, 0), // 0 = 用默认 30min
 		interval: execTickInterval,
 		auto:     auto,
+		fills:    fills,
 	}
 	if querier != nil {
 		t.reconciler = exec.NewReconciler(pg, querier)
@@ -113,11 +119,33 @@ func (t *execTicker) Run(ctx context.Context) {
 // 只是「减少无谓的抢跑」。正确性由超时扫描的条件 UPDATE 保证
 // （`WHERE state=$from`），见 exec/timeout.go 的说明。
 func (t *execTicker) step(ctx context.Context) {
+	// 账户列表本轮只查一次（对账与成交同步共用）。
+	accts, acctsErr := t.pg.ExecAccounts().ListAccounts()
+	if acctsErr != nil {
+		slog.Error("执行层：列账户失败", "err", acctsErr)
+	}
+
+	// 成交明细同步：放在最前面且不受模式限制 —— 交易记录是「已经发生过
+	// 什么」的账，不因为当前切到 paper 就该停止记录。
+	//
+	// 停用/冻结账户也照同步：冻结是因为对账失败，那时更需要历史成交来核对。
+	if t.fills != nil && acctsErr == nil {
+		for _, a := range accts {
+			n, sErr := t.fills.SyncAccount(ctx, a.ID)
+			if sErr != nil {
+				slog.Warn("成交同步部分失败", "account_id", a.ID, "inserted", n, "err", sErr)
+				continue
+			}
+			if n > 0 {
+				slog.Info("成交同步完成", "account_id", a.ID, "inserted", n)
+			}
+		}
+	}
+
 	if t.reconciler != nil {
-		// 对账按账户跑。当前只有「列出所有账户」这一种方式。
-		accts, err := t.pg.ExecAccounts().ListAccounts()
-		if err != nil {
-			slog.Error("对账：列账户失败", "err", err)
+		// 对账按账户跑。
+		if acctsErr != nil {
+			slog.Error("对账：列账户失败", "err", acctsErr)
 		} else {
 			for _, a := range accts {
 				if !a.Active || a.BlockedAt != nil {
@@ -193,65 +221,26 @@ func (t *execTicker) runAuto(ctx context.Context) {
 		slog.Error("自动交易：读执行模式失败", "err", err)
 		return
 	}
-	// paper = 模拟盘自动成交（只落纸面账本），live_auto = 实盘自动下发。
-	// 其余模式一律不碰 —— 特别是 live_manual（要人工确认，不能被自动流程绕过）。
-	if mode != db.ExecModePaper && mode != db.ExecModeLiveAuto {
-		return
-	}
-
-	// 找「已判定 pass、还没导出、还没执行」的草案。
+	// ⚠️ 2026-11-14 起**草案不再有执行者**，本函数只保留状态巡检职责。
 	//
-	// 口径与仪表盘的「待决策草案」不同：那个数的是「还没拍板的」（含未判定），
-	// 这里要的是「已判定可执行但还没发出去的」。两者互补，不能混用。
-	drafts, err := t.pg.OrderDrafts().ListAutoExecutable(maxAutoBatch)
-	if err != nil {
-		slog.Error("自动交易：列待执行草案失败", "err", err)
-		return
-	}
-	if len(drafts) == 0 {
-		return
-	}
-
-	// 用哪个账户下单？
+	// # 为什么（这是架构变更的收尾，不是临时关掉）
 	//
-	// 当前取「第一个活跃且未冻结的账户」。多账户场景需要草案显式指定
-	// 或按市场路由 —— 那是后续工作，这里先保证单账户可用且行为可预测。
-	acct, err := t.firstActiveAccount()
-	if err != nil {
-		slog.Error("自动交易：找不到可用账户", "err", err)
-		return
-	}
-
-	slog.Info("自动交易：开始执行", "drafts", len(drafts), "account_id", acct.ID)
-
-	for _, d := range drafts {
-		out, err := t.auto.Execute(ctx, d.ID, acct.ID)
-		if err != nil {
-			slog.Error("自动交易：执行失败",
-				"draft_id", d.ID, "err", err)
-			// 降级错误不继续跑后面的单 —— 状态已经不可信。
-			if errors.Is(err, exec.ErrAutoDegraded) ||
-				errors.Is(err, exec.ErrAutoNotAuthorized) {
-				slog.Error("自动交易：已停止本轮", "reason", err)
-				return
-			}
-			continue
-		}
-		if out == nil {
-			continue
-		}
-		if out.Degraded {
-			// 已降级 → 本轮不再继续（后续单的限额判断也不可信了）。
-			slog.Error("自动交易：因降级停止本轮", "reason", out.DegradeWhy)
-			return
-		}
-		slog.Info("自动交易：草案已处理",
-			"draft_id", out.DraftID,
-			"decision", out.Decision,
-			"channel_order_id", out.ChannelID,
-			"client_order_id", out.ClientOrder,
-			"reason", out.Reason)
-	}
+	// 旧设计有两条执行路径：TradeLoop 消费 live_auto 草案，runAuto 消费
+	// paper 草案。TradeLoop 已下线（模型改用 open_position / close_position
+	// 同步下单），于是草案在 live 模式下**永远没人执行** —— 而模型还按旧
+	// prompt 以为「过闸就会自动下发」，报告「已完成」而实际什么都没发生。
+	//
+	// 留着 paper 这一半更糟：它让 paper 与 live 走不同的路径、不同的账本。
+	// 实测任务 30 的纸面单就是这条路产生的 —— 交易记录页里 paper_orders
+	// 有 1 笔，而 trade_records.action 是 0 条，盈亏归属对不上。
+	//
+	// 所以两条都停：**唯一的执行路径是工具**。纸面单也由 open_position 写，
+	// 这样两种模式共用同一套台账与盈亏算法。
+	//
+	// 想做「保留旧草案自动成交」的话，正确做法是给 ExecutePaper 补写
+	// trade_records，而不是恢复这条分支 —— 但那是多余的第二条路。
+	_ = mode
+	return
 }
 
 // maxAutoBatch 是单轮自动执行的上限。
@@ -340,6 +329,18 @@ func ensurePaperAutoAccount(d *db.DB) (*db.ExecAccount, error) {
 //	ARTEX_VAULTD_TOKEN  —— vaultd stdout 首行拿到的 token
 //
 // 不从数据库读：凭证不进 DB 是本项目的既有约束（见 PRD 的硬约束）。
+// okxTradeCred 读当前可用的 OKX 交易凭据（下单 / 对账 / 持仓都从这里取）。
+//
+// 每次调用都重读表：用户在凭证页换 key 之后必须立即生效 ——
+// 缓存住旧 key 的后果是所有下单返回 50119「key 不存在」，
+// 而页面显示的是新 hint，最难查的那类「配置不生效」。
+func (s *Server) okxTradeCred() (*db.OkxTradeCred, error) {
+	if s.m == nil || s.m.pg == nil {
+		return nil, db.ErrCredentialNotFound
+	}
+	return s.m.pg.ActiveOkxTradeCredential()
+}
+
 func (s *Server) newAutoTrader() *exec.AutoTrader {
 	base := strings.TrimSpace(os.Getenv("ARTEX_VAULTD_URL"))
 	token := strings.TrimSpace(os.Getenv("ARTEX_VAULTD_TOKEN"))

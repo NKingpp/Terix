@@ -508,6 +508,9 @@ func (s *Server) seedOrchestrationTools() {
 	// screener 提示词补上任务目标（2026-11-11）：原版让模型「看 user 消息第一段」，
 	// 而那段不存在 → 选品员看不到策略与目标 → 任务写明 BTC-USDT 却选了 NVDA。
 	s.reseedScreenerPrompt()
+	// trader 提示词改成「工具直接下单」（2026-11-14）：TradeLoop 下线后，
+	// 旧版教的 create_order_draft 在实盘模式下再也不会被执行。
+	s.reseedTraderPrompt()
 	// 注：pentest / reporter / retester 三个渗透语义 agent 已下线，清理在
 	// db.seedAgentRemovals（flag 守卫的一次性 DELETE）里做，不再在启动期 seed 它们。
 	// 注：pentest 的默认工具绑定无需迁移——BuiltinToolSeeds 在全新初始化时就把

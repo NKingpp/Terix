@@ -371,6 +371,26 @@ RETURNING id`,
 	return id, true, nil
 }
 
+// DraftKind 区分「增加敞口」与「减少敞口」的草案。
+//
+// # 为什么必须能分开查（2026-11-14 实盘事故）
+//
+// 交易循环有一条守卫「有仓不开新仓」——它在有持仓时整轮 return，
+// 连 eat 掉 exit 草案一起跳过。结果：**LLM 永远平不了仓**，
+// 而 draft 表里那张 exit 一直躺着（exported_at 为空，每轮都被读到、每轮都没执行）。
+//
+// 拆开查是修复的前提：有仓时只允许执行 reduce，open 仍然挡住。
+type DraftKind int
+
+const (
+	// DraftAny 不过滤（开仓与平仓都取）。
+	DraftAny DraftKind = iota
+	// DraftOpen 只取会**增加敞口**的草案。
+	DraftOpen
+	// DraftReduce 只取 reduce_only 的草案（平仓/减仓）。
+	DraftReduce
+)
+
 // ListAutoExecutable 列出可被自动交易执行的草案（最多 limit 条）。
 //
 // # 判定条件（三者缺一不可）
@@ -391,8 +411,26 @@ RETURNING id`,
 //
 // 老草案先执行。信号有实效性，积压时先处理更早的通常更合理。
 func (s *OrderDraftStore) ListAutoExecutable(limit int) ([]*OrderDraft, error) {
+	return s.ListAutoExecutableKind(limit, DraftAny)
+}
+
+// ListAutoExecutableKind 是 ListAutoExecutable 的按类过滤版本。
+//
+// kind 的过滤走 draft_exec_params.reduce_only 的子查询，不 JOIN 出列 ——
+// 那张侧表可能没有行（历史草案），JOIN 后 NULL 会被当成「非 reduce」，
+// 与「没有侧表记录 = 开仓」的既有语义一致，所以用 NOT EXISTS 表达。
+func (s *OrderDraftStore) ListAutoExecutableKind(limit int, kind DraftKind) ([]*OrderDraft, error) {
 	if limit <= 0 {
 		limit = 20
+	}
+	kindClause := ""
+	switch kind {
+	case DraftOpen:
+		kindClause = `
+  AND NOT EXISTS (SELECT 1 FROM draft_exec_params p WHERE p.draft_id = od.id AND p.reduce_only = 1)`
+	case DraftReduce:
+		kindClause = `
+  AND EXISTS (SELECT 1 FROM draft_exec_params p WHERE p.draft_id = od.id AND p.reduce_only = 1)`
 	}
 	rows, err := s.db.Query(`
 SELECT `+draftColumns+`
@@ -402,6 +440,13 @@ WHERE od.risk_verdict = 'pass'
   AND od.exported_at IS NULL
   AND od.executed_note IS NULL
   AND od.instrument_id IS NOT NULL
+  -- 真正的幂等闸：即使上一轮在 MarkExported 之前崩了，只要已经落过
+  -- orders_execution 就不会再发一次（MarkExported 是事后标记，不可靠）。
+  AND NOT EXISTS (SELECT 1 FROM orders_execution oe WHERE oe.draft_id = od.id)
+  -- 归档/删除任务的残单不得继续开仓（任务 19 有 4 条历史 pass 草案）。
+  AND (s.task_id IS NULL OR NOT EXISTS (
+        SELECT 1 FROM tasks t WHERE t.id = s.task_id
+          AND (t.archived_at IS NOT NULL OR t.deleted_at IS NOT NULL)))`+kindClause+`
 ORDER BY od.id ASC
 LIMIT $1`, limit)
 	if err != nil {
@@ -443,4 +488,15 @@ WHERE id = $1 AND exported_at IS NULL`, id)
 		return false, err
 	}
 	return n > 0, nil
+}
+
+// SetExecutedNote 写入「为什么这张草案没有被执行」（或执行结果）。
+//
+// 与 MarkExported 的区别：那个是「已经发出去了」，这个是「决定不发」。
+// 复用同一列（executed_note）是因为 ListAutoExecutable 已经用它做过滤 ——
+// 加一列就要再改一处过滤条件，而漏改的后果是同一张坏草案每轮重试。
+func (s *OrderDraftStore) SetExecutedNote(id int64, note string) error {
+	_, err := s.db.Exec(`UPDATE orders_draft SET executed_note=$1 WHERE id=$2 AND executed_note IS NULL`,
+		strings.TrimSpace(note), id)
+	return err
 }

@@ -585,3 +585,15 @@ func dailyUsageNotional(filled, avgPrice, qty, ref sql.NullString) (*big.Rat, bo
 	restAmt := DecimalMul(DecimalSub(totalQty, filledQty), restPrice)
 	return DecimalAdd(filledAmt, restAmt), true
 }
+
+// AttachChannelAck 把通道回报挂到一张已提交的订单上。
+//
+// 为什么不复用 TransitionWithAck：那个要求合法的状态迁移，而
+// submitted→submitted 不在 CanExecTransit 里。下单成功那一刻要做的只是
+// 「补上 ordId 与原始回执」，状态没变。
+func (s *ExecOrderStore) AttachChannelAck(id int64, channelOrderID string, raw json.RawMessage) error {
+	_, err := s.db.Exec(`UPDATE orders_execution
+SET channel_order_id=NULLIF($1,''), raw_ack=NULLIF($2,''), state_at=now()
+WHERE id=$3 AND state='submitted'`, strings.TrimSpace(channelOrderID), string(raw), id)
+	return err
+}

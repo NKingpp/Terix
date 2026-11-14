@@ -336,14 +336,21 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		}
 		// 交易工具需要 gate 实例。它与 exec_api 用的是同一套构造方式
 		// （exec.NewGate(pg, nil)），audit 传 nil 表示只写判定记录、不额外审计。
-		tts := NewTradeToolSet(s.m.pg, exec.NewGate(s.m.pg, nil))
+		gate := exec.NewGate(s.m.pg, nil)
+		tts := NewTradeToolSet(s.m.pg, gate)
+		// 读持仓/改止盈止损要直接打交易所，需要凭据读取器。
+		// 每次都重读表，换 key 立即生效。
+		tts.SetCreds(s.okxTradeCred)
+		// 同步交易工具：模型直接开平仓，不经草案队列。
+		ets := NewExecToolSet(s.m.pg, gate, s.okxTradeCred)
 		sits := NewSetInstrumentToolSet(s.m.pg)
-		domainReg := buildDomainReg(m.Assets(), mts, tts, sits)
+		domainReg := buildDomainReg(m.Assets(), mts, tts, ets, sits)
 		wireTools(m.pg, domainReg)             // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		s.seedFinancialToolBindings()          // W5 金融角色默认工具绑定（一次性迁移，见 assembly.go）
 		s.seedTradeToolBindings()              // 交易执行工具绑定给 trader（提案 + 过闸，不含执行）
 		s.SeedSetInstrumentTool()              // 选品结果回填工具绑给 screener（见 set_instrument_tool.go）
 		s.SeedMaterializeDownstreamTool()      // 阶段图补建工具绑给 planner（见 materialize_tool.go）
+		s.refreshTradeToolDefaults()           // 交易工具 description+schema 对齐代码（每次启动，见函数注释）
 		s.refreshSourceQuoteToolDescriptions() // 按源行情工具描述刷成代码默认值（每次启动，见函数注释）
 		s.refreshComputeIndicatorDefaults()    // compute_indicator schema 对齐（每次启动，见函数注释）
 		seedPrompts(m.pg)                      // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
@@ -372,7 +379,10 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// 自动交易器在这里装配，但**装不等于开**：每轮 runAuto 都会先查
 		// 执行模式是否为 live_auto，不是就直接返回。这样「部署了这段代码」
 		// 与「启用自动交易」是两件事 —— 后者需要显式切模式 + 授权。
-		go newExecTicker(s.m.pg, nil, s.newAutoTrader()).Run(s.ctx)
+		autoTrader := s.newAutoTrader()
+		go newExecTicker(s.m.pg, exec.NewOkxQuerier(s.okxTradeCred), autoTrader,
+			exec.NewFillsSyncer(s.m.pg, s.okxTradeCred)).Run(s.ctx)
+
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
 		go newNotifier(s).Run(s.ctx)
@@ -848,6 +858,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/task-archives/restore/batch", s.restoreTaskArchivesBatch)
 	mux.HandleFunc("DELETE /api/task-archives/{id}", s.queueTaskArchiveDelete)
 	mux.HandleFunc("POST /api/task-archives/delete/batch", s.deleteTaskArchivesBatch)
+	mux.HandleFunc("GET /api/tasks/{id}/trades", s.taskTrades)           // 交易记录（成交明细 + 已实现盈亏）
+	mux.HandleFunc("POST /api/tasks/{id}/trades/sync", s.taskTradesSync) // 立即拉一次成交
 	mux.HandleFunc("GET /api/tasks/{id}/coverage", s.taskCoverage)
 	mux.HandleFunc("GET /api/tasks/{id}/coverage-graph", s.taskCoverageGraph)
 	mux.HandleFunc("GET /api/tasks/{id}/asset-refs", s.taskAssetRefs)
@@ -867,6 +879,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/tasks/{id}/goals", s.addGoal)                        // 目标管理:人工新增目标(复活任务)
 	mux.HandleFunc("PATCH /api/tasks/{id}/goals/{gid}", s.editGoal)                // 目标管理:修改目标(复活任务)
 	mux.HandleFunc("DELETE /api/tasks/{id}/goals/{gid}", s.deleteGoal)             // 目标管理:硬删除目标(不复活)
+	mux.HandleFunc("POST /api/tasks/{id}/goals/{gid}/accept", s.acceptGoal)        // 目标管理:人工验收(机器先核验)→置 met
 	mux.HandleFunc("GET /api/tasks/{id}/constraints", s.listConstraints)           // 约束管理:列出本任务操作约束
 	mux.HandleFunc("POST /api/tasks/{id}/constraints", s.addConstraint)            // 约束管理:新增约束(不通知 planner)
 	mux.HandleFunc("PATCH /api/tasks/{id}/constraints/{cid}", s.editConstraint)    // 约束管理:修改约束
@@ -941,6 +954,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exec/mode", s.pgExecMode)
 	mux.HandleFunc("POST /api/exec/mode", s.pgExecSetMode)
 	mux.HandleFunc("POST /api/exec/authorize", s.pgExecAuthorize)
+	mux.HandleFunc("GET /api/exec/accounts", s.listExecAccounts)        // 执行账户列表（含 pos_mode/lever）
+	mux.HandleFunc("POST /api/exec/accounts", s.createExecAccount)      // 人工创建（uid 用真实凭证探测）
+	mux.HandleFunc("PATCH /api/exec/accounts/{id}", s.patchExecAccount) // 改 label/market_support/active/账户参数
+	mux.HandleFunc("GET /api/exec/loop/status", s.execLoopStatus)       // 交易循环运行状态
 	mux.HandleFunc("POST /api/exec/accounts/{id}/unfreeze", s.pgExecUnfreeze)
 	mux.HandleFunc("GET /api/exec/orders", s.pgExecOrders)
 	mux.HandleFunc("GET /api/exec/limits", s.pgExecGetLimits)

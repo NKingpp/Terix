@@ -361,3 +361,83 @@ SELECT COUNT(*) FROM (
 		`SELECT COUNT(*) FROM paper_orders WHERE mode=$1 AND filled_qty > 0`, mode).Scan(&c.FilledOrderCount)
 	return c, err
 }
+
+// TaskTradeSummary 是**单任务**的成交汇总（人工验收用）。
+//
+// 为什么不复用 ListPaperPositions / SumRealizedPnlNumeric：那两个按 mode 全局口径，
+// 别的任务的持仓会污染「本任务是否已平仓 / 已实现多少」的判定。这里多一层 task_id。
+type TaskTradeSummary struct {
+	Mode          string
+	RealizedTotal string           // 精确十进制
+	OpenPositions int              // 净数量 != 0 的标的数
+	NetQty        map[int64]string // 每标的净数量（十进制字面量）
+	Fills         int
+}
+
+// TaskTradeSummaryFor 汇总某任务（可选某标的）的成交与净持仓；算法与全局口径共用
+// aggregatePaperPositions，不另写一套。
+func TaskTradeSummaryFor(ctx context.Context, conn *sql.DB, taskID int64, mode string, instrumentID int64) (TaskTradeSummary, error) {
+	out := TaskTradeSummary{Mode: mode, RealizedTotal: "0", NetQty: map[int64]string{}}
+	if mode == "" {
+		mode = "paper"
+		out.Mode = mode
+	}
+	q := `
+SELECT instrument_id, side, filled_qty, COALESCE(avg_fill_price, price)
+FROM paper_orders
+WHERE mode = $1
+  AND task_id = $2
+  AND status IN ('filled','partial')
+  AND CAST(filled_qty AS REAL) > 0
+  AND COALESCE(avg_fill_price, price) IS NOT NULL
+  AND instrument_id IS NOT NULL`
+	args := []any{mode, taskID}
+	if instrumentID > 0 {
+		q += ` AND instrument_id = $3`
+		args = append(args, instrumentID)
+	}
+	q += ` ORDER BY instrument_id, COALESCE(filled_at, created_at), id`
+	rows, err := conn.QueryContext(ctx, q, args...)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	fills := make([]paperFill, 0, 32)
+	for rows.Next() {
+		var (
+			f    paperFill
+			qtyS string
+			pxS  string
+		)
+		if err := rows.Scan(&f.InstrumentID, &f.Side, &qtyS, &pxS); err != nil {
+			return out, err
+		}
+		q, qErr := ParseDecimal(qtyS)
+		if qErr != nil {
+			return out, fmt.Errorf("paper_orders.filled_qty 非法（instrument_id=%d）: %w", f.InstrumentID, qErr)
+		}
+		p, pErr := ParseDecimal(pxS)
+		if pErr != nil {
+			return out, fmt.Errorf("paper_orders 成交价非法（instrument_id=%d）: %w", f.InstrumentID, pErr)
+		}
+		f.Qty, f.Price = q, p
+		fills = append(fills, f)
+	}
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
+	out.Fills = len(fills)
+	positions, _ := aggregatePaperPositions(fills)
+	total := new(big.Rat)
+	for _, p := range positions {
+		out.NetQty[p.InstrumentID] = p.NetQty
+		if r, err := ParseDecimal(p.RealizedAmount); err == nil {
+			total = DecimalAdd(total, r)
+		}
+		if r, err := ParseDecimal(p.NetQty); err == nil && r.Sign() != 0 {
+			out.OpenPositions++
+		}
+	}
+	out.RealizedTotal = DecimalString(total, decimalScaleAmount)
+	return out, nil
+}

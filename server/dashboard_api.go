@@ -24,8 +24,10 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/exec"
 )
 
 // dashboardSummaryDTO 是 GET /api/dashboard/summary 的响应。
@@ -94,6 +96,13 @@ type dashboardOrdersDTO struct {
 // JSON number 会被 JS 的 float64 截断两位以上小数。
 type dashboardPnlDTO struct {
 	PaperOrders int64 `json:"paper_orders"`
+	// LiveFills 是实盘逐笔成交数（来自 trade_fills，每 60s 从交易所同步）。
+	LiveFills int64 `json:"live_fills"`
+	// LiveRealizedPnl 是实盘已实现盈亏（含手续费）。与纸面分开算 ——
+	// 两边的钱不是一回事，合并会得出「模拟赚 50 + 实盘亏 30 = 赚 20」。
+	LiveRealizedPnl string `json:"live_realized_pnl"`
+	// LiveFeeTotal 是实盘手续费合计（负数，交易所口径）。
+	LiveFeeTotal string `json:"live_fee_total"`
 	// Positions 是有净持仓（买卖差额不为 0）的标的数。
 	Positions int64 `json:"positions"`
 	// RealizedPnl 是已实现盈亏（已平仓部分），精确 decimal 字符串。
@@ -207,6 +216,33 @@ func (s *Server) dashboardSummary(w http.ResponseWriter, r *http.Request) {
 		out.Pnl.PricedPositions = pnl.PricedPositions
 		out.Pnl.TotalPositions = pnl.TotalPositions
 		out.Pnl.Note = pnl.Note
+	}
+
+	// ---- 实盘盈亏（2026-11-14 补）----
+	//
+	// 旧版只算纸面。TradeLoop 下线后实盘成交全部来自工具下单，
+	// 数据源是 trade_fills（逐笔含手续费），与任务详情页同一套算法。
+	// 失败不阻断概览页：盈亏是附加信息，drafts/ratings 才是核心。
+	if liveFills, fErr := s.m.pg.ListFills(db.FillsFilter{Limit: 2000}); fErr == nil {
+		livePnL := exec.ComputePnLByInst(liveFills)
+		var realized, fee string
+		for _, p := range livePnL {
+			realized = exec.DecimalAddStr(realized, p.Realized)
+			fee = exec.DecimalAddStr(fee, p.FeeTotal)
+		}
+		out.Pnl.LiveFills = int64(len(liveFills))
+		if realized == "" {
+			realized = "0"
+		}
+		if fee == "" {
+			fee = "0"
+		}
+		out.Pnl.LiveRealizedPnl = realized
+		out.Pnl.LiveFeeTotal = fee
+	} else {
+		out.Pnl.LiveRealizedPnl = "0"
+		out.Pnl.LiveFeeTotal = "0"
+		out.Pnl.Note = strings.TrimSpace(out.Pnl.Note + " 实盘盈亏读取失败：" + fErr.Error())
 	}
 
 	writeJSON(w, 200, out)

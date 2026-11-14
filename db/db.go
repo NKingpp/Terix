@@ -138,6 +138,25 @@ func (d *DB) initSchemaAndSeed() error {
 		return fmt.Errorf("应用 schema: %w", err)
 	}
 
+	// 加列迁移。
+	//
+	// # 为什么需要这一步（2026-11-14）
+	//
+	// schema_sqlite.sql 是 CREATE TABLE IF NOT EXISTS —— 表已存在时整段跳过，
+	// 所以「在 DDL 里加一列」对存量库**完全不生效**。而 SQLite 又没有
+	// ADD COLUMN IF NOT EXISTS，所以只能先探测再 ALTER。
+	//
+	// # 为什么不用 PRAGMA 语句
+	//
+	// PRAGMA 的返回不参与行扫描，用 Query 取列名要绕一圈；pragma_table_info
+	// 是表值函数，可以直接 SELECT，在事务内也安全。
+	//
+	// 漏了这一步的后果：新列永远不出现，Scan 直接报 "no such column"，
+	// 服务起不来（而不是静默降级）。
+	if err := ensureColumn(tx, "trade_records", "position_effect", "TEXT"); err != nil {
+		return fmt.Errorf("迁移 trade_records.position_effect: %w", err)
+	}
+
 	// seed 顺序即依赖顺序：agents 必须先建，agent_prompt_vars 才有 agent_id。
 	steps := []struct {
 		name string
@@ -972,4 +991,24 @@ WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
 		return fmt.Errorf("rule %q: %w", name, err)
 	}
 	return setSettingE(d, "intercept_default_rules_v3", "done")
+}
+
+// ensureColumn 幂等加列：列不存在才 ALTER。
+//
+// ddl 只给类型部分（如 "TEXT" / "INTEGER NOT NULL DEFAULT 0"）——
+// SQLite 的 ADD COLUMN 不接受表级约束，且默认值必须是常量。
+func ensureColumn(e execer, table, column, ddl string) error {
+	var n int
+	if err := e.QueryRow(
+		`SELECT count(*) FROM pragma_table_info($1) WHERE name=$2`, table, column).Scan(&n); err != nil {
+		return fmt.Errorf("探测 %s.%s: %w", table, column, err)
+	}
+	if n > 0 {
+		return nil
+	}
+	// 表名/列名/DDL 都来自代码常量，不参与用户输入，所以直接拼。
+	if _, err := e.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, ddl)); err != nil {
+		return fmt.Errorf("加列 %s.%s: %w", table, column, err)
+	}
+	return nil
 }

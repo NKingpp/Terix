@@ -48,7 +48,7 @@ func newTradeE2E(t *testing.T) *tradeE2E {
 	// 标的：用唯一 symbol 避免与既有数据冲突
 	active := true
 	instID, _, err := pg.Instruments().UpsertInstrument(db.InstrumentInput{
-		Market: "crypto", Symbol: "E2ETEST-USDT",
+		Market: "crypto", Symbol: "E2ETEST-USDT-SWAP",
 		Name: "E2E 测试标的", AssetClass: "crypto", Active: &active,
 	})
 	if err != nil {
@@ -57,6 +57,8 @@ func newTradeE2E(t *testing.T) *tradeE2E {
 	t.Cleanup(func() {
 		_, _ = pg.Exec(`DELETE FROM orders_draft WHERE instrument_id=$1`, instID)
 		_, _ = pg.Exec(`DELETE FROM instruments WHERE id=$1`, instID)
+		// 解析器可能自动登记过同名的其它写法，一并清掉
+		_, _ = pg.Exec(`DELETE FROM instruments WHERE symbol='E2ETEST-USDT-SWAP'`)
 	})
 
 	// 账户
@@ -116,8 +118,8 @@ func TestTradeChainCreateAuthExecute(t *testing.T) {
 
 	// ① 建草案
 	out := e.call(t, "create_order_draft", map[string]any{
-		"symbol": "E2ETEST-USDT", "market": "crypto",
-		"side": "buy", "qty": "1", "ref_price": "100",
+		"symbol": "E2ETEST-USDT-SWAP", "market": "crypto",
+		"side": "buy", "qty": "1", "ref_price": "100", "tp_price": "115.00", "sl_price": "95.00",
 	})
 	if !strings.Contains(out, "draft_id") {
 		t.Fatalf("建草案失败，返回: %s", out)
@@ -241,7 +243,7 @@ func TestCreateOrderDraftRejectsIntentWithoutInstrument(t *testing.T) {
 	}
 	ctx := agent.WithRunInfo(context.Background(), agent.RunInfo{TaskID: exp.ID, ExplorationID: exp.ExplorationID, IntentID: intentID})
 	out := e.callCtx(t, ctx, "create_order_draft", map[string]any{
-		"symbol": "E2ETEST-USDT", "market": "crypto", "side": "buy", "qty": "1",
+		"symbol": "E2ETEST-USDT-SWAP", "market": "crypto", "side": "buy", "qty": "1",
 	})
 	if strings.Contains(out, "draft_id") {
 		t.Fatalf("无明确交易标的意图不应创建草案: %s", out)
@@ -264,7 +266,7 @@ func TestTradeChainWithTaskContext(t *testing.T) {
 	})
 	ctx := agent.WithRunInfo(context.Background(), ri)
 	out := e.callCtx(t, ctx, "create_order_draft", map[string]any{
-		"symbol": "E2ETEST-USDT", "market": "crypto", "side": "buy", "qty": "1", "ref_price": "100", "signal_id": signalID,
+		"symbol": "E2ETEST-USDT-SWAP", "market": "crypto", "side": "buy", "qty": "1", "ref_price": "100", "tp_price": "115.00", "sl_price": "95.00", "signal_id": signalID,
 	})
 	var result struct {
 		DraftID int64 `json:"draft_id"`
@@ -333,9 +335,9 @@ func TestTradeToolsRejectInvalidTaskContext(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := agent.WithRunInfo(context.Background(), tc.info)
-			for _, name := range tradeToolNames {
+			for _, name := range draftScopedTradeToolNames {
 				out := e.callCtx(t, ctx, name, map[string]any{
-					"symbol": "E2ETEST-USDT", "market": "crypto", "side": "buy", "qty": "1",
+					"symbol": "E2ETEST-USDT-SWAP", "market": "crypto", "side": "buy", "qty": "1",
 					"draft_id": draftID, "account_id": e.acctID,
 				})
 				if !strings.Contains(out, tc.want) {
@@ -362,7 +364,7 @@ func TestTradeToolsRejectCrossInstrumentDraft(t *testing.T) {
 	ri := e.runInfo(t, &otherID)
 	ctx := agent.WithRunInfo(context.Background(), ri)
 	out := e.callCtx(t, ctx, "create_order_draft", map[string]any{
-		"symbol": "E2ETEST-USDT", "market": "crypto", "side": "buy", "qty": "1",
+		"symbol": "E2ETEST-USDT-SWAP", "market": "crypto", "side": "buy", "qty": "1",
 	})
 	if !strings.Contains(out, "任务") || !strings.Contains(out, "不一致") {
 		t.Fatalf("任务与旧 intent/request 同标的也必须拒绝: %s", out)
@@ -443,9 +445,9 @@ func TestTradeToolsValidateSignalTaskBinding(t *testing.T) {
 			if tc.noContext {
 				ctx = context.Background()
 			}
-			for _, name := range tradeToolNames {
+			for _, name := range draftScopedTradeToolNames {
 				out := e.callCtx(t, ctx, name, map[string]any{
-					"symbol": "E2ETEST-USDT", "market": "crypto", "side": "buy", "qty": "1", "signal_id": signalID,
+					"symbol": "E2ETEST-USDT-SWAP", "market": "crypto", "side": "buy", "qty": "1", "signal_id": signalID,
 					"draft_id": draftID, "account_id": e.acctID,
 				})
 				if !strings.Contains(out, tc.want) {

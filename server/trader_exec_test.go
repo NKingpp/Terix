@@ -62,14 +62,23 @@ func TestWithExecAccountIgnoresZeroID(t *testing.T) {
 //
 // 改之前 prompt 写「你唯一的职责是产出交易信号」，模型照做了，
 // 于是永远不下单。这条测试锁住「prompt 必须提到这两个工具」。
-func TestTraderPromptRequiresDraftAndAuthorize(t *testing.T) {
+func TestTraderPromptRequiresTradingTools(t *testing.T) {
 	body := agent.BuiltinPromptSeeds()["trader"]
 	if body == "" {
 		t.Fatal("trader prompt 缺失")
 	}
-	for _, want := range []string{"create_order_draft", "authorize_order", "draft_id", "account_id"} {
+	// 2026-11-14 架构变更：草案链路（create_order_draft + authorize_order）
+	// 已被同步工具取代 —— TradeLoop 下线后，实盘草案再也没有消费者，
+	// 继续让 prompt 教模型建草案，等于让它在 live 模式下永远下不出单。
+	for _, want := range []string{"open_position", "close_position", "set_leverage", "modify_bracket"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("trader prompt 应提到 %q（否则模型不会调用它）", want)
+		}
+	}
+	// 旧链路的关键词不该再出现：留着会让模型走回死路。
+	for _, deny := range []string{"create_order_draft", "authorize_order"} {
+		if strings.Contains(body, deny) {
+			t.Errorf("trader prompt 不该再提 %q —— 那条链路在 live 模式下没有消费者", deny)
 		}
 	}
 }
@@ -84,8 +93,8 @@ func TestTraderPromptRequiresDraftAndAuthorize(t *testing.T) {
 // 限价单会被限额挡住，但市价单可能直接成交。
 func TestTraderPromptExplainsQtyIsBaseCcy(t *testing.T) {
 	body := agent.BuiltinPromptSeeds()["trader"]
-	if !strings.Contains(body, "币的数量") {
-		t.Error("trader prompt 必须明确 qty 是币的数量（不是金额）——否则会买错数量级")
+	if !strings.Contains(body, "合约张数") {
+		t.Error("trader prompt 必须明确 qty 是合约张数（不是金额）——否则会买错数量级")
 	}
 }
 

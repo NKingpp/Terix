@@ -18,6 +18,8 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+
+	"github.com/Autumn-27/artex/agent"
 	"testing"
 
 	actool "github.com/Autumn-27/norma/tool"
@@ -48,7 +50,7 @@ func callTool(t *testing.T, tl actool.CoreTool, args map[string]any) (map[string
 // 下单工具如果不在这里，agent 会退回去调 skill，拦截能力等于不存在。
 func TestTradeToolsInDomainReg(t *testing.T) {
 	tts := NewTradeToolSet(nil, nil) // nil 依赖足够：这里只验证名字存在
-	reg := buildDomainReg(nil, nil, tts, nil)
+	reg := buildDomainReg(nil, nil, tts, nil, nil)
 
 	for _, want := range tradeToolNames {
 		if _, ok := reg[want]; !ok {
@@ -127,5 +129,36 @@ func TestCreateOrderDraftValidatesInput(t *testing.T) {
 				t.Errorf("应返回错误说明，实际空")
 			}
 		})
+	}
+}
+
+// 只读工具不该因为「任务未绑定标的」而拒绝。
+//
+// # 这是 2026-11-14 实测的坑
+//
+// get_positions 一开始复用了 requireTaskInstrument（要求 tasks.instrument_id 非空）。
+// 结果主 agent 在未绑定标的的任务里连续 4 次调用全失败，然后开始用
+// add_task_scope / insert_assets 乱试 —— 工具用坏比不给工具更糟。
+//
+// 读交易所持仓与「任务绑没绑标的」无关，所以上下文校验必须放宽到
+// 「任务存在 + exploration 一致」。
+func TestRequireTaskContextAllowsUnboundTask(t *testing.T) {
+	e := newTradeE2E(t)
+	// 建一个**不绑标的**的任务
+	ri := e.runInfo(t, nil)
+	ctx := agent.WithRunInfo(context.Background(), ri)
+
+	task, err := e.tts.requireTaskContext(ctx)
+	if err != nil {
+		t.Fatalf("未绑标的的任务不该被拒: %v", err)
+	}
+	if task == nil || task.ID != ri.TaskID {
+		t.Fatalf("应返回任务 %d，得到 %+v", ri.TaskID, task)
+	}
+
+	// 但仍然必须校验 exploration 一致性（防跨任务读数据）
+	bad := agent.WithRunInfo(context.Background(), agent.RunInfo{TaskID: ri.TaskID, ExplorationID: ri.ExplorationID + 1})
+	if _, err := e.tts.requireTaskContext(bad); err == nil {
+		t.Fatal("exploration 不一致必须报错")
 	}
 }
