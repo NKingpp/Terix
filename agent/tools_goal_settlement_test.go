@@ -88,7 +88,7 @@ func TestFinancialGoalSettlementRejectsTextEvidence(t *testing.T) {
 					tool, input = tools.goalMet(), `{"reason":"分析已完成，收益达到 10%"}`
 				}
 				result := callGoalSettlement(t, tool, input)
-				if !result.IsError || !strings.Contains(result.Flatten(), "缺少结构化业务验收，需人工核验") {
+				if !result.IsError || !strings.Contains(result.Flatten(), "须人工验收") {
 					t.Errorf("文本证据不得完成金融目标: IsError=%v result=%s", result.IsError, result.Flatten())
 				}
 				if tools.GoalMet || tools.Reason != "" {
