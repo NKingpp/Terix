@@ -32,6 +32,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { api, type ExecLimits, type ExecOrder, errCode } from "@/lib/api";
+import type { ExecAccount, TradeLoopStatus } from "@/lib/types";
 
 import { useExecMode } from "./_components/exec-mode-provider";
 
@@ -156,6 +157,12 @@ export default function ExecPage() {
           </p>
         </CardContent>
       </Card>
+
+      {/* ---- 执行账户 ---- */}
+      <AccountsCard />
+
+      {/* ---- 交易循环状态 ---- */}
+      <LoopStatusCard />
 
       {/* ---- 限额 ---- */}
       <LimitsCard
@@ -355,4 +362,191 @@ function toastText(code: string): string {
     default:
       return code;
   }
+}
+
+// ---- 执行账户卡片 ----
+//
+// 执行账户是「服务可以对哪个真实账户下单」的唯一声明，必须人工创建：
+// 不给 uid 时后端会用当前 OKX 凭证探测一次（拿不到 uid 说明凭证有问题，
+// 此时建档只会造出一个「看起来能用但下不了单」的账户）。
+function AccountsCard() {
+  const [accounts, setAccounts] = React.useState<ExecAccount[]>([]);
+  const [label, setLabel] = React.useState("");
+  const [uid, setUid] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState("");
+
+  const load = React.useCallback(async () => {
+    try {
+      const resp = await api.execAccounts();
+      setAccounts(resp.accounts);
+    } catch {
+      // 忽略：瞬时错误，下次轮询重试
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void load();
+    const t = setInterval(() => void load(), 10000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  async function create() {
+    if (!label.trim()) {
+      setErr("请填写账户标签");
+      return;
+    }
+    setBusy(true);
+    setErr("");
+    try {
+      await api.createExecAccount({ label: label.trim(), channelAccountId: uid.trim() || undefined });
+      setLabel("");
+      setUid("");
+      await load();
+      toast.success("执行账户已创建");
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggle(a: ExecAccount) {
+    try {
+      await api.patchExecAccount(a.id, { active: !a.active });
+      await load();
+    } catch (e) {
+      toast.error((e as Error).message);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>执行账户</CardTitle>
+        <CardDescription>
+          交易循环只对这里启用的 OKX 账户下单。paper-auto 账户是纸面占位，不会被使用。
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="flex flex-wrap items-end gap-2">
+          <div className="flex flex-col gap-1">
+            <Label className="text-xs">账户标签</Label>
+            <Input className="h-8 w-40" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="如 okx-main" />
+          </div>
+          <div className="flex flex-col gap-1">
+            <Label className="text-xs">OKX uid（留空自动探测）</Label>
+            <Input className="h-8 w-48" value={uid} onChange={(e) => setUid(e.target.value)} placeholder="留空则用凭证探测" />
+          </div>
+          <Button size="sm" disabled={busy} onClick={() => void create()}>
+            创建
+          </Button>
+          {err && <span className="text-xs text-red-500">{err}</span>}
+        </div>
+        {accounts.length === 0 ? (
+          <p className="text-sm text-muted-foreground">还没有执行账户。实盘下单前必须先创建一个。</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b text-left text-muted-foreground">
+                  <th className="py-2 pr-3 font-medium">#</th>
+                  <th className="py-2 pr-3 font-medium">标签</th>
+                  <th className="py-2 pr-3 font-medium">uid</th>
+                  <th className="py-2 pr-3 font-medium">市场</th>
+                  <th className="py-2 pr-3 font-medium">仓位模式</th>
+                  <th className="py-2 pr-3 font-medium">杠杆</th>
+                  <th className="py-2 pr-3 font-medium">跟踪持仓</th>
+                  <th className="py-2 font-medium">状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                {accounts.map((a) => (
+                  <tr key={a.id} className="border-b last:border-0">
+                    <td className="py-2 pr-3 font-mono text-xs">{a.id}</td>
+                    <td className="py-2 pr-3">{a.label || "—"}</td>
+                    <td className="py-2 pr-3 font-mono text-xs">{a.channel_account_id}</td>
+                    <td className="py-2 pr-3 text-xs">{(a.market_support ?? []).join("/") || a.market}</td>
+                    <td className="py-2 pr-3 text-xs">{a.pos_mode} · {a.mgn_mode}</td>
+                    <td className="py-2 pr-3 font-mono text-xs">{a.lever}x</td>
+                    <td className="py-2 pr-3 font-mono text-xs">{a.open_tracked}</td>
+                    <td className="py-2">
+                      <Button size="sm" variant="outline" className="h-6 px-2 text-xs" onClick={() => void toggle(a)}>
+                        {a.blocked_at ? "已冻结" : a.active ? "启用中" : "已停用"}
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ---- 交易循环状态卡片 ----
+//
+// 这个卡片要回答的是「无人值守到底有没有在跑」：模式、持仓数、
+// 最近一次 tick、最后一个错误。没有它，出问题只能翻容器日志。
+function LoopStatusCard() {
+  const [st, setSt] = React.useState<TradeLoopStatus | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const resp = await api.execLoopStatus();
+        if (!cancelled) setSt(resp);
+      } catch {
+        // 忽略
+      }
+    };
+    void load();
+    const t = setInterval(() => void load(), 10000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, []);
+
+  const running = st?.running ?? false;
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          交易循环
+          <Badge variant={running ? "default" : "outline"}>{running ? "运行中" : "未启用"}</Badge>
+        </CardTitle>
+        <CardDescription>
+          live_auto 模式下每 {st?.interval_sec ?? 15} 秒读持仓、补挂 TP/SL、消费已过闸草案开仓。
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
+        <div>
+          <div className="text-xs text-muted-foreground">当前模式</div>
+          <div className="font-mono text-xs">{st?.mode || "—"}</div>
+        </div>
+        <div>
+          <div className="text-xs text-muted-foreground">交易所持仓</div>
+          <div className="font-mono text-xs">{st?.positions ?? 0}</div>
+        </div>
+        <div>
+          <div className="text-xs text-muted-foreground">跟踪中</div>
+          <div className="font-mono text-xs">{st?.open_tracked ?? 0}</div>
+        </div>
+        <div>
+          <div className="text-xs text-muted-foreground">最近 tick</div>
+          <div className="font-mono text-xs">{st?.last_tick ? new Date(st.last_tick).toLocaleTimeString("zh-CN") : "—"}</div>
+        </div>
+        {st?.last_error && (
+          <div className="col-span-2 md:col-span-4">
+            <div className="text-xs text-muted-foreground">最后错误</div>
+            <div className="text-xs text-red-500 break-words">{st.last_error}</div>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
 }

@@ -401,6 +401,183 @@ func (s *ExplorationStore) ProveGoal(goalID, evidenceID int64) error {
 	return tx.Commit()
 }
 
+// GoalAcceptance 是目标的人工验收口径，存在 goal payload 的 "acceptance" 键里。
+// 不入表：口径随目标一起被 PATCH 撤销、随节点导出，省一次 schema 迁移。
+type GoalAcceptance struct {
+	Kind         string   `json:"kind"`                // pnl_ge|flat|signal_exists|rating_in
+	Source       string   `json:"source,omitempty"`    // ledger|evidence；空 = 自动
+	Mode         string   `json:"mode,omitempty"`      // paper|live；空 = 按 exec_mode 推断
+	Threshold    string   `json:"threshold,omitempty"` // 十进制字面量，仅 pnl_ge
+	InstrumentID int64    `json:"instrument_id,omitempty"`
+	Ratings      []string `json:"ratings,omitempty"` // 仅 rating_in
+}
+
+// Normalize 填默认值并校验枚举；空 Acceptance 视为 flat。
+func (a *GoalAcceptance) Normalize() error {
+	if a.Kind == "" {
+		a.Kind = "flat"
+	}
+	switch a.Kind {
+	case "flat", "signal_exists", "rating_in", "pnl_ge":
+	default:
+		return fmt.Errorf("未知验收类型: %s", a.Kind)
+	}
+	switch a.Source {
+	case "", "ledger", "evidence":
+	default:
+		return fmt.Errorf("未知验收来源: %s", a.Source)
+	}
+	switch a.Mode {
+	case "", "paper", "live":
+	default:
+		return fmt.Errorf("未知验收模式: %s", a.Mode)
+	}
+	if a.Kind == "pnl_ge" {
+		if _, err := ParseDecimal(a.Threshold); err != nil {
+			return fmt.Errorf("验收阈值非法: %s", a.Threshold)
+		}
+	}
+	return nil
+}
+
+type GoalAcceptResult struct {
+	Changed   bool
+	Previous  string
+	Goal      *Node
+	Effective GoalAcceptance
+}
+
+// AcceptGoalWithAudit 是「人工验收」把目标置 met 的唯一入口（agent 工具在金融域被
+// 硬拦截，服务端此前没有任何写 met 的路径，于是金融任务永不收敛）。
+//
+// 与 ProveGoal 的差别：evidenceID 可为 0（人工验收不强制引用证据节点）；置 met 时写
+// completed_at；写一条 activity(kind='goal_accepted') 审计。已是 met 时幂等返回
+// Changed=false 且不写任何行。
+func (s *ExplorationStore) AcceptGoalWithAudit(goalID int64, reason string, evidenceID int64, acc *GoalAcceptance, observation map[string]string) (GoalAcceptResult, error) {
+	var out GoalAcceptResult
+	tx, err := s.db.Begin()
+	if err != nil {
+		return out, err
+	}
+	defer tx.Rollback()
+
+	var oldRaw []byte
+	var state string
+	if err := tx.QueryRow(`SELECT payload, state FROM exploration_nodes
+		WHERE id=$1 AND exploration_id=$2 AND kind='goal'`, goalID, s.expID).Scan(&oldRaw, &state); err != nil {
+		if err == sql.ErrNoRows {
+			return out, fmt.Errorf("目标不存在: %w", err)
+		}
+		return out, err
+	}
+	out.Previous = state
+	if state == "met" {
+		return out, nil // 幂等：零写
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(oldRaw, &payload); err != nil {
+		return out, err
+	}
+	if payload == nil {
+		return out, fmt.Errorf("目标 payload 不是对象")
+	}
+	var existing GoalAcceptance
+	existingRaw, hasExisting := payload["acceptance"]
+	if hasExisting {
+		if err := json.Unmarshal(existingRaw, &existing); err != nil {
+			return out, fmt.Errorf("目标验收口径损坏: %w", err)
+		}
+	}
+	payloadRaw := oldRaw
+	switch {
+	case hasExisting && acc != nil:
+		return out, fmt.Errorf("该目标已配置验收口径，不允许在验收时改写")
+	case hasExisting:
+		out.Effective = existing
+	case acc != nil:
+		if err := acc.Normalize(); err != nil {
+			return out, err
+		}
+		out.Effective = *acc
+		b, err := json.Marshal(acc)
+		if err != nil {
+			return out, err
+		}
+		payload["acceptance"] = b
+		if payloadRaw, err = json.Marshal(payload); err != nil {
+			return out, err
+		}
+	default:
+		// 老目标没有验收口径：退化为「必须平仓 + 必须附证据」，阈值类口径不猜。
+		out.Effective = GoalAcceptance{Kind: "flat", Source: "evidence"}
+		if evidenceID <= 0 {
+			return out, fmt.Errorf("目标未配置验收口径，需附证据")
+		}
+	}
+
+	if evidenceID > 0 {
+		var id int64
+		if err := tx.QueryRow(`SELECT evidence.id FROM exploration_nodes evidence
+			WHERE evidence.id=$1 AND evidence.kind IN ('fact','finding')
+			AND (evidence.exploration_id=$2 OR EXISTS (
+				SELECT 1 FROM tasks owner
+				JOIN task_relations relation ON relation.task_id=owner.id
+				JOIN tasks source ON source.id=relation.source_task_id AND source.deleted_at IS NULL
+				WHERE owner.exploration_id=$2 AND owner.deleted_at IS NULL
+				AND source.exploration_id=evidence.exploration_id))`, evidenceID, s.expID).Scan(&id); err != nil {
+			return out, fmt.Errorf("证据必须是本任务或直接来源的事实/发现: %w", err)
+		}
+		if _, err := tx.Exec(`INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id)
+			VALUES ($1,$2,'proves',$3) ON CONFLICT (exploration_id,src_id,rel,dst_id) DO NOTHING`, s.expID, evidenceID, goalID); err != nil {
+			return out, err
+		}
+	}
+
+	res, err := tx.Exec(`UPDATE exploration_nodes SET payload=$1, state='met', completed_at=now(),
+		blocked_reason=NULL, content_version=content_version+1
+		WHERE id=$2 AND exploration_id=$3 AND kind='goal' AND state='open'`, string(payloadRaw), goalID, s.expID)
+	if err != nil {
+		return out, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return out, nil // 并发已被置 met，本条不写审计
+	}
+
+	meta := map[string]any{
+		"actor": "human", "source": "goals_api", "subject": "anonymous_shared", "goal_id": goalID,
+		"reason": reason, "previous_state": state, "observation": observation,
+		"acceptance": out.Effective, "evidence_id": evidenceID,
+	}
+	metadata, err := json.Marshal(meta)
+	if err != nil {
+		return out, err
+	}
+	if _, err := tx.Exec(`INSERT INTO activity(exploration_id, node_id, worker, kind, summary, metadata)
+		VALUES ($1,$2,'human','goal_accepted',$3,$4)`, s.expID, goalID, "人工验收通过："+reason, string(metadata)); err != nil {
+		return out, err
+	}
+	if err := tx.Commit(); err != nil {
+		return out, err
+	}
+	out.Changed = true
+	out.Goal, _ = s.GetNode(goalID)
+	return out, nil
+}
+
+// GoalCounts 汇总本探索的目标数（total / met）。
+func (s *ExplorationStore) GoalCounts() (GoalCounts, error) {
+	var gc GoalCounts
+	err := s.db.QueryRow(`SELECT COUNT(*), COUNT(*) FILTER (WHERE state='met')
+		FROM exploration_nodes WHERE exploration_id=$1 AND kind='goal'`, s.expID).Scan(&gc.Total, &gc.Met)
+	return gc, err
+}
+
+// AllGoalsMet 报告目标是否全部达成（无目标时为 false）。
+func (s *ExplorationStore) AllGoalsMet() (bool, error) {
+	gc, err := s.GoalCounts()
+	return gc.Total > 0 && gc.Met == gc.Total, err
+}
+
 // UpdateGoalPayload 保留旧调用签名；目标变更与审计在同一事务提交。
 func (s *ExplorationStore) UpdateGoalPayload(id int64, text, vulnclass string) error {
 	_, err := s.UpdateGoalPayloadWithAudit(id, text, vulnclass)

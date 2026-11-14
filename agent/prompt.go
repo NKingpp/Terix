@@ -239,6 +239,20 @@ type TraderVars struct {
 	//
 	// 0 表示无限制（非 OKX 通道或未配置）。
 	MinOrderAmount float64
+
+	// PositionsJSON 是当前持仓快照（JSON 数组）。
+	//
+	// # 为什么必须注入
+	//
+	// 平仓需要知道「现在有什么仓、多少、什么方向」。没有它，trader 只能
+	// 从 planner 的意图正文里读手算数字 —— 那正是任务 19 里「QQQ 2.37 张」
+	// 这类参数的来源，一旦持仓变动就全错。
+	//
+	// 空表示「没有持仓」或「读不到」（provider 未注入 / 交易所不可达）。
+	// prompt 里必须区分这两种，不然后者会被误判成「不用平仓」。
+	PositionsJSON string
+	// PositionsErr 非空表示读取持仓失败（≠ 无持仓）。
+	PositionsErr string
 }
 
 // RiskVars 是三方风控共用的变量。

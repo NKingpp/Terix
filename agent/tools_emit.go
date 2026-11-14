@@ -532,9 +532,18 @@ func (t *ToolSet) emitSignal() actool.CoreTool {
 			if store == nil {
 				return actool.Errorf("无法写入信号：DB 未初始化"), nil
 			}
+			// node_id 必须写：engine 的 trader 产出契约按
+			// signals.node_id = intentID 核验（server/engine.go:1031）。
+			// 不写的话 trader 意图永远判 blocked —— 哪怕真下了单。
+			var nodeIDPtr *int64
+			if ri.IntentID > 0 {
+				id := ri.IntentID
+				nodeIDPtr = &id
+			}
 			id, err := store.Signals().InsertSignal(db.SignalInput{
 				TaskID:       taskID,
 				InstrumentID: &instID,
+				NodeID:       nodeIDPtr,
 				SignalType:   st,
 				Action:       act,
 				Direction:    dir,
@@ -545,7 +554,28 @@ func (t *ToolSet) emitSignal() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(fmt.Sprintf("写入 signal 失败: %v", err)), nil
 			}
-			return jsonResult(map[string]any{"signal_id": id, "signal_type": st, "action": act, "direction": dir, "role": role})
+
+			// 再落一个 signal 节点 + yields 边：风控与组合经理读的
+			// TraderProposalJSON（agent/role_vars.go 的 siblingOutput）走的正是
+			// 这条边。缺了它，下游永远看到「（上游尚未产出）」。
+			//
+			// 失败不阻断：signal 已落库，节点是冗余视图；但要在返回里说明，
+			// 否则「为什么下游看不见提案」又要从头查一遍。
+			res := map[string]any{"signal_id": id, "signal_type": st, "action": act, "direction": dir, "role": role}
+			if ri.IntentID > 0 {
+				if nid, nErr := t.ts.AddNodeWithYield(db.KindSignal, map[string]any{
+					"role": role, "instrument_id": instID, "signal_id": id,
+					"action": act, "direction": dir,
+					"confidence": strconv.FormatFloat(a.Confidence, 'f', 4, 64),
+					"horizon":    strings.TrimSpace(a.Horizon),
+					"rationale":  maskString(rationale),
+				}, 0, "open", "worker", nil, ri.IntentID); nErr != nil {
+					res["node_warning"] = "signal 已落库，但登记 signal 节点失败: " + nErr.Error()
+				} else {
+					res["node_id"] = nid
+				}
+			}
+			return jsonResult(res)
 		},
 	)
 }

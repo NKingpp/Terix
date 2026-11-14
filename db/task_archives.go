@@ -608,7 +608,6 @@ func archiveRowJSON(rows archiveRowScanner) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-
 // looksLikeJSONValue 判断字符串是否是「应以 JSON 形态内嵌」的复合值。
 //
 // 只认以 { 或 [ 开头的合法 JSON —— 这两个字符能把「JSON 对象/数组」与

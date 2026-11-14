@@ -24,6 +24,7 @@ import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Progress } from "@/components/ui/progress";
@@ -34,6 +35,7 @@ import type {
   AssetInterceptKind,
   AssetInterceptRule,
   Finding,
+  GoalAcceptanceKind,
   ModelTokenStat,
   Stats,
   Task,
@@ -167,6 +169,18 @@ export function OverviewTab({ taskId }: { taskId: string }) {
   const [editingGoalId, setEditingGoalId] = React.useState<string | null>(null);
   const [editText, setEditText] = React.useState("");
   const [editVuln, setEditVuln] = React.useState("");
+  // 人工验收弹窗：目标 + 理由(必填) + 证据 fact(可选) + 补填验收口径。
+  const [acceptTarget, setAcceptTarget] = React.useState<TaskGoal | null>(null);
+  const [acceptReason, setAcceptReason] = React.useState("");
+  const [acceptEvidence, setAcceptEvidence] = React.useState("");
+  const [acceptKind, setAcceptKind] = React.useState<GoalAcceptanceKind>("flat");
+  const [acceptSource, setAcceptSource] = React.useState<"auto" | "ledger" | "evidence">("auto");
+  const [acceptMode, setAcceptMode] = React.useState<"auto" | "paper" | "live">("auto");
+  const [acceptThreshold, setAcceptThreshold] = React.useState("");
+  const [acceptBusy, setAcceptBusy] = React.useState(false);
+  const [acceptErr, setAcceptErr] = React.useState("");
+  // 核验未通过时服务端回显的实测值（持仓/盈亏/信号数），失败后留在弹窗里给人工看。
+  const [acceptObserved, setAcceptObserved] = React.useState<Record<string, string> | null>(null);
   // 约束管理：约束列表 + 新增表单 + 行内编辑状态。
   const [constraints, setConstraints] = React.useState<TaskConstraint[]>([]);
   const [conText, setConText] = React.useState("");
@@ -255,6 +269,55 @@ export function OverviewTab({ taskId }: { taskId: string }) {
       await api.deleteGoal(taskId, g.id);
     } catch {
       await loadGoals(); // 删除失败：重新拉取还原
+    }
+  };
+
+  const startAcceptGoal = (g: TaskGoal) => {
+    setAcceptTarget(g);
+    setAcceptReason("");
+    setAcceptEvidence("");
+    setAcceptErr("");
+    setAcceptObserved(null);
+    setAcceptKind(g.acceptance?.kind ?? "flat");
+    setAcceptSource((g.acceptance?.source as "ledger" | "evidence" | undefined) ?? "auto");
+    setAcceptMode((g.acceptance?.mode as "paper" | "live" | undefined) ?? "auto");
+    setAcceptThreshold(g.acceptance?.threshold ?? "");
+  };
+
+  const submitAcceptGoal = async () => {
+    const g = acceptTarget;
+    if (!g) return;
+    const reason = acceptReason.trim();
+    if (!reason) {
+      setAcceptErr("验收理由必填");
+      return;
+    }
+    setAcceptBusy(true);
+    setAcceptErr("");
+    setAcceptObserved(null);
+    const evidence = Number.parseInt(acceptEvidence.trim(), 10);
+    try {
+      await api.acceptGoal(taskId, g.id, {
+        reason,
+        evidence_id: Number.isFinite(evidence) && evidence > 0 ? evidence : undefined,
+        // 目标已配置口径时不允许在验收时改写（后端也会拒），所以只有缺口径时才带。
+        acceptance: g.acceptance
+          ? undefined
+          : {
+              kind: acceptKind,
+              source: acceptSource === "auto" ? undefined : acceptSource,
+              mode: acceptMode === "auto" ? undefined : acceptMode,
+              threshold: acceptKind === "pnl_ge" ? acceptThreshold.trim() : undefined,
+            },
+      });
+      setAcceptTarget(null);
+      await loadGoals();
+    } catch (e) {
+      setAcceptErr(e instanceof Error ? e.message : "验收失败");
+      const observed = (e as { observed?: Record<string, string> | null }).observed;
+      setAcceptObserved(observed ?? null);
+    } finally {
+      setAcceptBusy(false);
     }
   };
 
@@ -572,10 +635,28 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                   <div key={g.id} className="flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-sm">
                     <StatusBadge domain="goal" value={g.state} />
                     <span className="min-w-0 flex-1 break-words">{g.text}</span>
+                    {g.state === "met" && (g.completed_at || g.accepted_by) && (
+                      <span className="text-muted-foreground shrink-0 text-xs">
+                        {g.completed_at ? new Date(g.completed_at).toLocaleString("zh-CN") : ""}
+                        {g.accepted_by ? ` · ${g.accepted_by}` : ""}
+                      </span>
+                    )}
                     {g.vulnclass && (
                       <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-xs">
                         {g.vulnclass}
                       </span>
+                    )}
+                    {g.state === "open" && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-6 shrink-0 px-1.5 text-xs"
+                        disabled={goalBusy}
+                        onClick={() => startAcceptGoal(g)}
+                        title="人工验收：服务端先跑机器核验，通过后置为已达成"
+                      >
+                        <ShieldCheckIcon className="size-3.5" /> 验收
+                      </Button>
                     )}
                     <Button
                       size="sm"
@@ -604,6 +685,112 @@ export function OverviewTab({ taskId }: { taskId: string }) {
           )}
         </CardContent>
       </Card>
+      {/* 人工验收弹窗：金融任务的唯一收敛路径（agent 侧 prove_goal 在金融域被硬拦截）。
+          服务端先跑机器核验，不通过则 409 + 实测值，这里原样展示，不关窗。 */}
+      <Dialog open={!!acceptTarget} onOpenChange={(open) => { if (!open) setAcceptTarget(null); }}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>人工验收目标</DialogTitle>
+            <DialogDescription>
+              服务端先按验收口径实测本任务：平台账本有本任务成交时核「已平仓 + 已实现盈亏 ≥ 阈值」；
+              账本无成交（实盘走外部通道）时必须附结算证据事实，数值由人负责。核验不通过不会写入任何状态。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-3 text-sm">
+            <p className="bg-muted/50 rounded-md px-2 py-1.5 text-xs break-words">{acceptTarget?.text}</p>
+            <label className="flex flex-col gap-1">
+              <span className="text-muted-foreground text-xs">验收理由（必填，写入审计）</span>
+              <Input
+                value={acceptReason}
+                onChange={(e) => setAcceptReason(e.target.value)}
+                placeholder="例：QQQ round-trip 净 +11.004 ≥ 10，持仓已平，已结算"
+                disabled={acceptBusy}
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-muted-foreground text-xs">
+                结算证据事实 id（可选{acceptTarget && !acceptTarget.acceptance ? "；目标未配置口径时必填" : ""}）
+              </span>
+              <Input
+                value={acceptEvidence}
+                onChange={(e) => setAcceptEvidence(e.target.value)}
+                placeholder="事实节点 id，如 2426"
+                disabled={acceptBusy}
+              />
+            </label>
+            {acceptTarget && !acceptTarget.acceptance && (
+              <div className="flex flex-col gap-2 rounded-md border p-2">
+                <span className="text-muted-foreground text-xs">
+                  该目标还没有验收口径，本次补填并写入目标（之后不允许在验收时改写）
+                </span>
+                <div className="flex flex-wrap items-center gap-2">
+                  <NativeSelect
+                    size="sm"
+                    value={acceptKind}
+                    onChange={(e) => setAcceptKind(e.target.value as GoalAcceptanceKind)}
+                    disabled={acceptBusy}
+                  >
+                    <NativeSelectOption value="flat">仅要求已平仓</NativeSelectOption>
+                    <NativeSelectOption value="pnl_ge">已实现盈亏 ≥ 阈值</NativeSelectOption>
+                    <NativeSelectOption value="signal_exists">存在交易信号</NativeSelectOption>
+                    <NativeSelectOption value="rating_in">存在评级</NativeSelectOption>
+                  </NativeSelect>
+                  <NativeSelect
+                    size="sm"
+                    value={acceptSource}
+                    onChange={(e) => setAcceptSource(e.target.value as "auto" | "ledger" | "evidence")}
+                    disabled={acceptBusy}
+                  >
+                    <NativeSelectOption value="auto">核验源:自动</NativeSelectOption>
+                    <NativeSelectOption value="ledger">核验源:平台账本</NativeSelectOption>
+                    <NativeSelectOption value="evidence">核验源:外部证据</NativeSelectOption>
+                  </NativeSelect>
+                  <NativeSelect
+                    size="sm"
+                    value={acceptMode}
+                    onChange={(e) => setAcceptMode(e.target.value as "auto" | "paper" | "live")}
+                    disabled={acceptBusy}
+                  >
+                    <NativeSelectOption value="auto">账本:按执行模式</NativeSelectOption>
+                    <NativeSelectOption value="paper">账本:paper</NativeSelectOption>
+                    <NativeSelectOption value="live">账本:live</NativeSelectOption>
+                  </NativeSelect>
+                  {acceptKind === "pnl_ge" && (
+                    <Input
+                      className="h-7 w-28 text-sm"
+                      placeholder="阈值，如 10"
+                      value={acceptThreshold}
+                      onChange={(e) => setAcceptThreshold(e.target.value)}
+                      disabled={acceptBusy}
+                    />
+                  )}
+                </div>
+              </div>
+            )}
+            {acceptErr && <p className="text-xs text-red-500">{acceptErr}</p>}
+            {acceptObserved && Object.keys(acceptObserved).length > 0 && (
+              <div className="rounded-md border border-red-200 bg-red-50 p-2 text-xs text-red-700">
+                <div className="mb-1 font-medium">服务端实测值（核验未通过）</div>
+                <div className="grid grid-cols-2 gap-x-3 gap-y-0.5">
+                  {Object.entries(acceptObserved).map(([k, v]) => (
+                    <span key={k} className="truncate" title={`${k}: ${v}`}>
+                      {k}: {v}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button size="sm" variant="ghost" onClick={() => setAcceptTarget(null)} disabled={acceptBusy}>
+              取消
+            </Button>
+            <Button size="sm" onClick={() => void submitAcceptGoal()} disabled={acceptBusy || !acceptReason.trim()}>
+              {acceptBusy ? "核验中…" : "核验并验收"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       {/* 操作约束管理：allow=允许 / deny=禁止。约束会在下一轮规划时注入 planner/worker 的系统
           提示以框定探索边界（注入范围可在 系统设置 里按 planner/worker 开关）。改动不即时打断，
           下一轮规划自然读到。 */}

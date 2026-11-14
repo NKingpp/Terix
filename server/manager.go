@@ -237,8 +237,8 @@ type Manager struct {
 	// SQLite 的入队时刻只到毫秒，同毫秒的两次入队会拿到相同纳秒值，
 	// 让「先入队先准入」失去判据。这个字段把相等的情况抬成 +1 纳秒。
 	lastQueuedAtNS int64
-	active      string
-	llmRecOn    bool // LLM 录制开关（默认关；settings.llm_record）
+	active         string
+	llmRecOn       bool // LLM 录制开关（默认关；settings.llm_record）
 	// 联网搜索开关与来源（默认关；settings.web_search_*）。brave-free 需要 braveKey；tavily 需要 tavilyKey。
 	// webSearchProxy 是独立出口代理(http/https/socks5)，与记录流量的 MITM 代理无关。
 	webSearchOn      bool
@@ -1273,7 +1273,6 @@ func (m *Manager) EnqueueTask(id, mode string) error {
 	m.mu.Unlock()
 	return nil
 }
-
 
 // monotonicQueuedAtLocked 把 DB 里的入队时刻换成「不同任务之间严格递增」的纳秒值。
 //

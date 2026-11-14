@@ -736,6 +736,47 @@ export default function DashboardPage() {
             </span>
           </CardContent>
         </Card>
+
+        {/* 实盘盈亏：与纸面分开呈现。
+            ⚠️ 两边的钱不是一回事 —— 合并会得出「模拟赚 50 + 实盘亏 30 = 赚 20」，
+            那个数字没有任何决策含义。实盘口径含手续费（交易所返回负值）。 */}
+        <Card className="gap-1">
+          <CardHeader className="pb-0">
+            <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+              <CoinsIcon className="size-3" /> 实盘盈亏
+            </div>
+            <div className="text-2xl font-semibold tabular-nums">
+              {!summary ? (
+                "—"
+              ) : summary.pnl.live_fills === 0 ? (
+                <span className="text-muted-foreground text-base font-normal">无成交</span>
+              ) : (
+                <span className={cn("tabular-nums", pnlColor(summary.pnl.live_realized_pnl))}>
+                  {formatPnl(summary.pnl.live_realized_pnl)}
+                </span>
+              )}
+            </div>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-0.5 text-[10px]">
+            {summary && summary.pnl.live_fills > 0 && (
+              <>
+                <div className="flex justify-between gap-2">
+                  <span className="text-muted-foreground">手续费</span>
+                  <span className="tabular-nums">{formatPnl(summary.pnl.live_fee_total)}</span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-muted-foreground">成交笔数</span>
+                  <span className="tabular-nums">{summary.pnl.live_fills}</span>
+                </div>
+              </>
+            )}
+            <span className="text-muted-foreground leading-snug">
+              {summary?.pnl.live_fills === 0
+                ? "还没有实盘成交。成交每 60 秒从交易所同步一次"
+                : "已实现盈亏（含手续费），浮动部分见任务详情"}
+            </span>
+          </CardContent>
+        </Card>
       </div>
 
       {/* 全空引导：后端说「为什么空」（ratings.note），这里说「怎么办」。

@@ -29,9 +29,7 @@ RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@late
     && playwright-cli --help \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
-WORKDIR /app
-# 预编译好的对应架构二进制（dist/amd64/artex 或 dist/arm64/artex）
-COPY dist/${TARGETARCH}/artex /app/artex
+
 
 # 内置 akshare sidecar（与 artex 同一个容器）。
 #
@@ -47,7 +45,25 @@ COPY dist/${TARGETARCH}/artex /app/artex
 # 基础镜像本来就是 python:3.12-slim-bookworm（sidecar 也是），不额外增重。
 # 代价是镜像变大（pandas/numpy 约 150MB）且升级 artex 时依赖层走缓存，不重装。
 COPY sidecars/akshare/requirements.txt /app/akshare/requirements.txt
-RUN pip install --no-cache-dir -r /app/akshare/requirements.txt
+# pip index 可覆盖：默认走清华镜像。
+#
+# # 为什么默认不用 pypi.org（2026-11-14）
+#
+# 部署环境（NAS）在 docker build 网络下访问 pypi.org 会 read timeout，
+# 重试 4 次后整个镜像构建失败 —— 而这次失败发生在「换二进制」时，
+# 看起来像部署脚本坏了，实际是依赖层被无谓地重跑。
+#
+# 镜像源只是**获取渠道**，包内容与校验仍由 pip 的 hash/pin 保证，
+# 所以要换源时用 --build-arg PIP_INDEX_URL=https://pypi.org/simple 即可。
+#
+# 实测（2026-11-14，NAS）：
+#   - pypi.org 索引可达，但 wheel CDN `files.pythonhosted.org` 读超时 → 装不上
+#   - 清华镜像对某些 wheel 路径返 403
+#   - aliyun 镜像可用（实测 pip download akshare==1.19.3 成功）
+# 要换源用 --build-arg PIP_INDEX_URL=... 覆盖。
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+RUN pip install --no-cache-dir --timeout 90 --retries 10 \
+      -i ${PIP_INDEX_URL} -r /app/akshare/requirements.txt
 COPY sidecars/akshare/server.py /app/akshare/server.py
 
 # 守护启动脚本：进程退出后按退出码决定是否重新拉起，页面一键更新靠它完成换装。
@@ -55,6 +71,19 @@ COPY sidecars/akshare/server.py /app/akshare/server.py
 # 不转发的话 artex 收不到、做不了优雅关闭，10 秒后被 SIGKILL 硬杀。
 # 现在它还负责拉起 akshare sidecar 并在退出时一并回收。
 COPY start.sh /app/start.sh
+
+# 预编译好的对应架构二进制（dist/amd64/artex 或 dist/arm64/artex）。
+#
+# ⚠️ 这一行必须放在**所有需要联网的层之后**（下面的 akshare pip、okx CLI），
+# 因为它每次部署都会变。Docker 的层缓存按「前面所有层的内容」判定 ——
+# 把高频变动的产物放最后，pip/apt/npm 那些依赖层才能稳定命中缓存。
+#
+# # 2026-11-14 部署事故
+#
+# 原来这行在 pip install 之前，于是**每换一次二进制就重跑一次 pip install**。
+# NAS 访问 pypi.org 会读超时（重试 4 次后失败），一次构建直接失败，
+# 部署卡住，只能 docker cp 手工塞二进制绕过。
+COPY dist/${TARGETARCH}/artex /app/artex
 RUN chmod +x /app/artex /app/start.sh
 COPY skills/ /app/skills/
 

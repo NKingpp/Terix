@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -113,7 +114,7 @@ func TestFinancialGoalSettlementRequiresManualVerification(t *testing.T) {
 	}
 
 	out, isErr := callWithCtx(t, ts.proveGoal(), context.Background(), map[string]any{"goal_id": goalID, "evidence_id": factID, "reason": "收益为正"})
-	if !isErr || !strings.Contains(out, "缺少结构化业务验收，需人工核验") {
+	if !isErr || !strings.Contains(out, "须人工验收") {
 		t.Fatalf("金融目标应拒绝自动验收并要求人工核验，isErr=%v output=%q", isErr, out)
 	}
 	goal, err := ts.ts.GetNode(goalID)
@@ -122,7 +123,7 @@ func TestFinancialGoalSettlementRequiresManualVerification(t *testing.T) {
 	}
 
 	out, isErr = callWithCtx(t, ts.goalMet(), context.Background(), map[string]any{"reason": "完成"})
-	if !isErr || !strings.Contains(out, "缺少结构化业务验收，需人工核验") || ts.GoalMet {
+	if !isErr || !strings.Contains(out, "须人工验收") || ts.GoalMet {
 		t.Fatalf("金融 goal_met 应拒绝自动完成，isErr=%v GoalMet=%v output=%q", isErr, ts.GoalMet, out)
 	}
 }
@@ -938,5 +939,51 @@ func TestEmitRatingLiteralReviewStillRequiresReasons(t *testing.T) {
 	}
 	if !strings.Contains(out, "review_reasons") {
 		t.Errorf("错误信息应指明 review_reasons: %s", out)
+	}
+}
+
+// emit_signal 必须把 intentID 写进 signals.node_id，并落一个 signal 节点 +
+// yields 边。缺前者 trader 意图永远判 blocked（engine 契约按 node_id 核验）；
+// 缺后者风控/PM 读到的 TraderProposal 永远是「上游尚未产出」。
+func TestEmitSignalWritesNodeIDAndSignalNode(t *testing.T) {
+	ts := newEmitTestSet(t)
+	tool := findTool(t, ts, "emit_signal")
+	instID := upsertTestInstrument(t, ts.ts.DB(), db.InstrumentInput{Symbol: "SIG-NODE", Market: "us", AssetClass: "stock"})
+	intentID := mkIntent(t, ts.ts, "trader")
+
+	out, isErr := callWithCtx(t, tool, ctxWithIntent(1, intentID), map[string]any{
+		"instrument_id": instID, "signal_type": "technical", "action": "entry",
+		"direction": "long", "confidence": 0.7, "rationale": "验证 node_id 落库",
+	})
+	if isErr {
+		t.Fatalf("emit_signal 失败: %s", out)
+	}
+	var res struct {
+		SignalID int64 `json:"signal_id"`
+		NodeID   int64 `json:"node_id"`
+	}
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("解析返回: %v (%s)", err, out)
+	}
+	if res.SignalID <= 0 || res.NodeID <= 0 {
+		t.Fatalf("应同时返回 signal_id 与 node_id，得到 %+v", res)
+	}
+
+	var nodeID sql.NullInt64
+	if err := ts.ts.DB().QueryRow(`SELECT node_id FROM signals WHERE id=$1`, res.SignalID).Scan(&nodeID); err != nil {
+		t.Fatal(err)
+	}
+	if !nodeID.Valid || nodeID.Int64 != intentID {
+		t.Fatalf("signals.node_id 应等于 intentID=%d，得到 %+v", intentID, nodeID)
+	}
+
+	var edges int
+	if err := ts.ts.DB().QueryRow(`SELECT COUNT(*) FROM exploration_edges
+WHERE exploration_id=$1 AND rel='yields' AND src_id=$2 AND dst_id=$3`,
+		ts.ts.ID(), intentID, res.NodeID).Scan(&edges); err != nil {
+		t.Fatal(err)
+	}
+	if edges != 1 {
+		t.Fatalf("应有一条 intent→signal 的 yields 边，实际 %d", edges)
 	}
 }

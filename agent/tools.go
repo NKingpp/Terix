@@ -1510,7 +1510,7 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			if financial, err := t.goalSettlementFinancial(); err != nil {
 				return actool.Errorf("无法核验任务标的，拒绝自动验收: " + err.Error()), nil
 			} else if financial {
-				return actool.Errorf("缺少结构化业务验收，需人工核验"), nil
+				return actool.Errorf("金融目标须人工验收：请在任务详情『目标管理』卡片点『验收』"), nil
 			}
 			goalNode, err := t.ts.GetNode(goal)
 			if err != nil || goalNode == nil || goalNode.Kind != db.KindGoal {
@@ -1543,7 +1543,7 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 			if financial, err := t.goalSettlementFinancial(); err != nil {
 				return actool.Errorf("无法核验任务标的，拒绝自动验收: " + err.Error()), nil
 			} else if financial {
-				return actool.Errorf("缺少结构化业务验收，需人工核验"), nil
+				return actool.Errorf("金融目标须人工验收：请在任务详情『目标管理』卡片点『验收』"), nil
 			}
 			if t.ts == nil {
 				return actool.Errorf("无法核验目标状态，拒绝自动验收"), nil
@@ -1569,9 +1569,8 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 }
 
 func (t *ToolSet) goalSettlementCounts() (total, unmet int, err error) {
-	err = t.ts.DB().QueryRow(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN state='met' THEN 0 ELSE 1 END),0)
-		FROM exploration_nodes WHERE exploration_id=$1 AND kind=$2`, t.ts.ID(), db.KindGoal).Scan(&total, &unmet)
-	return
+	gc, err := t.ts.GoalCounts()
+	return gc.Total, gc.Total - gc.Met, err
 }
 
 // --- worker write tools ---

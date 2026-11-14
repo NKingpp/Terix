@@ -14,6 +14,9 @@ import type {
   AgentTrigger,
   ArchiveBatchItem,
   DashboardSummary,
+  ExecAccount,
+  TaskTrades,
+  TradeLoopStatus,
   Asset,
   AssetInterceptRule,
   AssetInterceptRuleInput,
@@ -87,6 +90,7 @@ import type {
   TaskCategory,
   TaskConstraint,
   TaskGoal,
+  GoalAcceptance,
   TaskLLMResolutions,
   TaskNode,
   TaskScopeRow,
@@ -125,12 +129,15 @@ function getToken(): string | null {
 export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
+  /** 服务端回显的实测值（如机器核验未通过时的持仓/盈亏）。 */
+  readonly observed?: Record<string, string>;
 
-  constructor(message: string, status: number, code?: string) {
+  constructor(message: string, status: number, code?: string, observed?: Record<string, string>) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.observed = observed;
   }
 }
 
@@ -172,8 +179,9 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
     const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
     let message = fallback;
     let code: string | undefined;
+    let observed: Record<string, string> | undefined;
     try {
-      const payload = (await r.json()) as { error?: unknown; code?: unknown };
+      const payload = (await r.json()) as { error?: unknown; code?: unknown; observed?: unknown };
       if (typeof payload.error === "string" && payload.error.trim()) {
         message = payload.error.trim();
       }
@@ -182,10 +190,17 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       if (typeof payload.code === "string" && payload.code.trim()) {
         code = payload.code.trim();
       }
+      // observed 是服务端实测值（目标验核失败时回显），只收 string→string 的键值。
+      if (payload.observed && typeof payload.observed === "object") {
+        const entries = Object.entries(payload.observed as Record<string, unknown>)
+          .filter(([, v]) => typeof v === "string")
+          .map(([k, v]) => [k, v as string]);
+        if (entries.length) observed = Object.fromEntries(entries);
+      }
     } catch {
       // Keep the status-based fallback for empty or non-JSON error responses.
     }
-    throw new ApiError(message, r.status, code);
+    throw new ApiError(message, r.status, code, observed);
   }
   if (r.status === 204) return undefined as T;
   return r.json();
@@ -445,6 +460,17 @@ export const api = {
     patch<TaskGoal>(`/tasks/${id}/goals/${goalId}`, { text, vulnclass: vulnclass ?? "" }),
   // 人工删除目标（硬删除）：通知 planner，删除不复活任务。
   deleteGoal: (id: string, goalId: string) => del<{ ok: boolean }>(`/tasks/${id}/goals/${goalId}`),
+  // 人工验收：服务端先跑机器核验（账本平仓/盈亏阈值 或 外部结算证据），通过后置 met；
+  // 全部目标达成时任务落 done。核验失败抛 ApiError(code=GOAL_ACCEPT_VERIFY_FAILED)，实测值在 observed。
+  acceptGoal: (
+    id: string,
+    goalId: string,
+    body: { reason: string; evidence_id?: number; acceptance?: GoalAcceptance },
+  ) =>
+    post<{ goal: TaskGoal; all_met: boolean; changed: boolean; verification?: Record<string, string> }>(
+      `/tasks/${id}/goals/${goalId}/accept`,
+      body,
+    ),
 
   // ---- 操作约束管理（总览）----
   // 本任务全部操作约束（allow/deny）。
@@ -806,6 +832,12 @@ export const api = {
     ).then((r) => ({ ...r, deliveries: arr(r.deliveries) }));
   },
   notifyRetryDelivery: (id: number) => post<{ ok: boolean }>(`/notify/deliveries/${id}/retry`),
+  // 任务级交易记录：成交明细 + 按标的汇总的已实现盈亏。
+  // 盈亏由后端用 big.Rat 逐笔算（均价×总量算不出手续费），前端只负责展示。
+  taskTrades: (taskId: string) => get<TaskTrades>(`/tasks/${taskId}/trades`),
+  taskTradesSync: (taskId: string) =>
+    post<{ inserted: number; accounts: number; warning?: string }>(`/tasks/${taskId}/trades/sync`, {}),
+
   report: async (task?: string) => {
     if (MOCK) return mockReport(task);
     const token = getToken();
@@ -1301,6 +1333,50 @@ export const api = {
   },
 
   execLimits: () => get<ExecLimits>("/exec/limits"),
+
+  // ---- 执行账户与交易循环 ----
+  //
+  // 执行账户是「这个服务可以对哪个真实账户下单」的唯一声明，只能人工创建：
+  // POST 时若不给 channel_account_id，服务端会用当前 OKX 凭证探测一次 uid。
+  execAccounts: () => get<{ accounts: ExecAccount[] | null }>("/exec/accounts").then((r) => ({ accounts: arr(r.accounts) })),
+
+  createExecAccount: (input: {
+    channel?: string;
+    channelAccountId?: string;
+    label: string;
+    market?: string;
+    marketSupport?: string[];
+  }) =>
+    post<ExecAccount>("/exec/accounts", {
+      channel: input.channel ?? "okx",
+      channel_account_id: input.channelAccountId ?? "",
+      label: input.label,
+      market: input.market ?? "crypto",
+      market_support: input.marketSupport ?? ["crypto", "us"],
+    }),
+
+  patchExecAccount: (
+    id: number,
+    input: {
+      label?: string;
+      marketSupport?: string[];
+      active?: boolean;
+      posMode?: string;
+      mgnMode?: string;
+      lever?: string;
+    },
+  ) =>
+    patch<{ ok: boolean }>(`/exec/accounts/${id}`, {
+      label: input.label,
+      market_support: input.marketSupport,
+      active: input.active,
+      pos_mode: input.posMode,
+      mgn_mode: input.mgnMode,
+      lever: input.lever,
+    }),
+
+  /** 交易循环状态（无人值守 live_auto 的唯一执行者）。 */
+  execLoopStatus: () => get<TradeLoopStatus>("/exec/loop/status"),
 
   setExecLimits: (input: {
     maxSingleAmount: string;

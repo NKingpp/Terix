@@ -396,7 +396,146 @@ export interface ExplorationNodeQuery {
   order?: "asc" | "desc";
 }
 
+// 目标的人工验收口径（存 goal payload.acceptance）。source=ledger 走平台账本实测，
+// source=evidence 表示账本无本任务成交（实盘走外部通道），只核证据节点存在。
+export type GoalAcceptanceKind = "pnl_ge" | "flat" | "signal_exists" | "rating_in";
+export interface GoalAcceptance {
+  kind: GoalAcceptanceKind;
+  source?: "ledger" | "evidence";
+  mode?: "paper" | "live";
+  threshold?: string;
+  instrument_id?: number;
+  ratings?: string[];
+}
+
 // 目标管理卡片用的目标(后端已把 payload 拆成 text/vulnclass)。
+// 一笔成交明细（来自 OKX /trade/fills，落 trade_fills 表）。
+// fee 是负数（支出），计算净盈亏时直接相加。
+export interface TradeFill {
+  id: number;
+  fill_id: string;
+  account_id: number;
+  inst_id: string;
+  side: string;
+  pos_side: string;
+  fill_px: string;
+  fill_sz: string;
+  fee: string;
+  fee_ccy: string;
+  ord_id: string;
+  cl_ord_id: string;
+  draft_id: number;
+  filled_at: string;
+}
+
+// 单个标的的盈亏汇总（后端 big.Rat 逐笔算）。
+export interface TradePnL {
+  pos_side?: string;
+  inst_id: string;
+  realized: string;
+  fee_total: string;
+  net_realized: string;
+  open_qty: string;
+  open_avg_cost?: string;
+  buy_amount: string;
+  sell_amount: string;
+  fill_count: number;
+}
+
+export interface TradeTotals {
+  realized: string;
+  fee_total: string;
+  net_realized: string;
+}
+
+// 实盘一段：逐笔成交（含手续费）。
+export interface TradeLiveBucket {
+  fills: TradeFill[];
+  pnl: TradePnL[];
+  totals: TradeTotals;
+  synced: boolean;
+}
+
+// 模拟盘一段：纸面成交（不记手续费）。
+export interface PaperTradeRow {
+  id: number;
+  inst_id: string;
+  side: string;
+  qty: string;
+  price: string;
+  status: string;
+  filled_at?: string;
+}
+
+export interface TradePaperBucket {
+  orders: PaperTradeRow[];
+  pnl: TradePnL[];
+  totals: TradeTotals;
+  fee_included: boolean;
+}
+
+// 工具级交易台账（开仓/平仓/调杠杆的原始动作，含被拒的）。
+export interface TradeAction {
+  id: number;
+  task_id?: number;
+  account_id: number;
+  inst_id: string;
+  action: "open" | "close" | "set_leverage";
+  side?: string;
+  pos_side?: string;
+  qty?: string;
+  leverage?: string;
+  tp_price?: string;
+  sl_price?: string;
+  reduce_only?: boolean;
+  channel_order_id?: string;
+  state: "submitted" | "filled" | "failed";
+  // position_effect 记录这一单对持仓做了什么。action 只能区分开/平，
+  // 分不出「新开一仓」与「在已有仓上加仓」—— 而两者的成本口径与后续
+  // 平仓方式都不同，台账里必须留下这个信息。
+  position_effect?: "open" | "scale_in" | "reduce" | "reverse";
+  error?: string;
+  mode: string;
+  created_at?: string;
+}
+
+export interface TaskTrades {
+  task_id: string;
+  live: TradeLiveBucket;
+  paper: TradePaperBucket;
+  actions: TradeAction[];
+  note?: string;
+}
+
+// 执行账户（可对真实资金下单的那个账户）。pos_mode/lever 来自侧表。
+export interface ExecAccount {
+  id: number;
+  channel: string;
+  channel_account_id: string;
+  label: string;
+  market: string;
+  market_support: string[];
+  active: boolean;
+  blocked_at?: string;
+  block_reason?: string;
+  pos_mode: string;
+  mgn_mode: string;
+  lever: string;
+  open_tracked: number;
+}
+
+// 无人值守交易循环的运行状态。
+export interface TradeLoopStatus {
+  running: boolean;
+  mode: string;
+  interval_sec: number;
+  positions: number;
+  last_tick?: string;
+  last_error?: string;
+  last_error_at?: string;
+  open_tracked: number;
+}
+
 export interface TaskGoal {
   id: string;
   text: string;
@@ -404,6 +543,10 @@ export interface TaskGoal {
   state: string; // GoalState
   origin?: string;
   ts: string;
+  acceptance?: GoalAcceptance | null;
+  completed_at?: string;
+  accepted_by?: string;
+  accepted_reason?: string;
 }
 
 // 约束管理卡片用的操作约束(allow=允许 / deny=禁止)。
@@ -1730,6 +1873,9 @@ export interface DashboardSummary {
      * 展示时用 Number() 转，但**不要**在计算链里转换后再转回字符串。
      */
     realized_pnl: string;
+  live_fills: number;
+  live_realized_pnl: string;
+  live_fee_total: string;
     /**
      * 浮动盈亏 —— 持仓 × (现价 - 成本)。
      *

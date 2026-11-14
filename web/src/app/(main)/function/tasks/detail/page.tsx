@@ -43,6 +43,7 @@ import { BroadcastTab } from "./_tabs/broadcast-tab";
 import { OverviewTab } from "./_tabs/overview-tab";
 import { ReportTab } from "./_tabs/report-tab";
 import { SessionsTab } from "./_tabs/sessions-tab";
+import { TradesTab } from "./_tabs/trades-tab";
 
 // 只保留金融分析相关的 4 个 Tab（渗透测试的 6 个已删除）。
 const TABS = [
@@ -50,6 +51,7 @@ const TABS = [
   { value: "overview", label: "总览" },
   { value: "broadcast", label: "播报板" },
   { value: "report", label: "报告" },
+  { value: "trades", label: "交易记录" },
 ];
 
 function taskProfileIDs(task: Task): string[] {
@@ -417,6 +419,9 @@ function TaskDetailInner() {
         </TabsContent>
         <TabsContent value="report" className="mt-0">
           <ReportTab taskId={id} />
+        </TabsContent>
+        <TabsContent value="trades" className="mt-0">
+          <TradesTab taskId={id} />
         </TabsContent>
       </div>
     </Tabs>

@@ -90,6 +90,11 @@ func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
 // (re)installed at runtime (LLM configured from the UI); the loops always run
 // but idle until an LLM is set.
 type Engine struct {
+	// posProvider 是「当前持仓」快照的懒加载单例（带 10s 缓存，
+	// 跨 intent 共享 —— 每个 intent 新建一个等于没有缓存）。
+	posProviderOnce sync.Once
+	posProvider     agent.PositionsProvider
+
 	m        *Manager
 	debounce time.Duration
 
@@ -1040,6 +1045,25 @@ func intentHasRequiredOutput(store *db.ExplorationStore, intentID int64, role st
 			return false, "读取交易信号失败", err
 		}
 		return false, "trader 未产出当前任务、标的及 intent 对应的 signal（不代表成交）", nil
+	case role == agent.RoleScreener:
+		// 选品员的产出契约 = **任务标的被绑定**。
+		//
+		// # 为什么必须单独给一条（2026-11-14 任务 30 卡死）
+		//
+		// screener 是金融角色，但不在上面的白名单里，于是掉进最后的
+		// `IsFinancialRole(role)` 兜底分支 → 永远返回
+		// 「金融角色 screener 尚无可核验的产出契约」→ 意图 blocked。
+		//
+		// 实测任务 30：screener 意图 2767 / 2783 两次都 blocked。
+		// 第二次时它其实已经绑好标的、写了 fact —— 判 blocked 的理由
+		// 与「有没有产出」无关，纯粹是这个分支根本没有 screener 的处理。
+		//
+		// 选品员唯一可核验的结果就是 bind：调 set_task_instrument 成功后
+		// tasks.instrument_id 就有值。有绑定即达标，不看它说了什么。
+		if instrumentID == nil || *instrumentID <= 0 {
+			return false, "screener 尚未绑定任务标的（未成功调用 set_task_instrument）", nil
+		}
+		return true, "", nil
 	case role == agent.RolePortfolioManager:
 		if instrumentID == nil {
 			return false, "portfolio_manager task has no instrument binding", nil
@@ -1226,6 +1250,11 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		}
 	}
 	workCtx = agent.WithExecAccount(workCtx, execAcct)
+	// 当前持仓：trader 决定该不该平仓、平多少的唯一输入。
+	// 用带缓存的 provider（10s），避免每个 intent 都打一次交易所。
+	if e.m != nil && e.m.pg != nil {
+		workCtx = agent.WithPositionsProvider(workCtx, e.positionsProvider())
+	}
 	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
 	// 重跑一轮不该把额度清零重来。
 	hooks := steerHooks{
