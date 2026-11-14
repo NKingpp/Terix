@@ -905,7 +905,9 @@ func TestAssetPaginationUsesStableIDTieBreaker(t *testing.T) {
 		}
 		ids = append(ids, id)
 	}
-	defer func() { _, _ = d.Exec(`DELETE FROM assets WHERE id IN (SELECT CAST(value AS INTEGER) FROM json_each($1))`, int64SliceJSON(ids)) }()
+	defer func() {
+		_, _ = d.Exec(`DELETE FROM assets WHERE id IN (SELECT CAST(value AS INTEGER) FROM json_each($1))`, int64SliceJSON(ids))
+	}()
 
 	want := slices.Clone(ids)
 	slices.Reverse(want)

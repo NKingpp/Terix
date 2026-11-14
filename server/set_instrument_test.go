@@ -196,3 +196,42 @@ func TestSetInstrumentRequiresReason(t *testing.T) {
 		t.Fatalf("缺 reason 应拒绝，实际: %s", out)
 	}
 }
+
+// 选品员挑了现货时必须升级为永续（而不是绑一个不可交易的标的）。
+//
+// # 任务 29 的根因
+//
+// 选品员绑了 BTC-USDT（现货），工具返回的提示自己都写着「只能分析、
+// 不能自动执行」—— 但绑定已生效，11 个下游节点全为一个不可交易的标的服务，
+// 交易员最后只能报「找不到标的」。
+//
+// 提示语没用：那是选品员的最后一次调用，它不会因此再改一次标的。
+func TestToPerpSymbol(t *testing.T) {
+	cases := []struct {
+		in, want string
+		ok       bool
+	}{
+		{"BTC", "BTC-USDT-SWAP", true},
+		{"btc", "BTC-USDT-SWAP", true},
+		{"BTC-USDT", "BTC-USDT-SWAP", true},
+		// 美股裸代码 → 美股永续（OKX 确有 NVDA-USDT-SWAP）。
+		// 任务 30 就是绑了裸 NVDA(us/stock) 导致整链不可交易。
+		{"NVDA", "NVDA-USDT-SWAP", true},
+		{"AAPL", "AAPL-USDT-SWAP", true},
+		{"BTC-USDT-SWAP", "BTC-USDT-SWAP", true},
+		{"AAPL-USDT", "AAPL-USDT-SWAP", true},
+		// 三段式但不是 SWAP（交割合约）→ 不支持
+		{"BTC-USDT-250926", "", false},
+		{"", "", false},
+	}
+	for _, c := range cases {
+		got, ok := toPerpSymbol(c.in)
+		if ok != c.ok {
+			t.Errorf("toPerpSymbol(%q) ok=%v, want %v", c.in, ok, c.ok)
+			continue
+		}
+		if ok && got != c.want {
+			t.Errorf("toPerpSymbol(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

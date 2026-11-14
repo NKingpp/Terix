@@ -12,6 +12,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -204,6 +205,18 @@ func buildTraderVars(ctx context.Context, intent *db.Node) TraderVars {
 		vars.AccountID = acct.ID
 		vars.AccountRef = acct.Ref
 		vars.MinOrderAmount = acct.MinOrderAmount
+	}
+
+	// 当前持仓：平仓决策的唯一输入。读不到与没有仓必须区分 ——
+	// 把「读不到」当成「没仓」会让该平的仓留在场上。
+	if p, ok := PositionsFrom(ctx); ok {
+		if ps, err := p.Positions(ctx); err != nil {
+			vars.PositionsErr = err.Error()
+		} else if len(ps) > 0 {
+			if b, mErr := json.Marshal(ps); mErr == nil {
+				vars.PositionsJSON = string(b)
+			}
+		}
 	}
 	return vars
 }

@@ -222,8 +222,8 @@ context_assets AS (
     OR (ts.kind='subdomain'   AND a.domain=ts.domain)
     OR (ts.kind IN ('ip','cidr') AND cidr_contains(ts.net, a.ip) = 1)
     OR (ts.kind='icp' AND (
-         ` + sqlNormalizeICPExpr("a.icp") + ` = ts."value"
-         OR ` + sqlNormalizeICPExpr("a.app_icp") + ` = ts."value"
+         `+sqlNormalizeICPExpr("a.icp")+` = ts."value"
+         OR `+sqlNormalizeICPExpr("a.app_icp")+` = ts."value"
        ))
   )
   JOIN context_tasks ctx ON ctx.task_id=ts.task_id

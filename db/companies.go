@@ -804,6 +804,7 @@ func (s *CompanyStore) ResolveCompany(rootDomain, ipStr string) (*int64, error) 
 func (s *CompanyStore) ResolveCompanyWithICP(rootDomain, ipStr, icp string) (*int64, error) {
 	return resolveCompanyWithICP(s.db, rootDomain, ipStr, icp)
 }
+
 type companyScopeQueryer interface {
 	QueryRow(query string, args ...any) *sql.Row
 }

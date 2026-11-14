@@ -30,6 +30,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/Autumn-27/artex/exec/okxrest"
 	"log"
 	"strings"
 
@@ -60,11 +61,11 @@ func (s *SetInstrumentToolSet) setTaskInstrument() actool.CoreTool {
 		"properties": map[string]any{
 			"symbol": map[string]any{
 				"type":        "string",
-				"description": "标的代码，如 BTC-USDT / AAPL / 600519",
+				"description": "标的完整 instId，如 BTC-USDT-SWAP / AAPL-USDT-SWAP。自动下单只支持永续（必须带 -SWAP 后缀，market 填 crypto）",
 			},
 			"market": map[string]any{
 				"type":        "string",
-				"description": "市场：cn|hk|us|crypto",
+				"description": "市场：crypto|us|hk|cn。永续一律填 crypto（含美股永续）",
 			},
 			"name": map[string]any{
 				"type":        "string",
@@ -168,6 +169,52 @@ func (s *SetInstrumentToolSet) runSetTaskInstrument(ctx context.Context, in json
 				"分析师现在会针对该标的取数分析。", *current, created)), nil
 	}
 
+	// ①.5 任何非永续标的都要**升级为对应永续**，而不是原样绑定。
+	//
+	// # 为什么不能绑非永续（2026-11-14 任务 29 / 30 两次整链白跑）
+	//
+	// 任务 29：选品员挑 BTC-USDT（现货）→ 11 个下游节点全为一个
+	// 永远不可交易的标的服务，交易员最后只能报「找不到标的」。
+	// 任务 30：挑 NVDA（market=us 的裸股票代码）→ 同样的结局，
+	// 而且更难查：工具返回的提示里只有一句「该标的只能分析、不能自动执行」，
+	// 模型据此认为「那我换个写法试试」，然后在 NVDA / NVDA-USDT /
+	// NVDA-USDT-SWAP 之间反复试，最后判「绑定不一致，需要人工介入」。
+	//
+	// 提示语没用 —— 那是选品员的最后一次工具调用，它不会因此再改一次标的
+	// （改标的本身被工具禁止）。所以这里直接**升级**：
+	//   BTC       → BTC-USDT-SWAP
+	//   BTC-USDT  → BTC-USDT-SWAP
+	//   NVDA (us) → NVDA-USDT-SWAP   ← OKX 确实有美股永续
+	// 升级前用公开行情验证该永续真实存在，避免凭空造标的。
+	var upgradeNote string
+	up := strings.ToUpper(strings.TrimSpace(symbol))
+	if !strings.HasSuffix(up, "-SWAP") {
+		perp, ok := toPerpSymbol(symbol)
+		if ok {
+			if perpPx, pErr := perpLastPrice(ctx, perp); pErr == nil && perpPx != "" {
+				upgradeNote = fmt.Sprintf("（%s 已升级为永续 %s，现价 %s —— 非永续标的无法自动下单）",
+					symbol, perp, perpPx)
+				symbol, market, up = perp, "crypto", perp
+			} else if market == "crypto" {
+				// crypto 标的找不到对应永续 → 明确拒绝。
+				// 让它绑一个不可交易的标的，等于让整条链白跑。
+				return actool.Errorf(fmt.Sprintf(
+					"标的 %q 在 OKX 没有对应的永续合约（试过 %s：%v）。"+
+						"请改选有永续的标的，如 BTC-USDT-SWAP / NVDA-USDT-SWAP",
+					symbol, perp, pErr)), nil
+			}
+			// 非 crypto（A股/美股）且没有对应永续 → 允许绑（用户可能只要分析），
+			// 但把话说清楚：下游交易阶段会拒绝，别让它以为能下单。
+			if !strings.HasSuffix(up, "-SWAP") && market != "crypto" {
+				upgradeNote = fmt.Sprintf("（%s 在 OKX 没有对应永续，只能分析、不能自动下单）", symbol)
+			}
+		}
+	}
+	// 永续的 market 一律是 crypto（OKX 的美股永续也走加密通道）。
+	if strings.HasSuffix(up, "-SWAP") {
+		market = "crypto"
+	}
+
 	// ② 查/建 instruments 行。
 	instID, err := ensureInstrument(ctx, s.pg, market, symbol, a.Name)
 	if err != nil {
@@ -204,10 +251,74 @@ func (s *SetInstrumentToolSet) runSetTaskInstrument(ctx context.Context, in json
 	// ⑤ 兜底：把仍为空标的的开放意图补上（正常情况下 ④ 已带好值，这里应为 0）。
 	patched, _ := patchOpenIntentInstrument(ctx, s.pg, ri.ExplorationID, instID)
 
+	// ⑥ 可执行性提示（不阻断）。
+	hint := instrumentExecutabilityHint(symbol, market)
+	if hint != "" {
+		hint = " " + hint
+	}
+
 	return actool.Text(fmt.Sprintf(
 		"标的已绑定：%s（%s，instrument_id=%d）。已展开 %d 个下游阶段，%d 个待启动意图补齐标的。"+
-			"分析师现在会针对该标的取数分析。",
-		symbol, market, instID, created, patched)), nil
+			"分析师现在会针对该标的取数分析。%s%s",
+		symbol, market, instID, created, patched, upgradeNote, hint)), nil
+}
+
+// toPerpSymbol 把现货/裸代码写法映射成 OKX 永续 instId。
+//
+//	BTC          → BTC-USDT-SWAP
+//	BTC-USDT     → BTC-USDT-SWAP
+//	BTC-USDT-SWAP→ 原样
+func toPerpSymbol(symbol string) (string, bool) {
+	up := strings.ToUpper(strings.TrimSpace(symbol))
+	switch {
+	case up == "":
+		return "", false
+	case strings.HasSuffix(up, "-SWAP"):
+		return up, true
+	case strings.Contains(up, "-"):
+		// 已有分隔符但不是 SWAP：只接受 X-USDT 这种两段式。
+		parts := strings.Split(up, "-")
+		if len(parts) == 2 {
+			return up + "-SWAP", true
+		}
+		return "", false
+	default:
+		return up + "-USDT-SWAP", true
+	}
+}
+
+// perpLastPrice 用**公开**接口取最新价（不需要凭据），用于验证永续是否存在。
+func perpLastPrice(ctx context.Context, instID string) (string, error) {
+	client := okxrest.NewClient(okxrest.Credentials{})
+	return client.LastPrice(ctx, instID)
+}
+
+// instrumentExecutabilityHint 判断「这个标的能不能被本系统自动下单」，返回提示语（空=没问题）。
+//
+// # 为什么选品环节就要提示
+//
+// 选品员容易按「行情能取到」挑标的，而自动下单要求的是 OKX 永续 instId。
+// 两者不是一回事：BTC-USDT 能取价但无法自动下单（现货持仓不在 positions
+// 接口里），AAPL 能取价但交易通道要的是 AAPL-USDT-SWAP。
+//
+// 不在这里说清，错误要等到交易员建草案时才暴露 —— 前面整条链已经白跑。
+// 但不拒绝：用户可能只要分析不要下单。
+func instrumentExecutabilityHint(symbol, market string) string {
+	up := strings.ToUpper(strings.TrimSpace(symbol))
+	switch {
+	case strings.HasSuffix(up, "-SWAP") && market == "crypto":
+		return "" // 正常：可直接自动下单
+	case strings.HasSuffix(up, "-SWAP"):
+		return fmt.Sprintf("注意：%s 是永续，market 建议填 crypto（当前 %s）——"+
+			"永续的行情与交易通道都走加密市场，填 %s 会取不到价。", symbol, market, market)
+	case market == "crypto":
+		return fmt.Sprintf("注意：%s 不是永续 instId（缺 -SWAP 后缀）。"+
+			"本系统只能对永续自动下单，该标的只能分析、不能自动执行。", symbol)
+	default:
+		return fmt.Sprintf("注意：%s（market=%s）是非永续标的。"+
+			"本系统只能对 OKX 永续（形如 %s-USDT-SWAP，market=crypto）自动下单；"+
+			"该标的只能分析、不能自动执行。", symbol, market, symbol)
+	}
 }
 
 // ensureInstrument 按 market+symbol 找标的，没有就建一条。
