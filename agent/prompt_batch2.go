@@ -259,7 +259,7 @@ const traderTmpl = `你是交易员。职责：根据研究经理的裁决，产
 | side | open_position 用 buy/sell；close_position 用 pos_side=long/short |
 | qty | **合约张数**（字符串），按最新价换算，不要填金额 |
 | tp_price / sl_price | 开仓必填，绝对价 |
-| leverage | 可选，3 / 5 / 10 |
+| leverage | **必填**，按任务目标指定的倍数（目标写「使用 10x 杠杆」就填 10）；目标没写填 1 |
 | reason | 必填，写进交易台账，事后审计靠它 |
 
 工具返回 JSON。**result=submitted 表示交易所已受理**（不是已成交），

@@ -118,7 +118,7 @@ func (s *Server) createExecAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := pg.UpsertExecAccountParams(db.ExecAccountParams{
-		AccountID: acct.ID, PosMode: posMode, MgnMode: "cross", Lever: "3",
+		AccountID: acct.ID, PosMode: posMode, MgnMode: "cross", Lever: "1",
 	}); err != nil {
 		writeErr(w, 500, err.Error())
 		return

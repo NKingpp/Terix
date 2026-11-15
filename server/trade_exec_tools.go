@@ -281,7 +281,9 @@ func (t *ExecToolSet) openPosition() actool.CoreTool {
 			"  tp_price: 止盈触发价。多单必须 > 现价，空单必须 < 现价\n"+
 			"  sl_price: 止损触发价。多单必须 < 现价，空单必须 > 现价\n"+
 			"            （open / scale_in / reduce 必填；reverse 可省略，因为方向刚反过来）\n"+
-			"  leverage: 可选，设置该标的杠杆倍数（3 / 5 / 10）。不填沿用账户默认\n"+
+			"  leverage: 杠杆倍数（必填，字符串，如 1 / 3 / 5 / 10）。\n"+
+			"            **必须先看任务目标里写的杠杆倍数并照抄**（如目标写「使用 10x 杠杆」就传 10）；\n"+
+			"            目标没写才用 1。不填会落到账户默认值，那不是你的选择\n"+
 			"  reason:   为什么做这一单（必填，写进交易台账）\n\n"+
 			"回执里必须看两个字段：\n"+
 			"  position_effect —— 这一单到底干了什么（见上）\n"+
@@ -295,7 +297,7 @@ func (t *ExecToolSet) openPosition() actool.CoreTool {
 			"qty":      tradeStr("合约张数（字符串）"),
 			"tp_price": tradeStr("止盈触发价（reverse 时可省略）"),
 			"sl_price": tradeStr("止损触发价（reverse 时可省略）"),
-			"leverage": tradeStr("可选。杠杆倍数，如 3"),
+			"leverage": tradeStr("杠杆倍数（必填），如 1 / 3 / 5 / 10。按任务目标里指定的倍数填；目标没写填 1"),
 			"reason":   tradeStr("为什么做这一单（必填，写进台账）"),
 		}, "symbol", "side", "qty", "reason"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {

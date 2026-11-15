@@ -68,10 +68,12 @@ type ExecAccountParams struct {
 	Lever     string
 }
 
-// GetExecAccountParams 读账户参数；无记录时返回默认值（net / cross / 3），
-// 与「加列前的历史账户」语义一致。
+// GetExecAccountParams 读账户参数；无记录时返回默认值（net / cross / 1）。
+//
+// 默认 1 倍：不给杠杆就别放大敞口。要放大必须在开仓时显式传 leverage，
+// 或显式改账户参数 —— 两者都是有意动作。
 func (d *DB) GetExecAccountParams(accountID int64) (ExecAccountParams, error) {
-	out := ExecAccountParams{AccountID: accountID, PosMode: "net", MgnMode: "cross", Lever: "3"}
+	out := ExecAccountParams{AccountID: accountID, PosMode: "net", MgnMode: "cross", Lever: "1"}
 	var pos, mgn, lever sql.NullString
 	err := d.QueryRow(`SELECT pos_mode, mgn_mode, lever FROM exec_account_params WHERE account_id=$1`, accountID).
 		Scan(&pos, &mgn, &lever)
@@ -102,7 +104,7 @@ func (d *DB) UpsertExecAccountParams(p ExecAccountParams) error {
 		p.MgnMode = "cross"
 	}
 	if p.Lever == "" {
-		p.Lever = "3"
+		p.Lever = "1"
 	}
 	if p.PosMode != "net" && p.PosMode != "long_short" {
 		return fmt.Errorf("pos_mode 只能是 net 或 long_short，收到 %q", p.PosMode)
