@@ -593,3 +593,50 @@ func TestTradeRecordPositionEffect(t *testing.T) {
 		t.Error("action=close 带 position_effect 应被拒")
 	}
 }
+
+// 纸面开仓必须校验名义金额能否被账户权益支撑。
+//
+// # 为什么（2026-11-15 荒谬仓位事故）
+//
+// 旧版 openPaper 零校验。模型按「用全部余额」算出 10000 张 NVDA 永续
+// （名义约 160 万 USD），账户权益只有 8.7 万 —— 引擎照单全收，
+// dashboard 于是显示「模拟盘赚 2766 USDT」。
+//
+// 那个数字没有决策含义：它来自一笔现实中必然被交易所拒绝的单。
+// 允许不可能成交的单，模拟结果就是纯噪声。
+//
+// 这条测试钉住「超额名义金额会被本地拦住」，且错误信息要说明
+// 这是保证金不足（不是随便的参数错误）。
+func TestOpenPaperRejectsOversizedNotional(t *testing.T) {
+	e := newTradeE2E(t)
+	if err := e.pg.SetSetting(db.ExecModeKey, string(db.ExecModePaper)); err != nil {
+		t.Fatal(err)
+	}
+	ri := e.runInfo(t, &e.instID)
+	ets := NewExecToolSet(e.pg, e.tts.gate, nil)
+	ec := &execCtx{
+		taskID: ri.TaskID, acct: &db.ExecAccount{ID: e.acctID},
+		inst: &db.Instrument{ID: e.instID, Symbol: "E2ETEST-USDT-SWAP"},
+		mode: db.ExecModePaper, isPaper: true,
+		params: db.ExecAccountParams{PosMode: "net", MgnMode: "cross", Lever: "3"},
+		// 用假客户端：权益 87000，现价 160 → 上限 261000 名义
+		client: &fakeOkxTrader{lastPrice: "160"},
+	}
+	plan := exec.EntryPlan{Effect: exec.EffectOpen, PostNet: "10000"}
+
+	// 10000 张 × 160 = 160 万名义，远超 87000×3
+	// 注意：工具用 actool.Errorf 表达业务拒绝（Result.IsError），
+	// 不是 Go error —— 所以断言要看 Result。
+	res, err := ets.openPaper(context.Background(), ec, "buy", "long",
+		"10000", "200", "120", "验证仓位校验", plan)
+	if err != nil {
+		t.Fatalf("不该返回 Go error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("超额名义金额必须被判为错误（现实中会被交易所拒绝），实际返回: %s", res.Flatten())
+	}
+	msg := res.Flatten()
+	if !strings.Contains(msg, "权益") && !strings.Contains(msg, "保证金") && !strings.Contains(msg, "名义金额") {
+		t.Errorf("错误应说明是保证金/名义金额问题，实际: %s", msg)
+	}
+}

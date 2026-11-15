@@ -2,11 +2,13 @@ package server
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"strconv"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/exec"
+	"github.com/Autumn-27/artex/exec/okxrest"
 )
 
 // 任务级交易记录接口。
@@ -221,6 +223,48 @@ func (s *Server) taskTradesSync(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{"inserted": inserted, "accounts": len(acctIDs)}
 	if lastErr != nil {
 		out["warning"] = lastErr.Error()
+	}
+
+	// ---- 同步完立刻对账：本地成交推算的净持仓 vs 交易所真实持仓 ----
+	//
+	// # 为什么放在同步响应里（2026-11-15 事故）
+	//
+	// 那次的不一致（本地 -68.95 / 交易所 0）存活了一整天没人发现：
+	// 两边都不报错，报表只是「偏小」。等有人手动比对 SQL 才暴露，
+	// 期间已经基于错误的净持仓做了决策。
+	//
+	// 把它做成每次同步都返回的结论，不一致就在响应里说出来，
+	// 不需要任何人记得去查。
+	cred, cErr := s.okxTradeCred()
+	if cErr == nil && cred != nil {
+		client := okxrest.NewClient(okxrest.Credentials{
+			APIKey: cred.APIKey, SecretKey: cred.SecretKey, Passphrase: cred.Passphrase,
+			Demo: cred.Demo, BaseURL: cred.BaseURL,
+		})
+		var drifts []exec.PositionDrift
+		for _, aid := range acctIDs {
+			local, nErr := pg.LocalNetPositions(aid)
+			if nErr != nil {
+				continue
+			}
+			d, dErr := exec.DetectPositionDrift(r.Context(), client, local, "")
+			if dErr != nil {
+				if out["warning"] == nil {
+					out["warning"] = dErr.Error()
+				}
+				continue
+			}
+			drifts = append(drifts, d...)
+		}
+		if len(drifts) > 0 {
+			out["position_drift"] = drifts
+			out["drift_note"] = "本地成交推算的净持仓与交易所不一致 —— " +
+				"常见成因是成交明细漏同步（大单拆成上百笔成交时分页不足）、" +
+				"或有人用交易所 APP/CLI 手工操作过。请以交易所为准"
+			slog.Warn("持仓漂移", "task", numID, "drifts", len(drifts))
+		} else {
+			out["position_drift"] = []exec.PositionDrift{}
+		}
 	}
 	writeJSON(w, 200, out)
 }

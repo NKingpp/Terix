@@ -452,3 +452,114 @@ func TestDistinctInstIDsIncludesTradeRecords(t *testing.T) {
 		t.Fatalf("应包含工具下单的标的，实际 %v（成交永远不会被同步）", ids)
 	}
 }
+
+// 本地净持仓汇总：对账的基础。
+//
+// 2026-11-15 的不一致就是「这个函数算出来 -68.95，交易所是 0」。
+// 所以它必须只做纯粹的买卖相减，不含成本/盈亏口径
+// （那些是派生值，不能用来互相校验）。
+func TestLocalNetPositions(t *testing.T) {
+	d := testOpen(t)
+	acct, err := d.ExecAccounts().UpsertAccount(ExecAccountInput{
+		Channel: "okx", ChannelAcctID: "netpos-" + t.Name(),
+		Label: "净持仓", Market: "crypto", MarketSupport: []string{"crypto"}, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM trade_fills WHERE account_id=$1`, acct.ID)
+		_, _ = d.Exec(`DELETE FROM exec_accounts WHERE id=$1`, acct.ID)
+	})
+
+	ins := []TradeFill{
+		{FillID: "np1", AccountID: acct.ID, InstID: "NPA-USDT-SWAP", Side: "buy", FillPx: "100", FillSz: "0.3", FilledAt: "2026-11-15T01:00:00Z"},
+		{FillID: "np2", AccountID: acct.ID, InstID: "NPA-USDT-SWAP", Side: "buy", FillPx: "100", FillSz: "0.2", FilledAt: "2026-11-15T01:01:00Z"},
+		{FillID: "np3", AccountID: acct.ID, InstID: "NPA-USDT-SWAP", Side: "sell", FillPx: "110", FillSz: "0.1", FilledAt: "2026-11-15T01:02:00Z"},
+		// 另一个标的：纯空仓
+		{FillID: "np4", AccountID: acct.ID, InstID: "NPB-USDT-SWAP", Side: "sell", FillPx: "50", FillSz: "2", FilledAt: "2026-11-15T01:03:00Z"},
+	}
+	for _, f := range ins {
+		if _, _, err := d.InsertFill(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := d.LocalNetPositions(acct.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 0.3 + 0.2 - 0.1 = 0.4
+	if got["NPA-USDT-SWAP"] != "0.4" {
+		t.Errorf("NPA 净持仓 = %q, want 0.4", got["NPA-USDT-SWAP"])
+	}
+	if got["NPB-USDT-SWAP"] != "-2" {
+		t.Errorf("NPB 净持仓 = %q, want -2", got["NPB-USDT-SWAP"])
+	}
+}
+
+// 台账 state 回填：成交齐了就不能再显示 submitted。
+//
+// 2026-11-15 的误判正是「看到 submitted 就断定 0 成交，而交易所早已
+// 全额成交」。回填让台账能自证。
+func TestBackfillTradeRecordStates(t *testing.T) {
+	d := testOpen(t)
+	acct, err := d.ExecAccounts().UpsertAccount(ExecAccountInput{
+		Channel: "okx", ChannelAcctID: "bftr-" + t.Name(),
+		Label: "回填", Market: "crypto", MarketSupport: []string{"crypto"}, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM trade_fills WHERE account_id=$1`, acct.ID)
+		_, _ = d.Exec(`DELETE FROM trade_records WHERE account_id=$1`, acct.ID)
+		_, _ = d.Exec(`DELETE FROM exec_accounts WHERE id=$1`, acct.ID)
+	})
+
+	mk := func(cid, qty string) int64 {
+		id, err := d.InsertTradeRecord(TradeRecord{
+			TaskID: 999001, AccountID: acct.ID, InstID: "BF-USDT-SWAP",
+			Action: "open", Side: "buy", Qty: qty, ClientOrderID: cid,
+			State: TradeRecordSubmitted, Mode: "live_auto",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	fullID := mk("artexbf-full", "2")  // 成交满量 → filled
+	partID := mk("artexbf-part", "10") // 只成交 1 → 保持 submitted
+	noneID := mk("artexbf-none", "5")  // 无成交 → 不动
+
+	fills := []TradeFill{
+		{FillID: "bf1", AccountID: acct.ID, InstID: "BF-USDT-SWAP", Side: "buy", FillPx: "100", FillSz: "1", ClOrdID: "artexbf-full", FilledAt: "2026-11-15T02:00:00Z"},
+		{FillID: "bf2", AccountID: acct.ID, InstID: "BF-USDT-SWAP", Side: "buy", FillPx: "101", FillSz: "1", ClOrdID: "artexbf-full", FilledAt: "2026-11-15T02:00:01Z"},
+		{FillID: "bf3", AccountID: acct.ID, InstID: "BF-USDT-SWAP", Side: "buy", FillPx: "100", FillSz: "1", ClOrdID: "artexbf-part", FilledAt: "2026-11-15T02:00:02Z"},
+	}
+	for _, f := range fills {
+		if _, _, err := d.InsertFill(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n, err := d.BackfillTradeRecordStates(acct.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("应只回填 1 条（满量那条），实际 %d", n)
+	}
+	check := func(id int64, want, why string) {
+		got, err := d.GetTradeRecord(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.State != want {
+			t.Errorf("%s: state = %q, want %q", why, got.State, want)
+		}
+	}
+	check(fullID, TradeRecordFilled, "成交满量")
+	check(partID, TradeRecordSubmitted, "部分成交仍应 submitted")
+	check(noneID, TradeRecordSubmitted, "无成交应保持不动")
+}

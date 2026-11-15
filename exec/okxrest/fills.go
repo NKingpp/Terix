@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -60,24 +61,88 @@ func (c *Client) ListFills(ctx context.Context, instType string, begin, end time
 	return out, nil
 }
 
-// ListFillsByInst 拉某标的最近窗口的成交（便捷封装）。
+// ListFillsByInst 拉某标的最近窗口的**全部**成交（自动分页）。
 //
-// 窗口默认 7 天：OKX 的 fills 保留期远大于此，但把窗口放大到 30 天会让
-// 一次调用就撞上 100 条上限而静默截断。要更长的历史必须自己切片。
+// # 为什么必须分页（2026-11-15 数据不一致事故）
+//
+// 原来这里硬编码 limit=100 且只发一次请求，注释写的是「7 天足够，
+// 不会撞上 100 条上限」。这个假设是错的：
+//
+//	一笔市价单在盘口薄的时候会被撮合拆成**上百笔微成交**。
+//	实测 NVDA-USDT-SWAP 一笔 150 张的卖单产生 150+ 条 fill，
+//	我们只拿到前 100 条（68.95 张）。
+//
+// 后果不是「少几条数字偏小」这种可容忍的误差，而是**净持仓符号都错**：
+// 台账算出 net=-68.95，而交易所实际是 0。基于这个净持仓做的所有
+// 盈亏、敞口、对账结论全部失真，且没有任何报错。
+//
+// # 分页机制
+//
+// OKX 用 billId 游标：`after=<billId>` 返回**比该条更早**的记录。
+// 响应按时间倒序，所以取本页最后一条的 billId 作为下一页游标，
+// 直到某页不足 pageSize（说明到底了）。
+//
+// 去重按 tradeId（fill 维度唯一）。billId 在 fill 接口里足够唯一，
+// 但 tradeId 更严格 —— 万一 OKX 某天返回重复 billId，游标不前进会被
+// 下面的 last.BillID == cursor 检查挡住，不会死循环。
 func (c *Client) ListFillsByInst(ctx context.Context, instID string, days int) ([]Fill, error) {
 	if days <= 0 {
 		days = 7
 	}
 	now := time.Now().UTC()
-	q := url.Values{}
-	q.Set("instType", "SWAP")
-	q.Set("instId", instID)
-	q.Set("begin", fmt.Sprintf("%d", now.AddDate(0, 0, -days).UnixMilli()))
-	q.Set("end", fmt.Sprintf("%d", now.UnixMilli()))
-	q.Set("limit", "100")
-	var out []Fill
-	if err := c.c.do(ctx, "GET", "/api/v5/trade/fills?"+q.Encode(), nil, &out); err != nil {
-		return nil, err
+	begin := fmt.Sprintf("%d", now.AddDate(0, 0, -days).UnixMilli())
+	end := fmt.Sprintf("%d", now.UnixMilli())
+
+	const pageSize = 100 // OKX 上限
+	// 上限保护：6000 笔。正常一圈远小于此；这个值只为防「后端异常时无限循环」。
+	const maxPages = 60
+
+	var all []Fill
+	seen := make(map[string]struct{}, 256)
+	cursor := ""
+	for page := 0; page < maxPages; page++ {
+		q := url.Values{}
+		q.Set("instType", "SWAP")
+		q.Set("instId", instID)
+		q.Set("begin", begin)
+		q.Set("end", end)
+		q.Set("limit", fmt.Sprintf("%d", pageSize))
+		if cursor != "" {
+			q.Set("after", cursor)
+		}
+		var out []Fill
+		if err := c.c.do(ctx, "GET", "/api/v5/trade/fills?"+q.Encode(), nil, &out); err != nil {
+			// 返回已取到的部分 + 错误：让调用方既能落库已有的，
+			// 又知道这一轮不完整（下一轮会补）。
+			return all, err
+		}
+		added := 0
+		for _, f := range out {
+			k := strings.TrimSpace(f.TradeID)
+			if k == "" {
+				k = strings.TrimSpace(f.BillID)
+			}
+			if k == "" {
+				continue
+			}
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
+			all = append(all, f)
+			added++
+		}
+		if len(out) < pageSize {
+			break // 到底了
+		}
+		last := out[len(out)-1]
+		if last.BillID == "" || last.BillID == cursor {
+			break // 没游标可用 / 游标不前进，防死循环
+		}
+		cursor = last.BillID
+		if added == 0 {
+			break // 整页都重复 → 后端在重复返回同一批，再问也没用
+		}
 	}
-	return out, nil
+	return all, nil
 }

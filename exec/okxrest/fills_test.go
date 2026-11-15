@@ -2,9 +2,12 @@ package okxrest
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -73,5 +76,73 @@ func TestListFillsQueryShape(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("query 缺 %q: %s", want, got)
 		}
+	}
+}
+
+// 分页必须把所有成交拉全 —— 这是 2026-11-15 数据不一致的根因。
+//
+// # 事故
+//
+// 一笔 150 张的市价单被撮合拆成 150+ 笔微成交。旧实现硬编码
+// limit=100 且只发一次请求，只拿到前 100 笔（68.95 张），
+// 台账从此算出净持仓 -68.95 而交易所是 0。两边都不报错。
+//
+// 这条测试用 fake server 模拟「第一页 100 条 + 第二页 60 条」，
+// 断言返回 160 条而不是 100 条。
+func TestListFillsByInstPaginates(t *testing.T) {
+	var pages []string // 记录每次请求带的 after 参数，断言游标真的在前进
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		after := r.URL.Query().Get("after")
+		pages = append(pages, after)
+		var data []map[string]string
+		if after == "" {
+			// 第一页：100 条，billId 从 1000 递减到 901（倒序）
+			for i := 0; i < 100; i++ {
+				data = append(data, map[string]string{
+					"tradeId": fmt.Sprintf("t%d", 1000-i),
+					"billId":  fmt.Sprintf("%d", 1000-i),
+					"instId":  "PG-USDT-SWAP",
+					"side":    "buy", "fillPx": "1", "fillSz": "1", "ts": "1794675000000",
+				})
+			}
+		} else {
+			// 第二页：60 条，比游标更早
+			base, _ := strconv.Atoi(after)
+			for i := 1; i <= 60; i++ {
+				data = append(data, map[string]string{
+					"tradeId": fmt.Sprintf("t%d", base-i),
+					"billId":  fmt.Sprintf("%d", base-i),
+					"instId":  "PG-USDT-SWAP",
+					"side":    "sell", "fillPx": "1", "fillSz": "1", "ts": "1794674000000",
+				})
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": "0", "data": data})
+	}
+	srv := httptest.NewServer(http.HandlerFunc(handler))
+	defer srv.Close()
+
+	c := NewClient(Credentials{BaseURL: srv.URL})
+	fills, err := c.ListFillsByInst(context.Background(), "PG-USDT-SWAP", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fills) != 160 {
+		t.Fatalf("应拉到 160 笔（100+60），实际 %d —— 分页没生效会漏数据", len(fills))
+	}
+	if len(pages) != 2 {
+		t.Fatalf("应请求 2 页，实际 %d 次: %v", len(pages), pages)
+	}
+	// 第二页必须带游标，且等于第一页最旧那条的 billId（901）
+	if pages[1] != "901" {
+		t.Errorf("第二页游标 = %q, want 901（上一页最旧记录）", pages[1])
+	}
+	// 去重：不能有重复 tradeId
+	seen := map[string]bool{}
+	for _, f := range fills {
+		if seen[f.TradeID] {
+			t.Fatalf("重复成交 %q", f.TradeID)
+		}
+		seen[f.TradeID] = true
 	}
 }

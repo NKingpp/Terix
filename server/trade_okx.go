@@ -39,6 +39,8 @@ type okxTrader interface {
 	AmendAlgoOCO(ctx context.Context, instID, algoID, tp, sl string) error
 	SetLeverage(ctx context.Context, instID, lever, mgnMode string) error
 	LastPrice(ctx context.Context, instID string) (string, error)
+	// FetchAccountBalance 读账户权益。纸面模式的仓位校验需要它。
+	FetchAccountBalance(ctx context.Context) (*okxrest.AccountBalance, error)
 }
 
 // 编译期锚点：*okxrest.Client 必须满足 okxTrader。

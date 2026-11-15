@@ -611,7 +611,7 @@ func archiveRowJSON(rows archiveRowScanner) ([]byte, error) {
 // looksLikeJSONValue 判断字符串是否是「应以 JSON 形态内嵌」的复合值。
 //
 // 只认以 { 或 [ 开头的合法 JSON —— 这两个字符能把「JSON 对象/数组」与
-// 「普通文本、数字、布尔」区分开，避免把 '' 或 'abc' 误当 JSON 内嵌
+// 「普通文本、数字、布尔」区分开，避免把 ” 或 'abc' 误当 JSON 内嵌
 // （那样会让归档包出现非法 JSON，sha256 校验时才发现已经太晚）。
 //
 // 注意 `json.Valid` 对 '123'、'"x"'、'true'、'null' 都返回 true，

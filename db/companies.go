@@ -544,7 +544,7 @@ func (s *CompanyStore) RecomputeAttribution() error {
 }
 
 // sqlNormalizeICPExpr 是"去空白 + 小写"的 SQL 表达式，等价 PG 的
-// `lower(regexp_replace(x, '[[:space:]]+', '', 'g'))`。
+// `lower(regexp_replace(x, '[[:space:]]+', ”, 'g'))`。
 //
 // SQLite 没有 regexp_replace，也不想为它注册 UDF（T01 只给了 regexp_match）。
 // 归属匹配用的 ICP 值在 Go 侧已经过 NormalizeICP（去掉所有 Unicode 空白），

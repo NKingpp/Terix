@@ -439,6 +439,23 @@ func (t *ExecToolSet) openPosition() actool.CoreTool {
 			}
 
 			rec.ChannelOrderID = oc.OrdID
+			// 台账 state 必须反映**实际成交**，不能一律写 submitted。
+			//
+			// # 为什么（2026-11-15 对账事故）
+			//
+			// 原来这里固定写 submitted，而 settleBracket 早就拿到了
+			// fill_state=filled。后果是台账永远显示「已提交」，
+			// 事后核对「这单到底成交没有、成交多少」只能去交易所查 ——
+			// 而账本存在的意义正是让人不用查交易所。
+			//
+			// 实测 rec=26（open buy 150 张）当时全量成交，台账却写 submitted，
+			// 被误读成「0 成交」，进而怀疑整条链路。
+			if oc.FillState == "filled" {
+				rec.State = db.TradeRecordFilled
+			} else if oc.FillState == "canceled" {
+				rec.State = db.TradeRecordFailed
+				rec.Error = "交易所撤销（未成交）"
+			}
 			if _, iErr := t.pg.InsertTradeRecord(rec); iErr != nil {
 				// 台账写失败不回滚：钱已经动了。但必须让调用方知道，
 				// 否则这一笔永远不会出现在盈亏报表里。
@@ -537,6 +554,41 @@ func (t *ExecToolSet) openPaper(ctx context.Context, ec *execCtx,
 	if px == "" {
 		return actool.Errorf("纸面开仓需要现价来计价，但取价失败。" +
 			"这会让纸面收益失真，所以拒绝执行；稍后重试"), nil
+	}
+
+	// ---- 仓位可行性校验：名义金额必须能被账户权益支撑 ----
+	//
+	// # 为什么纸面也要校验（2026-11-15 荒谬仓位事故）
+	//
+	// 原来这里零校验。模型按「用全部余额」算出 10000 张 NVDA 永续
+	// （名义约 160 万 USD），而账户权益只有 8.7 万 —— 引擎照单全收，
+	// dashboard 于是显示「模拟盘赚 2766 USDT」。
+	//
+	// 那个数字没有决策含义：它来自一笔现实中必然被交易所拒绝的单。
+	// 纸面模拟的意义是「约束都是真的，只是不花真钱」，允许不可能成交的
+	// 单就等于把模拟结果变成噪声。
+	//
+	// 读不到权益时 fail-closed：宁可这次不开，也不要记一笔无法兑现的账。
+	if ec.client != nil {
+		bal, bErr := ec.client.FetchAccountBalance(ctx)
+		if bErr != nil {
+			return actool.Errorf(fmt.Sprintf(
+				"纸面开仓需要账户权益来校验仓位是否可承受，但读取失败: %v。稍后重试", bErr)), nil
+		}
+		equity := bal.EquityOf("USDT")
+		if equity == "0" {
+			if eq := strings.TrimSpace(bal.TotalEq); eq != "" && eq != "0" {
+				equity = eq // 没有 USDT 明细时回退总权益（USD 计价）
+			}
+		}
+		notional := mulDecimal(qty, px)
+		lever := strings.TrimSpace(ec.params.Lever)
+		if ok, why := okxrest.FitsMargin(notional, equity, lever); !ok {
+			return actool.Errorf(fmt.Sprintf(
+				"纸面开仓被本地拒绝：%s。\n"+
+					"这一单在交易所同样会被拒绝（保证金不足），记进纸面账本只会让模拟盈亏失真。\n"+
+					"请按权益重算 qty：qty × %s ≤ %s × %s 倍", why, px, equity, lever)), nil
+		}
 	}
 
 	// ---- 加仓：合并到已有计划，不插新行 ----
@@ -785,6 +837,15 @@ func (t *ExecToolSet) closePosition() actool.CoreTool {
 				return actool.Errorf(fmt.Sprintf("平仓下单失败: %v", oErr)), nil
 			}
 			rec.ChannelOrderID = ack.OrdID
+			// 与开仓同理：台账要反映实际成交，不能一律 submitted。
+			// 平仓单成不成交直接决定「还剩多少仓」，猜错会让模型的
+			// 下一次决策建立在错误的敞口上。
+			switch st, _, _ := awaitFill(cctx, ec.client, ec.inst.Symbol, cid); st {
+			case "filled":
+				rec.State = db.TradeRecordFilled
+			case "canceled":
+				rec.State, rec.Error = db.TradeRecordFailed, "交易所撤销（未成交）"
+			}
 			if _, iErr := t.pg.InsertTradeRecord(rec); iErr != nil {
 				return actool.Errorf(fmt.Sprintf(
 					"**平仓单已下出（ordId=%s）但台账写入失败**: %v —— 请人工记录",
@@ -1009,4 +1070,17 @@ func sameUnderlying(a, b string) bool {
 	}
 	na, nb := base(a), base(b)
 	return na != "" && na == nb
+}
+
+// mulDecimal 两个十进制字符串相乘，保持精度（不走 float64）。
+//
+// 名义金额要拿去和权益比大小，float64 的尾数误差足以让
+// 「刚好等于上限」的单被误判成超限或漏放。
+func mulDecimal(a, b string) string {
+	x, ok1 := new(big.Rat).SetString(strings.TrimSpace(a))
+	y, ok2 := new(big.Rat).SetString(strings.TrimSpace(b))
+	if !ok1 || !ok2 {
+		return "0"
+	}
+	return decimalString(new(big.Rat).Mul(x, y))
 }

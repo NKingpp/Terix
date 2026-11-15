@@ -121,6 +121,23 @@ func (s *FillsSyncer) SyncAccount(ctx context.Context, accountID int64) (int, er
 				total++
 			}
 		}
+		// 成交落库后立刻回填台账 state。
+		//
+		// # 为什么在这里而不是单独一个定时任务
+		//
+		// 台账 state 与成交明细是同一份事实的两个视角。分开更新就会出现
+		// 「成交明细齐了但台账还写着 submitted」的中间态 —— 而那正是
+		// 2026-11-15 那次对账误判的直接原因（有人看到 submitted 就断定
+		// 0 成交，实际交易所早已全额成交）。
+		//
+		// 失败不中断：成交已经写进去了，state 下轮还能补。
+		if n, bErr := s.db.BackfillTradeRecordStates(accountID); bErr != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("回填台账状态失败: %w", bErr)
+			}
+		} else if n > 0 {
+			slog.Info("台账状态回填", "account_id", accountID, "rows", n)
+		}
 	}
 	return total, firstErr
 }

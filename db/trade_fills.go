@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 )
 
@@ -138,6 +140,56 @@ LEFT JOIN orders_draft od ON od.id = COALESCE(tf.draft_id, oe.draft_id)`
 			return nil, err
 		}
 		out = append(out, tf)
+	}
+	return out, rows.Err()
+}
+
+// LocalNetPositions 按标的汇总本地成交推算的净持仓（正=多，负=空）。
+//
+// # 与 PnL 的关系
+//
+// PnL 是「逐笔加权成本法」算出来的商业口径（含已实现盈亏）。
+// 这里要的是更朴素的东西：**净敞口**。对账只关心「我这边认为还有几手」，
+// 不需要成本和盈亏 —— 而且那两者都是派生的，不能用来互相校验。
+//
+// 用 SQL 聚合而不是拉全量到内存：单个账户的成交可能有几千条，对账每轮都要跑。
+func (d *DB) LocalNetPositions(accountID int64) (map[string]string, error) {
+	if accountID <= 0 {
+		return map[string]string{}, nil
+	}
+	rows, err := d.Query(`
+SELECT inst_id,
+       SUM(CASE WHEN LOWER(side)='buy' THEN CAST(fill_sz AS REAL)
+                ELSE -CAST(fill_sz AS REAL) END) AS net
+FROM trade_fills WHERE account_id = $1
+GROUP BY inst_id`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var inst string
+		var net float64
+		if err := rows.Scan(&inst, &net); err != nil {
+			return nil, err
+		}
+		// 抹掉浮点噪声后再格式化。
+		//
+		// # 为什么（2026-11-15 首次上线就踩到）
+		//
+		// SQLite 没有十进制类型，SUM(CAST(fill_sz AS REAL)) 会积累误差：
+		// 一买一卖「应该正好抵消」时能算出 -1.4e-17。直接格式化就成了
+		// "-0"，而对账侧交易所返回 "0" —— 两者数值相等，字符串不等，
+		// 于是漂移检测报了一条假阳性。
+		//
+		// 按 8 位小数归整：OKX 最细的合约张数精度是 1e-8 级别，再细的就是噪声。
+		if math.Abs(net) < 5e-9 {
+			net = 0
+		} else {
+			net = math.Round(net*1e8) / 1e8
+		}
+		out[inst] = strconv.FormatFloat(net, 'f', -1, 64)
 	}
 	return out, rows.Err()
 }

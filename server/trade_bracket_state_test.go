@@ -46,6 +46,7 @@ type fakeOkxTrader struct {
 	placedAlgos  []okxrest.AlgoRequest
 	canceledIDs  []string
 	lastPrice    string
+	balanceErr   error
 }
 
 func (f *fakeOkxTrader) GetPositions(context.Context, string) ([]okxrest.Position, error) {
@@ -108,6 +109,17 @@ func (f *fakeOkxTrader) AmendAlgoOCO(context.Context, string, string, string, st
 func (f *fakeOkxTrader) SetLeverage(context.Context, string, string, string) error {
 	f.calls = append(f.calls, "SetLeverage")
 	return nil
+}
+
+func (f *fakeOkxTrader) FetchAccountBalance(context.Context) (*okxrest.AccountBalance, error) {
+	f.calls = append(f.calls, "FetchAccountBalance")
+	if f.balanceErr != nil {
+		return nil, f.balanceErr
+	}
+	return &okxrest.AccountBalance{
+		TotalEq: "87000",
+		Details: []map[string]string{{"ccy": "USDT", "avail_eq": "87000", "eq": "87000"}},
+	}, nil
 }
 
 func (f *fakeOkxTrader) LastPrice(context.Context, string) (string, error) {

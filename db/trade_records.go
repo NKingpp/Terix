@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -134,6 +135,83 @@ SET channel_order_id = COALESCE(NULLIF($2,''), channel_order_id),
     error = NULLIF($4,'')
 WHERE id = $1`, id, strings.TrimSpace(channelOrderID), state, strings.TrimSpace(errText))
 	return err
+}
+
+// BackfillTradeRecordStates 按成交明细回填 trade_records.state。
+//
+// # 为什么需要（2026-11-15 对账事故）
+//
+// 下单时我们只知道「交易所受理了」，于是台账写 submitted。而实际上
+// 市价单几乎立刻成交 —— 台账却永远停在 submitted，事后核对
+// 「这单到底成交没有、成交多少」只能去交易所查。
+//
+// 更糟的是它会被误读：实测有人看到 state=submitted 就断定
+// 「0 成交」，进而怀疑整条执行链，而交易所那边 150 张早就全额成交。
+//
+// # 判据
+//
+// 按 cl_ord_id 汇总 fills 的成交数量：
+//
+//	sum >= qty  → filled
+//	0 < sum < qty → 仍是 submitted（部分成交，语义上还在进行）
+//	sum == 0    → 不动（可能真的没成交，也可能还没同步到）
+//
+// 只更新 state='submitted' 的行 —— filled/failed 是终态，不该被覆盖
+// （否则一次漏同步会把已经确认成交的记录改回未定）。
+func (d *DB) BackfillTradeRecordStates(accountID int64) (int, error) {
+	if accountID <= 0 {
+		return 0, nil
+	}
+	rows, err := d.Query(`
+SELECT tr.id, tr.qty, COALESCE(SUM(CAST(tf.fill_sz AS REAL)), 0) AS filled
+FROM trade_records tr
+LEFT JOIN trade_fills tf ON tf.cl_ord_id = tr.client_order_id
+WHERE tr.account_id = $1 AND tr.state = 'submitted'
+  AND COALESCE(tr.client_order_id,'') <> ''
+GROUP BY tr.id, tr.qty`, accountID)
+	if err != nil {
+		return 0, err
+	}
+	type row struct {
+		id     int64
+		qty    float64
+		filled float64
+	}
+	var todo []row
+	for rows.Next() {
+		var r row
+		var qtyStr string
+		if err := rows.Scan(&r.id, &qtyStr, &r.filled); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		r.qty, _ = strconv.ParseFloat(strings.TrimSpace(qtyStr), 64)
+		if r.filled > 0 {
+			todo = append(todo, r)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	updated := 0
+	for _, r := range todo {
+		// 允许 1e-9 的浮点误差：fill_sz 与 qty 都是十进制字符串，
+		// 累加后可能有尾数差。
+		if r.qty > 0 && r.filled+1e-9 < r.qty {
+			continue // 部分成交，保持 submitted
+		}
+		res, uErr := d.Exec(`UPDATE trade_records SET state='filled'
+WHERE id=$1 AND state='submitted'`, r.id)
+		if uErr != nil {
+			return updated, uErr
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			updated++
+		}
+	}
+	return updated, nil
 }
 
 // TaskIDsByClientOrderIDs 批量把 clOrdId 映射到任务 id。
