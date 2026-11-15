@@ -24,7 +24,7 @@ func TestGateBlockedAccountDenies(t *testing.T) {
 	draftID := newGateTestDraft(t, g, "crypto")
 
 	res, err := g.Authorize(t.Context(), GateRequest{
-		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModePaper,
+		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModeLiveManual,
 	})
 	if err != nil {
 		t.Fatalf("不该返回 error: %v", err)
@@ -37,30 +37,6 @@ func TestGateBlockedAccountDenies(t *testing.T) {
 	}
 }
 
-// TestGateFrozenModeDenies 全局 frozen → deny（含 paper）。
-func TestGateFrozenModeDenies(t *testing.T) {
-	g, done := gateTestEnv(t)
-	defer done()
-
-	acct := newGateTestAccount(t, g, "frozen")
-	draftID := newGateTestDraft(t, g, "crypto")
-
-	if _, err := g.db.TransitionMode(paperMode(), frozenMode()); err != nil {
-		t.Fatalf("切 frozen 失败: %v", err)
-	}
-	t.Cleanup(func() { _, _, _ = g.db.ForceSetExecMode(paperMode()) })
-
-	// 传入 frozen（与系统一致）→ 应在冻结检查处 deny
-	res, err := g.Authorize(t.Context(), GateRequest{
-		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModeFrozen,
-	})
-	if err != nil {
-		t.Fatalf("不该返回 error: %v", err)
-	}
-	if res.Decision != DecisionDeny || res.ErrCode != CodeModeFrozen {
-		t.Errorf("frozen 应 deny/%s，实际 %s/%s", CodeModeFrozen, res.Decision, res.ErrCode)
-	}
-}
 
 // TestGateModeMismatchDenies 调用方传的模式与系统不一致 → deny。
 //
@@ -73,9 +49,9 @@ func TestGateModeMismatchDenies(t *testing.T) {
 	acct := newGateTestAccount(t, g, "mismatch")
 	draftID := newGateTestDraft(t, g, "crypto")
 
-	// 系统是 paper，但调用方说自己是 live_manual
+	// 系统是 live_manual（resetToPaper 的当前落点），但调用方说自己是 live_whitelist
 	res, err := g.Authorize(t.Context(), GateRequest{
-		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModeLiveManual,
+		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModeLiveWhitelist,
 	})
 	if err != nil {
 		t.Fatalf("不该返回 error: %v", err)
@@ -95,11 +71,7 @@ func TestGateLimitsIncompleteLiveDenies(t *testing.T) {
 	acct := newGateTestAccount(t, g, "nolimits")
 	draftID := newGateTestDraft(t, g, "crypto")
 
-	// 切到 live_manual
-	if _, err := g.db.TransitionMode(paperMode(), liveManualMode()); err != nil {
-		t.Fatalf("切 live 失败: %v", err)
-	}
-	t.Cleanup(func() { _, _, _ = g.db.ForceSetExecMode(paperMode()) })
+	// 系统默认即 live_manual，无需切换
 	// 确保没有限额
 	_, _ = g.db.Exec(`DELETE FROM execution_limits WHERE key='global'`)
 
@@ -129,7 +101,7 @@ func TestGateLimitsIncompletePaperAllows(t *testing.T) {
 	_, _ = g.db.Exec(`DELETE FROM execution_limits WHERE key='global'`)
 
 	res, err := g.Authorize(t.Context(), GateRequest{
-		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModePaper,
+		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModeLiveManual,
 	})
 	if err != nil {
 		t.Fatalf("不该返回 error: %v", err)
@@ -179,10 +151,6 @@ func TestGateAshareManualAllows(t *testing.T) {
 	acct := newGateTestAccount(t, g, "ashare2")
 	draftID := newGateTestDraft(t, g, "cn")
 
-	if _, err := g.db.TransitionMode(paperMode(), liveManualMode()); err != nil {
-		t.Fatalf("切 live_manual 失败: %v", err)
-	}
-	t.Cleanup(func() { _, _, _ = g.db.ForceSetExecMode(paperMode()) })
 
 	res, err := g.Authorize(t.Context(), GateRequest{
 		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModeLiveManual,
@@ -206,7 +174,7 @@ func TestGateAsharePaperAllows(t *testing.T) {
 	draftID := newGateTestDraft(t, g, "cn")
 
 	res, err := g.Authorize(t.Context(), GateRequest{
-		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModePaper,
+		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModeLiveManual,
 	})
 	if err != nil {
 		t.Fatalf("不该返回 error: %v", err)
@@ -259,7 +227,7 @@ func TestGateRulesRevisionChangeAsks(t *testing.T) {
 	}
 
 	res, err := g.Authorize(t.Context(), GateRequest{
-		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModePaper,
+		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModeLiveManual,
 	})
 	if err != nil {
 		t.Fatalf("不该返回 error: %v", err)
@@ -283,7 +251,7 @@ func TestGateSingleAmountExceededDenies(t *testing.T) {
 	draftID := newGateTestDraftWithPrice(t, g, "crypto", "10", "100")
 
 	res, err := g.Authorize(t.Context(), GateRequest{
-		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModePaper,
+		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModeLiveManual,
 	})
 	if err != nil {
 		t.Fatalf("不该返回 error: %v", err)
@@ -318,7 +286,7 @@ func TestGateDailyAmountExceededDenies(t *testing.T) {
 	draftID := newGateTestDraftWithPrice(t, g, "crypto", "2", "100")
 
 	res, err := g.Authorize(t.Context(), GateRequest{
-		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModePaper,
+		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModeLiveManual,
 	})
 	if err != nil {
 		t.Fatalf("不该返回 error: %v", err)
@@ -349,7 +317,7 @@ func TestGateDailyCountExceededDenies(t *testing.T) {
 	// 第 3 笔应被拒
 	draftID := newGateTestDraftWithPrice(t, g, "crypto", "1", "10")
 	res, err := g.Authorize(t.Context(), GateRequest{
-		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModePaper,
+		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModeLiveManual,
 	})
 	if err != nil {
 		t.Fatalf("不该返回 error: %v", err)
@@ -378,7 +346,7 @@ func TestGateDailyNotionalUnknownDenies(t *testing.T) {
 
 	draftID := newGateTestDraftWithPrice(t, g, "crypto", "1", "10")
 	res, err := g.Authorize(t.Context(), GateRequest{
-		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModePaper,
+		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModeLiveManual,
 	})
 	if err != nil {
 		t.Fatalf("不该返回 error: %v", err)
@@ -407,7 +375,7 @@ func TestGateDraftIncompleteDenies(t *testing.T) {
 	t.Cleanup(func() { _, _ = g.db.Exec(`DELETE FROM orders_draft WHERE id=$1`, id) })
 
 	res, err := g.Authorize(t.Context(), GateRequest{
-		DraftID: id, AccountID: acct.ID, Mode: db.ExecModePaper,
+		DraftID: id, AccountID: acct.ID, Mode: db.ExecModeLiveManual,
 	})
 	if err != nil {
 		t.Fatalf("不该返回 error: %v", err)
@@ -432,7 +400,7 @@ func TestGateRuleDenyShortCircuits(t *testing.T) {
 	draftID := newGateTestDraft(t, g, "crypto")
 
 	res, err := g.Authorize(t.Context(), GateRequest{
-		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModePaper,
+		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModeLiveManual,
 	})
 	if err != nil {
 		t.Fatalf("不该返回 error: %v", err)

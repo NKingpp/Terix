@@ -111,7 +111,7 @@ func (e *execTickerEnv) mkStaleOrder(age time.Duration) *db.ExecOrder {
 	orderID, err := e.pg.ExecOrders().InsertOrder(db.ExecOrderInput{
 		DraftID:       draftID,
 		AccountID:     e.acct.ID,
-		Mode:          string(db.ExecModePaper),
+		Mode:          string(db.ExecModeLiveManual),
 		State:         db.ExecStateSubmitted,
 		ClientOrderID: clientID,
 		Qty:           "10",

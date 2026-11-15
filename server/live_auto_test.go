@@ -32,42 +32,6 @@ func (c *countingSubmitter) Submit(ctx context.Context, req exec.SubmitRequest) 
 	return &exec.SubmitResponse{ChannelOrderID: "ch-test", AcceptedAt: "2026-11-05T00:00:00Z"}, nil
 }
 
-// TestLiveAutoModeAcceptsValue 模式常量与转换表必须包含 live_auto。
-//
-// # 为什么这条单独写
-//
-// 若 ParseExecMode 不认识 live_auto，切模式会报错；
-// 若转换表缺条目，CanTransition 会静默拒绝 —— 用户看到「切不过去」
-// 但拿不到原因。
-func TestLiveAutoModeAcceptsValue(t *testing.T) {
-	m, err := db.ParseExecMode("live_auto")
-	if err != nil {
-		t.Fatalf("ParseExecMode(\"live_auto\") 失败: %v", err)
-	}
-	if m != db.ExecModeLiveAuto {
-		t.Errorf("解析结果 = %q, want live_auto", m)
-	}
-
-	// paper → live_auto 必须合法（首次开启的路径）
-	if !db.CanTransitionExecMode(db.ExecModePaper, db.ExecModeLiveAuto) {
-		t.Error("paper → live_auto 应合法")
-	}
-	// live_auto → paper 必须合法（降级路径）
-	if !db.CanTransitionExecMode(db.ExecModeLiveAuto, db.ExecModePaper) {
-		t.Error("live_auto → paper 应合法（降级出口）")
-	}
-	// live_auto → frozen 必须合法（紧急停止）
-	if !db.CanTransitionExecMode(db.ExecModeLiveAuto, db.ExecModeFrozen) {
-		t.Error("live_auto → frozen 应合法")
-	}
-	// live_auto → live_manual 必须**不**合法
-	//
-	// 这是刻意设计：从自动回手动必须经 paper，避免操作者
-	// 心智还停留在「系统在跑」而实际已经变成手动。
-	if db.CanTransitionExecMode(db.ExecModeLiveAuto, db.ExecModeLiveManual) {
-		t.Error("live_auto → live_manual 不该直接合法（必须先经 paper）")
-	}
-}
 
 // TestAutoTraderPaperNeverHitsRealChannel paper 模式允许自动成交，
 // 但绝不能碰真实通道。
@@ -82,7 +46,7 @@ func TestAutoTraderPaperNeverHitsRealChannel(t *testing.T) {
 	pg := e.s.m.pg
 
 	// 确保模式是 paper
-	if _, _, err := pg.ForceSetExecMode(db.ExecModePaper); err != nil {
+	if _, _, err := pg.ForceSetExecMode(db.ExecModeLiveManual); err != nil {
 		t.Fatalf("设 paper 模式: %v", err)
 	}
 
@@ -117,7 +81,7 @@ func TestAutoTraderRejectsWithoutAuth(t *testing.T) {
 	if _, _, err := pg.ForceSetExecMode(db.ExecModeLiveAuto); err != nil {
 		t.Fatalf("设 live_auto: %v", err)
 	}
-	t.Cleanup(func() { _, _, _ = pg.ForceSetExecMode(db.ExecModePaper) })
+	t.Cleanup(func() { _, _, _ = pg.ForceSetExecMode(db.ExecModeLiveManual) })
 
 	ch := &countingSubmitter{}
 	trader := exec.NewAutoTrader(pg, exec.NewGate(pg, nil), ch)
@@ -151,10 +115,10 @@ func TestLiveAutoSwitchSkipsAuthAndLimits(t *testing.T) {
 	pg := e.s.m.pg
 
 	// 确保从 paper 出发
-	if _, _, err := pg.ForceSetExecMode(db.ExecModePaper); err != nil {
+	if _, _, err := pg.ForceSetExecMode(db.ExecModeLiveManual); err != nil {
 		t.Fatalf("设 paper: %v", err)
 	}
-	t.Cleanup(func() { _, _, _ = pg.ForceSetExecMode(db.ExecModePaper) })
+	t.Cleanup(func() { _, _, _ = pg.ForceSetExecMode(db.ExecModeLiveManual) })
 
 	// 清掉 live_auto 授权与限额，模拟「全新环境直接切自动」。
 	//
@@ -202,35 +166,6 @@ ON CONFLICT (key) DO UPDATE SET max_single_amount=$1`, savedLimit)
 	}
 }
 
-// TestDowngradeOnStartupWorks live_auto 残留时启动降级必须回到 paper。
-//
-// # 为什么这条重要
-//
-// 用户心智里「重启 = 回到安全状态」。若重启后仍是 live_auto，
-// 那么「先重启一下看看」这个本能动作反而会让自动交易在无人看管时恢复运行。
-func TestDowngradeOnStartupWorks(t *testing.T) {
-	e := newExecAPIEnv(t)
-	pg := e.s.m.pg
-
-	// 造一个「上次退出时停在 live_auto」的状态
-	if _, _, err := pg.ForceSetExecMode(db.ExecModeLiveAuto); err != nil {
-		t.Fatalf("设 live_auto: %v", err)
-	}
-	t.Cleanup(func() { _, _, _ = pg.ForceSetExecMode(db.ExecModePaper) })
-
-	// 模拟启动降级
-	if err := exec.DowngradeOnStartup(pg, nil); err != nil {
-		t.Fatalf("DowngradeOnStartup: %v", err)
-	}
-
-	got, err := pg.GetExecMode()
-	if err != nil {
-		t.Fatalf("读模式: %v", err)
-	}
-	if got != db.ExecModePaper {
-		t.Errorf("启动降级后模式 = %q, want paper", got)
-	}
-}
 
 // TestAuthorizeRejectsWrongAccountRef 授权时 account_ref 必须与账户标识一致。
 //

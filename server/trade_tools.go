@@ -24,10 +24,10 @@ package server
 //
 //	create_order_draft  提案：写草案（不执行、无副作用）
 //	authorize_order     过闸：Gate.Authorize 判定 + 落判定记录
-//	execute_paper_order 执行：仅 paper 模式真正记账
 //
-// 为什么拆三步而不是一个 place_order：闸门需要草案 ID 才能求值风控、
+// 为什么拆两步而不是一个 place_order：闸门需要草案 ID 才能求值风控、
 // 比对规则指纹、写 draft_risk_verdicts。所以「先有草案」是硬约束。
+// 真正下单走 open_position（server/trade_exec_tools.go）。
 
 import (
 	"context"
@@ -55,7 +55,6 @@ import (
 var tradeToolNames = []string{
 	"create_order_draft",
 	"authorize_order",
-	"execute_paper_order",
 	"get_positions",
 	"get_task_trades",
 	"modify_bracket",
@@ -76,7 +75,6 @@ var tradeToolNames = []string{
 var draftScopedTradeToolNames = []string{
 	"create_order_draft",
 	"authorize_order",
-	"execute_paper_order",
 }
 
 // TradeToolSet 持有交易工具需要的依赖。
@@ -111,7 +109,6 @@ func (t *TradeToolSet) Tools() []actool.CoreTool {
 	return []actool.CoreTool{
 		t.createOrderDraft(),
 		t.authorizeOrder(),
-		t.executePaperOrder(),
 		t.getPositions(),
 		t.getTaskTrades(),
 		t.modifyBracket(),
@@ -462,63 +459,6 @@ func (t *TradeToolSet) authorizeOrder() actool.CoreTool {
 // execute_paper_order：paper 模式执行
 // ---------------------------------------------------------------------
 
-func (t *TradeToolSet) executePaperOrder() actool.CoreTool {
-	return tradeWriteTool(
-		"execute_paper_order",
-		"在纸面（paper）模式执行已过闸门的订单，记入纸面账本。**不涉及真实资金**。\n"+
-			"前置：该草案必须先通过 authorize_order（decision=allow）。\n"+
-			"若当前是 live 模式，本工具会拒绝 —— 真实下单走独立通道。\n\n"+
-			"为什么 live 不走这里：真实资金下发由 exec/vaultd 独立进程承担，\n"+
-			"它只从环境变量读密钥、不持有数据库连接（隔离设计）。",
-		tradeObj(map[string]any{
-			"draft_id":   tradeInt("草案 ID"),
-			"account_id": tradeInt("执行账户 ID"),
-		}, "draft_id", "account_id"),
-		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
-			if err := t.guard(); err != nil {
-				return actool.Errorf(err.Error()), nil
-			}
-			var a struct {
-				DraftID   int64 `json:"draft_id"`
-				AccountID int64 `json:"account_id"`
-			}
-			if err := json.Unmarshal(in, &a); err != nil {
-				return actool.Errorf(fmt.Sprintf("入参解析失败: %v", err)), nil
-			}
-			if a.DraftID <= 0 || a.AccountID <= 0 {
-				return actool.Errorf("draft_id / account_id 无效"), nil
-			}
-
-			if err := t.validateDraftContext(ctx, a.DraftID); err != nil {
-				return actool.Errorf(err.Error()), nil
-			}
-			mode, err := t.pg.GetExecMode()
-			if err != nil {
-				return actool.Errorf(fmt.Sprintf("读执行模式失败: %v", err)), nil
-			}
-			// 只允许 paper。live 的真实下发不在进程内，不能在此静默降级 ——
-			// 那会让 agent 以为「已下单」而实际什么都没发生。
-			if mode != db.ExecModePaper {
-				return actool.Errorf(fmt.Sprintf(
-					"当前是 %s 模式，本工具只执行 paper 单。真实下单需走 live 通道（未接入本工具）",
-					mode)), nil
-			}
-
-			paperID, err := t.gate.ExecutePaper(ctx, a.DraftID, a.AccountID)
-			if err != nil {
-				return actool.Errorf(fmt.Sprintf("纸面执行失败: %v", err)), nil
-			}
-
-			return tradeJSON(map[string]any{
-				"paper_order_id": paperID,
-				"draft_id":       a.DraftID,
-				"account_id":     a.AccountID,
-				"mode":           string(mode),
-				"note":           "已记入纸面账本，不涉及真实资金。",
-			})
-		},
-	)
-}
 
 // requireTaskInstrument 校验任务上下文并返回任务绑定的 instrument_id。
 //
@@ -910,18 +850,6 @@ func (t *TradeToolSet) getPositions() actool.CoreTool {
 			// 纸面模式读**纸面账本**，不是交易所。
 			//
 			// # 为什么（2026-11-14 任务 30）
-			//
-			// 纸面仓在交易所不存在，所以按交易所读永远返回空。而模型拿到
-			// 「count:0」就断定「没有持仓」，于是它不会去平仓/改保护 ——
-			// 实测任务 30 的 trader 连续两次报「三处都找不到该仓」，
-			// 而纸面账本里明明有一条 short 0.1。
-			//
-			// 这不是小事：「看不见自己的仓」会让后续所有决策都建立在
-			// 错误前提上，而模型没有任何办法发现这一点。
-			if mode, mErr := t.pg.GetExecMode(); mErr == nil && mode == db.ExecModePaper {
-				return t.getPaperPositions(ctx)
-			}
-
 			client, cErr := t.okxClient()
 			if cErr != nil {
 				return actool.Errorf(cErr.Error()), nil
@@ -1044,10 +972,6 @@ func (t *TradeToolSet) getTaskTrades() actool.CoreTool {
 			livePnL := exec.ComputePnLByInst(fills)
 
 			actions, _ := t.pg.ListTradeRecords(db.TradeRecordFilter{TaskID: ri.TaskID, Limit: 100})
-			paper, pErr := db.TaskTradeSummaryFor(ctx, t.pg.DB, ri.TaskID, "paper", 0)
-			if pErr != nil {
-				return actool.Errorf(fmt.Sprintf("读模拟盘成交失败: %v", pErr)), nil
-			}
 
 			return tradeJSON(map[string]any{
 				"task_id": ri.TaskID,
@@ -1056,12 +980,6 @@ func (t *TradeToolSet) getTaskTrades() actool.CoreTool {
 					"pnl":        livePnL,
 					"synced":     len(fills) > 0,
 					"note":       "逐笔成交含手续费；未平仓部分的浮动盈亏不在此处",
-				},
-				"paper": map[string]any{
-					"realized_total": paper.RealizedTotal,
-					"fills":          paper.Fills,
-					"open_positions": paper.OpenPositions,
-					"fee_included":   false,
 				},
 				// actions 是「我做过什么」的原始台账（含被拒的）。
 				// 与 pnl 的差别：pnl 只统计真的成交了的部分。
@@ -1342,56 +1260,3 @@ func tradeReadTool(name, desc string, schema map[string]any,
 	})
 }
 
-// getPaperPositions 把纸面账本里的未平仓计划渲染成 get_positions 的形状。
-//
-// 形状与实盘一致是刻意的：模型对同一份字段做同一套判断，
-// 不该因为模式不同而换一套读法（那会让 prompt 里的「当前持仓」段落
-// 在两种模式下语义不同）。
-func (t *TradeToolSet) getPaperPositions(ctx context.Context) (actool.Result, error) {
-	plans, err := t.pg.ListOpenPaperTradePlans(0)
-	if err != nil {
-		return actool.Errorf(fmt.Sprintf("读纸面持仓失败: %v", err)), nil
-	}
-	type protection struct {
-		AlgoID string `json:"algo_id"`
-		Tp     string `json:"tp"`
-		Sl     string `json:"sl"`
-	}
-	type row struct {
-		InstID     string       `json:"inst_id"`
-		PosSide    string       `json:"pos_side"`
-		Pos        string       `json:"pos"`
-		AvgPx      string       `json:"avg_px"`
-		MarkPx     string       `json:"mark_px"`
-		Upl        string       `json:"upl"`
-		Lever      string       `json:"lever"`
-		Protection []protection `json:"protection"`
-	}
-	out := make([]row, 0, len(plans))
-	bare := make([]string, 0, 2)
-	for _, p := range plans {
-		r := row{InstID: p.Symbol, PosSide: p.PosSide, Pos: p.Qty, Protection: []protection{}}
-		// 纸面没有交易所侧 OCO，用计划里的 TP/SL 表达「保护是否存在」。
-		if p.TpPrice != "" || p.SlPrice != "" {
-			r.Protection = append(r.Protection, protection{
-				AlgoID: fmt.Sprintf("paper-plan-%d", p.ID), Tp: p.TpPrice, Sl: p.SlPrice,
-			})
-		} else {
-			bare = append(bare, p.Symbol)
-		}
-		out = append(out, r)
-	}
-	payload := map[string]any{
-		"positions": out, "count": len(out), "mode": "paper",
-	}
-	if len(bare) > 0 {
-		payload["warning"] = "以下纸面仓没有止盈止损：" + strings.Join(bare, ", ") +
-			" —— 用 modify_bracket 补挂，或到点调 close_position"
-	}
-	if len(out) == 0 {
-		payload["note"] = "纸面账本当前无未平仓持仓（这是纸面账本返回空，不是读取失败）"
-	} else {
-		payload["note"] = "纸面持仓，不涉及真实资金；TP/SL 是记录值，不自动触发，需按判断调 close_position"
-	}
-	return tradeJSON(payload)
-}

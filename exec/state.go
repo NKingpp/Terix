@@ -5,8 +5,7 @@ package exec
 // # 这个包管什么，不管什么
 //
 // 管：
-//   - 模式转换的**校验**（五条硬规则）
-//   - 进程启动时的**降级**（非 paper → paper，带审计）
+//   - 模式转换的**校验**
 //
 // 不管：
 //   - 落库（那是 db 包的 TransitionMode）
@@ -118,24 +117,15 @@ type TransitionRequest struct {
 //
 // # 五条规则的分工
 //
-//	规则 1 frozen → live_* 拒绝         → 本函数（纯查表 + 显式分支）
+//	规则 1 转换合法性                     → 本函数（查转换表）
 //	规则 2 升级 live 需有效授权           → 本函数（isLiveUpgrade + 三重一致）
 //	规则 3 限额不完整时拒绝 live          → 本函数（ValidateLimits）
-//	规则 4 重启降 paper                  → DowngradeOnStartup
-//	规则 5 审计失败导致转换失败            → ApplyTransition
+//	规则 4 审计失败导致转换失败            → ApplyTransition
 //
 // 前三条是**纯判断**（不改任何状态），所以放这里；
-// 后两条涉及副作用，放 ApplyTransition / DowngradeOnStartup。
+// 第四条涉及副作用，放 ApplyTransition。
 func ValidateTransition(req TransitionRequest) error {
 	if !db.CanTransitionExecMode(req.From, req.To) {
-		// frozen → live_* 是最常见的一条，给它单独的 code，
-		// 因为调用方的处置完全不同（要去解冻，而不是「转换写错了」）。
-		if req.From == db.ExecModeFrozen && isLive(req.To) {
-			return &ModeError{
-				Code:   CodeModeFrozenRejectsLive,
-				Reason: "系统处于冻结状态，必须先回到 paper 模式确认问题已解决",
-			}
-		}
 		return &ModeError{
 			Code:   CodeModeTransitionInvalid,
 			Reason: fmt.Sprintf("%s → %s 不是合法转换", req.From, req.To),
@@ -268,22 +258,15 @@ func isLive(m db.ExecMode) bool {
 //
 // 升级 = 目标比来源更接近实盘：
 //
-//	paper → live_*            ✓ 升级
 //	live_whitelist → live_manual  ✓ 升级（约束更松）
 //	live_manual → live_whitelist  ✗ 降档（约束更紧，不需要重新授权）
-//	live_* → paper               ✗ 降级
-//	任意 → frozen                ✗ 降级
-//	frozen → paper               ✗ 降级（但这是唯一合法出口）
+//	live_* → live_auto            ✓ 升级（无人值守，必须重新授权）
 func isLiveUpgrade(from, to db.ExecMode) bool {
 	if !isLive(to) {
 		return false
 	}
-	if from == db.ExecModeFrozen {
-		// frozen 不能直接到 live（转换表已拦，这里再兜一次防止调用方绕过）
-		return false
-	}
 	if !isLive(from) {
-		return true // paper → live_*
+		return true
 	}
 	// live → live：只有 whitelist → manual 是升级（约束变松）
 	return from == db.ExecModeLiveWhitelist && to == db.ExecModeLiveManual

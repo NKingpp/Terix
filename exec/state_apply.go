@@ -260,50 +260,6 @@ func ApplyTransition(d *db.DB, auditor Auditor, req TransitionRequest, reason st
 // ErrModeConflict 表示模式已被别人先改（不是错误）。
 var ErrModeConflict = errors.New("exec mode was changed concurrently")
 
-// DowngradeOnStartup 在进程启动时把非 paper 模式降为 paper（规则 4）。
-//
-// # 三条要求
-//
-//  1. **幂等**：两个进程同时启动，只有一个能成功降级（ForceSetExecMode 的
-//     CAS 保证）。另一个拿到 changed=false，什么都不做。
-//  2. **有记录**：成功降级那个写审计（含降级前的模式）。
-//  3. **不刷噪音**：本来就是 paper 时不写审计 —— 否则每次重启都一条。
-//
-// # 为什么必须在启动时、且在任何下单路径可用之前调用
-//
-// 否则存在一个窗口期：进程已经能接单，但模式还是上次的 live_*。
-// 那个窗口里的订单会真的打到通道 —— 而用户以为重启后是安全的 paper。
-func DowngradeOnStartup(d *db.DB, auditor Auditor) error {
-	changed, previous, err := d.ForceSetExecMode(db.ExecModePaper)
-	if err != nil {
-		return fmt.Errorf("启动降级失败: %w", err)
-	}
-	if !changed {
-		// 本来就是 paper，或并发下别人已经降了 —— 都不写审计。
-		return nil
-	}
-
-	// 真的降级了，写审计。
-	//
-	// 这里审计失败不回滚（与 ApplyTransition 不同）：
-	// 启动降级的方向是「收紧」，失败时保持在 paper 比回滚到 live_* 安全得多。
-	// 所以只记日志，不阻断启动 —— 否则「审计写不进去」会让系统起不来，
-	// 而系统起不来时用户更容易做危险操作（比如手动改 DB 绕过）。
-	if auditor != nil {
-		prev, pErr := db.ParseExecMode(previous)
-		if pErr != nil {
-			// previous 是坏值 —— 记一个占位。
-			prev = db.ExecMode("(unknown:" + previous + ")")
-		}
-		if aErr := auditor.WriteModeChange(prev, db.ExecModePaper,
-			"进程重启，实盘模式自动降级为纸面模式"); aErr != nil {
-			slog.Error("启动降级的审计写入失败（不阻断启动，模式已是 paper）",
-				"from", previous, "err", aErr)
-		}
-	}
-	return nil
-}
-
 // ParseInt64Ptr 是给测试与调用方用的小工具：把字符串转成 *int64。
 //
 // 放在这里而不是 db 包，因为它只服务 exec 的限额快照构造。

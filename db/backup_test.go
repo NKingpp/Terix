@@ -343,7 +343,9 @@ func TestOpenIsIdempotent(t *testing.T) {
 // TestForeignKeyEnforced 验证外键真的被强制（漏设 foreign_keys=1 时这条会失败）。
 func TestForeignKeyEnforced(t *testing.T) {
 	d := openTestDB(t)
-	_, err := d.Exec(`INSERT INTO paper_orders(mode,side,qty,account_id) VALUES('paper','buy','1',999999)`)
+	// signals.instrument_id 有 FK → 插入不存在的标的必须失败
+	_, err := d.Exec(`INSERT INTO signals(instrument_id, signal_type, direction, action)
+VALUES(999999,'technical','long','entry')`)
 	if err == nil {
 		t.Fatal("外键未生效：插入了不存在的 account_id")
 	}

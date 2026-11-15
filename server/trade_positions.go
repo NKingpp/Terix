@@ -19,7 +19,6 @@ import (
 	"math/big"
 	"strings"
 
-	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/exec"
 	"github.com/Autumn-27/artex/exec/okxrest"
 )
@@ -39,10 +38,6 @@ type positionSnapshot struct {
 	BySide map[string]heldPosition
 	// Raw 是交易所原始行（供 get_positions 渲染）。
 	Raw []okxrest.Position
-	// Plans 是纸面未平仓计划（纸面模式专用）。
-	Plans []db.PaperTradePlan
-	// Paper 为真表示这条快照来自纸面账本，不是交易所。
-	Paper bool
 }
 
 // side 返回某方向的持仓；不存在时返回零值 + false。
@@ -100,59 +95,13 @@ func snapshotFromExchange(rows []okxrest.Position, instID, posMode string) *posi
 	return out
 }
 
-// snapshotFromPaperPlans 把纸面未平仓计划聚合成快照。
-//
-// # 纸面一律按 net 语义聚合
-//
-// 纸面账本没有双向隔离：paper_orders 按 instrument 汇总成本与盈亏，
-// 同标的多空相抵。所以这里也按「净方向」理解 —— 但实际记账仍按
-// pos_side 分开存（closePaper 按 posSide 找 plan）。
-//
-// 同一方向有多条 plan 时累加数量。历史数据里确实存在过重复行
-// （2026-11-14 任务 30 的「同标的可重复开仓」bug 造成），
-// 累加比只取第一条更接近事实。
-func snapshotFromPaperPlans(plans []db.PaperTradePlan, instrumentID int64, symbol string) *positionSnapshot {
-	out := &positionSnapshot{BySide: map[string]heldPosition{}, Plans: plans, Paper: true}
-	for _, p := range plans {
-		if instrumentID > 0 && p.InstrumentID != instrumentID {
-			continue
-		}
-		if symbol != "" && p.Symbol != "" && p.Symbol != symbol {
-			continue
-		}
-		side := strings.ToLower(strings.TrimSpace(p.PosSide))
-		if side != "long" && side != "short" {
-			continue
-		}
-		qty := strings.TrimSpace(p.Qty)
-		if qty == "" {
-			continue
-		}
-		if cur, exists := out.BySide[side]; exists {
-			cur.Qty = addDecimal(cur.Qty, qty)
-			out.BySide[side] = cur
-			continue
-		}
-		out.BySide[side] = heldPosition{Side: side, Qty: qty, Avail: qty}
-	}
-	return out
-}
 
-// snapshotPositions 读当前标的的持仓快照。
+// snapshotPositions 读当前标的的持仓快照（交易所）。
 //
-// 纸面模式读纸面账本（交易所里没有纸面仓，读了必然是空 ——
-// 那会让模型误判「无需平仓」，2026-11-14 任务 30 实测过）。
-// 实盘模式读交易所；读失败返回 error，由调用方决定是否 fail-closed。
+// 读失败返回 error，由调用方决定是否 fail-closed。
 func (t *ExecToolSet) snapshotPositions(ctx context.Context, ec *execCtx) (*positionSnapshot, error) {
 	if ec == nil || ec.inst == nil {
 		return nil, fmt.Errorf("持仓快照缺少标的上下文")
-	}
-	if ec.isPaper {
-		plans, err := t.pg.ListOpenPaperTradePlans(0)
-		if err != nil {
-			return nil, fmt.Errorf("读纸面持仓失败: %v", err)
-		}
-		return snapshotFromPaperPlans(plans, ec.inst.ID, ec.inst.Symbol), nil
 	}
 	if ec.client == nil {
 		return nil, fmt.Errorf("交易客户端未装配，无法读持仓")

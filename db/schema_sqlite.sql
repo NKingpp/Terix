@@ -961,29 +961,6 @@ CREATE TABLE IF NOT EXISTS orders_execution (
     CONSTRAINT orders_execution_risk_verdict_id_fkey FOREIGN KEY (risk_verdict_id) REFERENCES draft_risk_verdicts(id)
 );
 
-CREATE TABLE IF NOT EXISTS paper_orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-    task_id INTEGER,
-    signal_id INTEGER,
-    instrument_id INTEGER,
-    account_id INTEGER REFERENCES exec_accounts(id) ON DELETE RESTRICT,
-    mode TEXT NOT NULL,
-    side TEXT NOT NULL,
-    qty TEXT NOT NULL,
-    price TEXT,
-    filled_qty TEXT NOT NULL DEFAULT 0,
-    avg_fill_price TEXT,
-    status TEXT NOT NULL DEFAULT 'draft',
-    broker_order_id TEXT,
-    submitted_at TIMESTAMP,
-    filled_at TIMESTAMP,
-    created_at TIMESTAMP NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    CHECK ((mode IN ('paper', 'live'))),
-    CHECK ((side IN ('buy', 'sell'))),
-    CHECK ((status IN ('draft', 'risk_passed', 'submitted', 'filled', 'partial', 'rejected', 'cancelled', 'settled'))),
-    CONSTRAINT paper_orders_instrument_id_fkey FOREIGN KEY (instrument_id) REFERENCES instruments(id),
-    CONSTRAINT paper_orders_signal_id_fkey FOREIGN KEY (signal_id) REFERENCES signals(id)
-);
 
 CREATE TABLE IF NOT EXISTS exec_reconciliations (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -1136,13 +1113,8 @@ CREATE INDEX IF NOT EXISTS idx_verdicts_draft ON draft_risk_verdicts(draft_id, e
 CREATE INDEX IF NOT EXISTS idx_exec_acct ON orders_execution(account_id, state_at DESC);
 CREATE INDEX IF NOT EXISTS idx_exec_draft ON orders_execution(draft_id);
 CREATE INDEX IF NOT EXISTS idx_exec_state ON orders_execution(state, state_at);
-CREATE INDEX IF NOT EXISTS idx_paper_orders_instrument ON paper_orders(instrument_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_paper_orders_status ON paper_orders(status, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_paper_orders_task ON paper_orders(task_id) WHERE (task_id IS NOT NULL);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_orders_broker ON paper_orders(broker_order_id) WHERE (broker_order_id IS NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_recon_acct ON exec_reconciliations(account_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_recon_open ON exec_reconciliations(created_at DESC) WHERE (resolved_at IS NULL);
-CREATE INDEX IF NOT EXISTS idx_paper_orders_account ON paper_orders(account_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_instrument ON tasks(instrument_id) WHERE instrument_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_exec_audit_time ON exec_audit(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_exec_audit_action ON exec_audit(action, created_at DESC);
@@ -1453,31 +1425,6 @@ CREATE INDEX IF NOT EXISTS idx_trade_fills_clord ON trade_fills(cl_ord_id);
 CREATE INDEX IF NOT EXISTS idx_trade_fills_draft ON trade_fills(draft_id);
 
 -- ============================================================
--- 模拟盘持仓计划（手工追加）
---
--- 为什么需要这张表：paper_orders 是「成交流水」，它记不下「这一仓打算在
--- 哪里止盈止损」。而没有 TP/SL，模拟盘的仓位永远不会平 ——
--- 已实现盈亏永远为 0，模拟盘就只是个空转的记账本。
---
--- 所以开仓时把 TP/SL 存进计划表，TradeLoop 每轮拿最新价比对，
--- 触发就写一笔反向 paper_order 并标记 closed_at。
--- ============================================================
-
-CREATE TABLE IF NOT EXISTS paper_trade_plans (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-    account_id    INTEGER NOT NULL,
-    instrument_id INTEGER NOT NULL,
-    pos_side      TEXT NOT NULL DEFAULT 'long' CHECK (pos_side IN ('long', 'short')),
-    qty           TEXT NOT NULL,
-    tp_price      TEXT,
-    sl_price      TEXT,
-    draft_id      INTEGER,
-    opened_at     TIMESTAMP NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    closed_at     TIMESTAMP,
-    close_reason  TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_paper_trade_plans_open
-    ON paper_trade_plans(account_id, instrument_id) WHERE closed_at IS NULL;
 
 -- ============================================================
 -- 止盈止损改价审计（手工追加，2026-11-14）

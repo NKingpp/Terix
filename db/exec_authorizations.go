@@ -47,7 +47,6 @@ var validAuthModes = map[string]bool{
 
 // validAuthFromModes 是「从哪个模式授权」的白名单，与 CHECK 一致。
 var validAuthFromModes = map[string]bool{
-	string(ExecModePaper):         true,
 	string(ExecModeLiveManual):    true,
 	string(ExecModeLiveWhitelist): true,
 	string(ExecModeLiveAuto):      true,

@@ -63,7 +63,7 @@ func (e *timeoutEnv) mkOrder(state string, stateAt time.Time, filledQty string) 
 	orderID, err := e.g.db.ExecOrders().InsertOrder(db.ExecOrderInput{
 		DraftID:       draftID,
 		AccountID:     e.acct.ID,
-		Mode:          string(db.ExecModePaper),
+		Mode:          string(db.ExecModeLiveManual),
 		State:         state,
 		ClientOrderID: clientID,
 		Qty:           "10",

@@ -30,8 +30,6 @@ const ExecModeKey = "exec_mode"
 type ExecMode string
 
 const (
-	// ExecModePaper 纸面模式：订单走虚拟账本，不触达真实通道。
-	ExecModePaper ExecMode = "paper"
 	// ExecModeLiveWhitelist 实盘白名单：只允许白名单内标的下单。
 	ExecModeLiveWhitelist ExecMode = "live_whitelist"
 	// ExecModeLiveManual 实盘手动：每笔需人工确认。
@@ -47,8 +45,6 @@ const (
 	// 因此进入本模式需要独立的授权仪式（见 exec/live_auto.go 的 Arming），
 	// 且运行期有自动降级条件（对账失败 / 单笔超限）。
 	ExecModeLiveAuto ExecMode = "live_auto"
-	// ExecModeFrozen 冻结：拒绝一切实盘，唯一出口是回到 paper。
-	ExecModeFrozen ExecMode = "frozen"
 )
 
 // ErrExecModeUnknown 表示读到的模式值不在白名单内。
@@ -59,43 +55,21 @@ var ErrExecModeTransitionInvalid = errors.New("invalid exec mode transition")
 
 // validExecModes 是模式白名单。
 var validExecModes = map[ExecMode]bool{
-	ExecModePaper:         true,
 	ExecModeLiveWhitelist: true,
 	ExecModeLiveManual:    true,
 	ExecModeLiveAuto:      true,
-	ExecModeFrozen:        true,
 }
 
 // execModeTransitions 是模式状态机的合法转换表。
 //
-//	paper ──► live_whitelist ──► live_manual
-//	  ▲              │                │
-//	  │              ▼                ▼
-//	  └────────── frozen ◄────────────┘
-//	                │
-//	                └──► paper（唯一出口）
+//	live_whitelist ⇄ live_manual ⇄ live_auto
 //
-// # 四条设计选择
-//
-//  1. **frozen → live_* 被拒**：冻结意味着「发现了问题」。直接恢复实盘
-//     等于「问题没解决就继续下注」。强制经过 paper 是一道人工确认。
-//  2. **frozen → paper 是唯一出口**：必须先回模拟盘。
-//  3. **paper → frozen 合法**：在纸面上发现问题也该能立即全局冻结，
-//     不必先升档再冻。
-//  4. **live_manual → live_whitelist 是「降档」**：允许的 —— 收紧比放宽安全。
-//     反向（whitelist → manual）是放宽，需要重新授权（由调用方校验授权）。
+// 三档之间自由互转：无人值守系统里，人是唯一决策者，
+// 不需要额外的「必须先降档再升档」仪式。
 var execModeTransitions = map[ExecMode][]ExecMode{
-	ExecModePaper:         {ExecModeLiveWhitelist, ExecModeLiveManual, ExecModeLiveAuto, ExecModeFrozen},
-	ExecModeLiveWhitelist: {ExecModeLiveManual, ExecModeLiveAuto, ExecModePaper, ExecModeFrozen},
-	ExecModeLiveManual:    {ExecModeLiveWhitelist, ExecModeLiveAuto, ExecModePaper, ExecModeFrozen},
-	// live_auto 的出口刻意**不包含**任何 live 档位的直接互转。
-	//
-	// 出去只能到 paper 或 frozen —— 想从自动回到手动必须经过 paper。
-	// 理由：live_auto → live_manual 看起来是「收紧」，但操作者的心智
-	// 还停留在「系统在自动跑」，容易误以为自己没在下单。强制经 paper 是
-	// 一次明确的「停下来」确认。
-	ExecModeLiveAuto: {ExecModePaper, ExecModeFrozen},
-	ExecModeFrozen:   {ExecModePaper},
+	ExecModeLiveWhitelist: {ExecModeLiveManual, ExecModeLiveAuto},
+	ExecModeLiveManual:    {ExecModeLiveWhitelist, ExecModeLiveAuto},
+	ExecModeLiveAuto:      {ExecModeLiveWhitelist, ExecModeLiveManual},
 }
 
 // CanTransitionExecMode 判断 from→to 是否为合法模式转换。
@@ -125,22 +99,15 @@ func ParseExecMode(s string) (ExecMode, error) {
 
 // GetExecMode 读当前执行模式。
 //
-// # 不存在时返回 paper，不返回错误
-//
-// 首次启动时 settings 里没有这个 key。报错会让系统起不来，
-// 而 paper 是安全默认值 —— 符合「默认最保守」。
-//
-// 但**值非法**时返回错误而不是回退 paper：
-// 那是「配置被写坏了」，静默回退会掩盖问题（用户以为在实盘，实际在纸面）。
+// 不存在时返回 live_manual：新装系统不会无人值守下单，
+// 但也不阻塞使用。值非法时返回错误而不是回退 —— 静默回退会掩盖配置写坏。
 func (d *DB) GetExecMode() (ExecMode, error) {
 	raw, ok, err := d.GetSetting(ExecModeKey)
 	if err != nil {
 		return "", fmt.Errorf("读 exec_mode 失败: %w", err)
 	}
 	if !ok || strings.TrimSpace(raw) == "" {
-		// 两种情形都归到这里：key 不存在（ok=false）或值为空。
-		// 两者语义相同 —— 「没配过」，安全默认是 paper。
-		return ExecModePaper, nil
+		return ExecModeLiveManual, nil
 	}
 	return ParseExecMode(raw)
 }
@@ -202,11 +169,11 @@ WHERE key = $1 AND COALESCE(NULLIF(value,''), 'paper') = $3`,
 	}
 
 	// 影响 0 行有两种可能：key 不存在，或当前值 ≠ from。
-	// 若是因为「key 不存在」且 from=paper（默认值），则应插入。
-	if from != ExecModePaper {
-		return false, nil // 当前值不是 from，或不存在 —— 都不是 paper
+	// 若 key 不存在且 from 是默认值（live_manual），则应插入。
+	if from != ExecModeLiveManual {
+		return false, nil
 	}
-	// from=paper：尝试插入（首次设置）。
+	// 首次设置：插入。
 	insRes, insErr := d.Exec(`INSERT INTO settings (key, value) VALUES ($1, $2)
 ON CONFLICT (key) DO NOTHING`, ExecModeKey, string(to))
 	if insErr != nil {
@@ -304,10 +271,10 @@ func (d *DB) ForceSetExecMode(to ExecMode) (changed bool, previous string, err e
 	defer tx.Rollback() //nolint:errcheck // 提交成功后是 no-op
 
 	var current string
-	scanErr := tx.QueryRow(`SELECT COALESCE(NULLIF(value,''), 'paper') FROM settings
+	scanErr := tx.QueryRow(`SELECT COALESCE(NULLIF(value,''), 'live_manual') FROM settings
 WHERE key = $1`, ExecModeKey).Scan(&current)
 	if errors.Is(scanErr, sql.ErrNoRows) {
-		current = string(ExecModePaper)
+		current = string(ExecModeLiveManual)
 	} else if scanErr != nil {
 		return false, "", scanErr
 	}

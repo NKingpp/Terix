@@ -250,15 +250,7 @@ func (t *execTicker) runAuto(ctx context.Context) {
 const maxAutoBatch = 20
 
 // firstActiveAccount 返回第一个可用于自动执行的账户。
-//
-// paper 模式下若一个账户都没有，自动建一个仅用于纸面账本的账户 ——
-// 否则「模拟盘自动成交」会因拿不到 account_id 直接跑不起来（Gate 与
-// ExecutePaper 都要求账户可用）。该模拟账户在实盘自动模式下会被排除。
 func (t *execTicker) firstActiveAccount() (*db.ExecAccount, error) {
-	mode, err := t.pg.GetExecMode()
-	if err != nil {
-		return nil, fmt.Errorf("读执行模式: %w", err)
-	}
 	accts, err := t.pg.ExecAccounts().ListAccounts()
 	if err != nil {
 		return nil, err
@@ -267,18 +259,15 @@ func (t *execTicker) firstActiveAccount() (*db.ExecAccount, error) {
 		if !a.Active || a.BlockedAt != nil {
 			continue
 		}
-		if mode == db.ExecModeLiveAuto && strings.HasPrefix(a.ChannelAcctID, paperAutoAccountRef) {
-			continue // 模拟账户绝不用于真实下单
+		if strings.HasPrefix(a.ChannelAcctID, paperAutoAccountRef) {
+			continue // 模拟账户不用于真实下单
 		}
 		return a, nil
-	}
-	if mode == db.ExecModePaper {
-		return t.ensurePaperAccount()
 	}
 	return nil, errors.New("没有 active 且未冻结的执行账户")
 }
 
-// paperAutoAccountRef 是自动创建的模拟账户标识。
+// paperAutoAccountRef 是历史上的模拟账户标识，仅用于排掉遗留行。
 const paperAutoAccountRef = "paper-auto"
 
 func (t *execTicker) ensurePaperAccount() (*db.ExecAccount, error) {

@@ -1236,20 +1236,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// 下单账户：trader 的 vars 构造器要 account_id（authorize_order 必填）。
 	// 零值时 ExecAccountFrom 返回 false，trader 只产信号不建草案。
 	//
-	// paper 模式下若系统没有任何执行账户，惰性建一个只用于纸面账本的账户：
-	// 否则 trader 不建草案 → 没有可自动执行的草案 → 模拟盘自动成交从起点就断了。
-	// 实盘模式不建，且 firstActiveAccount 也会按前缀排除该账户。
-	execAcct := e.execAccount
-	if execAcct.ID == 0 && e.m != nil && e.m.pg != nil {
-		if curMode, mErr := e.m.pg.GetExecMode(); mErr == nil && curMode == db.ExecModePaper {
-			if a, cErr := ensurePaperAutoAccount(e.m.pg); cErr == nil {
-				execAcct = agent.ExecAccount{ID: a.ID, Ref: a.ChannelAcctID}
-			} else {
-				log.Printf("[exec] 惰性创建模拟盘账户失败: %v", cErr)
-			}
-		}
-	}
-	workCtx = agent.WithExecAccount(workCtx, execAcct)
+	workCtx = agent.WithExecAccount(workCtx, e.execAccount)
 	// 当前持仓：trader 决定该不该平仓、平多少的唯一输入。
 	// 用带缓存的 provider（10s），避免每个 intent 都打一次交易所。
 	if e.m != nil && e.m.pg != nil {

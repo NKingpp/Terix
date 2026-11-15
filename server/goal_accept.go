@@ -31,9 +31,7 @@ func resolveAcceptMode(t *Task, acc db.GoalAcceptance) (string, string) {
 	if err != nil {
 		return "", "无法读取执行模式：" + err.Error()
 	}
-	if string(m) == string(db.ExecModePaper) {
-		return "paper", ""
-	}
+	_ = m
 	return "live", ""
 }
 
@@ -56,7 +54,7 @@ func verifyGoalAcceptance(ctx context.Context, t *Task, goal *db.Node, acc db.Go
 	}
 	observed["mode"] = mode
 
-	summary, err := db.TaskTradeSummaryFor(ctx, conn.DB, taskIDInt(t.ID), mode, acc.InstrumentID)
+	summary, err := db.TaskTradeSummaryFor(ctx, conn.DB, taskIDInt(t.ID), acc.InstrumentID)
 	if err != nil {
 		return false, observed, "无法汇总本任务成交：" + err.Error()
 	}
@@ -67,7 +65,7 @@ func verifyGoalAcceptance(ctx context.Context, t *Task, goal *db.Node, acc db.Go
 		observed["net_qty"] = summary.NetQty[acc.InstrumentID]
 	}
 	// 全局口径只做交叉参考：账本里其它任务的成交会污染它，不能作为判定依据。
-	if global, err := db.SumRealizedPnlNumeric(ctx, conn.DB, mode); err == nil {
+	if global, err := db.SumRealizedPnlNumeric(ctx, conn.DB); err == nil {
 		observed["realized_global"] = global
 	}
 

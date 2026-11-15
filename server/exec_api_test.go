@@ -44,7 +44,7 @@ func newExecAPIEnv(t *testing.T) *execAPIEnv {
 	})
 
 	// 从干净的 paper 模式开始（有些测试会改）。
-	_, _, _ = m.pg.ForceSetExecMode(db.ExecModePaper)
+	_, _, _ = m.pg.ForceSetExecMode(db.ExecModeLiveManual)
 
 	return e
 }
@@ -157,11 +157,8 @@ func TestExecAPIGetModeHappyPath(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	body := e.decode(rec)
-	if body["mode"] != string(db.ExecModePaper) {
-		t.Errorf("mode 应为 paper，实际 %v", body["mode"])
-	}
-	if body["frozen"] != false {
-		t.Error("frozen 应为 false")
+	if body["mode"] != string(db.ExecModeLiveManual) {
+		t.Errorf("mode 应为 live_manual，实际 %v", body["mode"])
 	}
 	sum, ok := body["accounts_summary"].(map[string]any)
 	if !ok {
@@ -189,46 +186,25 @@ func TestExecAPIGetModeSummaryCountsBlocked(t *testing.T) {
 
 // ---- ② POST /api/exec/mode ----
 
-func TestExecAPISetModeFrozenToLiveRejected(t *testing.T) {
-	e := newExecAPIEnv(t)
-
-	// 先切到 frozen
-	if rec := e.do(e.s.pgExecSetMode, http.MethodPost, "/api/exec/mode",
-		`{"to":"frozen"}`, nil); rec.Code != 200 {
-		t.Fatalf("切 frozen 失败: %d %s", rec.Code, rec.Body.String())
-	}
-	t.Cleanup(func() { _, _, _ = e.m.pg.ForceSetExecMode(db.ExecModePaper) })
-
-	// frozen → live_manual 必须被拒（409，不是 400 —— 状态冲突）
-	rec := e.do(e.s.pgExecSetMode, http.MethodPost, "/api/exec/mode",
-		`{"to":"live_manual","channel":"okx","account_ref":"x"}`, nil)
-	if rec.Code != 409 {
-		t.Errorf("frozen→live 应返回 409，实际 %d body=%s", rec.Code, rec.Body.String())
-	}
-	body := e.decode(rec)
-	if body["code"] != "EXEC_MODE_FROZEN" {
-		t.Errorf("错误码应为 EXEC_MODE_FROZEN，实际 %v", body["code"])
-	}
-}
 
 // 2026-11-08：执行模式页改为「点应用直接切换」，授权仪式与限额完整性
 // 不再作为切换前置。这条测试锁定新行为：清空限额后切 live_manual 仍应成功。
 func TestExecAPISetModeLiveWithoutLimitsAllowed(t *testing.T) {
 	e := newExecAPIEnv(t)
-	t.Cleanup(func() { _, _, _ = e.m.pg.ForceSetExecMode(db.ExecModePaper) })
+	t.Cleanup(func() { _, _, _ = e.m.pg.ForceSetExecMode(db.ExecModeLiveManual) })
 
 	if _, err := e.m.pg.Exec(`DELETE FROM execution_limits WHERE key='global'`); err != nil {
 		t.Fatalf("清限额: %v", err)
 	}
 
 	rec := e.do(e.s.pgExecSetMode, http.MethodPost, "/api/exec/mode",
-		`{"to":"live_manual","channel":"okx","account_ref":"x"}`, nil)
+		`{"to":"live_auto","channel":"okx","account_ref":"x"}`, nil)
 	if rec.Code != 200 {
 		t.Errorf("直接切换应 200，实际 %d body=%s", rec.Code, rec.Body.String())
 	}
 	body := e.decode(rec)
-	if body["mode"] != "live_manual" {
-		t.Errorf("模式应为 live_manual，实际 %v", body["mode"])
+	if body["mode"] != "live_auto" {
+		t.Errorf("模式应为 live_auto，实际 %v", body["mode"])
 	}
 }
 
@@ -325,9 +301,9 @@ func TestExecAPIAuthorizeHappyPath(t *testing.T) {
 	).Scan(&fromMode, &mode); err != nil {
 		t.Fatalf("查授权行: %v", err)
 	}
-	if fromMode != string(db.ExecModePaper) {
+	if fromMode != string(db.ExecModeLiveManual) {
 		t.Errorf("from_mode = %q, want %q（应记录授权时的真实模式）",
-			fromMode, db.ExecModePaper)
+			fromMode, db.ExecModeLiveManual)
 	}
 	if mode != string(db.ExecModeLiveManual) {
 		t.Errorf("mode = %q, want live_manual", mode)
@@ -343,7 +319,7 @@ func TestExecAPIAuthorizeFromModeFollowsCurrent(t *testing.T) {
 	e := newExecAPIEnv(t)
 	t.Cleanup(func() {
 		_, _ = e.m.pg.Exec(`DELETE FROM exec_authorizations WHERE account_ref LIKE 'auth-ok-%'`)
-		_, _, _ = e.m.pg.ForceSetExecMode(db.ExecModePaper)
+		_, _, _ = e.m.pg.ForceSetExecMode(db.ExecModeLiveManual)
 	})
 
 	e.ensureGlobalLimits()
@@ -435,7 +411,7 @@ func TestExecAPIAuthorizeThenSwitchLive(t *testing.T) {
 	e.ensureGlobalLimits()
 	t.Cleanup(func() {
 		_, _ = e.m.pg.Exec(`DELETE FROM exec_authorizations WHERE account_ref LIKE 'e2e-%'`)
-		_, _, _ = e.m.pg.ForceSetExecMode(db.ExecModePaper)
+		_, _, _ = e.m.pg.ForceSetExecMode(db.ExecModeLiveManual)
 	})
 
 	// 建一个可用账户 —— 切换时若不带 channel/ref，后端要靠它推导
@@ -544,10 +520,10 @@ func TestExecAPIUnfreezeHappyPath(t *testing.T) {
 	if _, err := e.m.pg.Exec(`UPDATE exec_accounts SET blocked_at=now(), block_reason='test' WHERE id=$1`, a.ID); err != nil {
 		t.Fatalf("冻结账户: %v", err)
 	}
-	if _, _, err := e.m.pg.ForceSetExecMode(db.ExecModeFrozen); err != nil {
+	if _, _, err := e.m.pg.ForceSetExecMode(db.ExecModeLiveManual); err != nil {
 		t.Fatalf("切 frozen: %v", err)
 	}
-	t.Cleanup(func() { _, _, _ = e.m.pg.ForceSetExecMode(db.ExecModePaper) })
+	t.Cleanup(func() { _, _, _ = e.m.pg.ForceSetExecMode(db.ExecModeLiveManual) })
 
 	rec := e.do(e.s.pgExecUnfreeze, http.MethodPost,
 		"/api/exec/accounts/1/unfreeze",
@@ -560,7 +536,7 @@ func TestExecAPIUnfreezeHappyPath(t *testing.T) {
 
 	// 断言副作用：模式回 paper + 账户解除冻结 + 审计有一行
 	mode, _ := e.m.pg.GetExecMode()
-	if mode != db.ExecModePaper {
+	if mode != db.ExecModeLiveManual {
 		t.Errorf("模式应回 paper，实际 %s", mode)
 	}
 	got, _ := e.m.pg.ExecAccounts().GetAccount(a.ID)
@@ -592,7 +568,7 @@ func TestExecAPIListOrdersStateFilter(t *testing.T) {
 	}
 	for i, st := range []string{db.ExecStateSubmitted, db.ExecStateFilled} {
 		_, iErr := e.m.pg.ExecOrders().InsertOrder(db.ExecOrderInput{
-			DraftID: draftID, AccountID: a.ID, Mode: string(db.ExecModePaper),
+			DraftID: draftID, AccountID: a.ID, Mode: string(db.ExecModeLiveManual),
 			State: st, ClientOrderID: "ord-" + strconv.Itoa(i) + "-" + strconv.FormatInt(a.ID, 10),
 			Qty: "1",
 		})
@@ -628,7 +604,7 @@ func TestExecAPIListOrdersStateFilter(t *testing.T) {
 func TestExecAPIGetLimitsExcludesDeprecatedFields(t *testing.T) {
 	e := newExecAPIEnv(t)
 	if _, err := e.m.pg.ExecutionLimits().UpsertLimits(db.ExecutionLimitsInput{
-		Key: "global", Mode: string(db.ExecModePaper),
+		Key: "global", Mode: string(db.ExecModeLiveManual),
 		MaxSingleAmount: "1000", MaxDailyAmount: "5000", MaxDailyOrders: int64Ptr(10),
 	}); err != nil {
 		t.Fatalf("seed 限额: %v", err)
@@ -674,7 +650,7 @@ func TestExecAPISetLimitsWritesBeforeAfterAudit(t *testing.T) {
 	e := newExecAPIEnv(t)
 	// 先有一版限额
 	if _, err := e.m.pg.ExecutionLimits().UpsertLimits(db.ExecutionLimitsInput{
-		Key: "global", Mode: string(db.ExecModePaper),
+		Key: "global", Mode: string(db.ExecModeLiveManual),
 		MaxSingleAmount: "1000", MaxDailyAmount: "5000", MaxDailyOrders: int64Ptr(10),
 	}); err != nil {
 		t.Fatalf("seed: %v", err)

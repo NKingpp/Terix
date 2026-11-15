@@ -17,7 +17,7 @@ package server
 //
 // # 为什么 cleanup 顺序是先子后父
 //
-// tasks / signals / ratings / orders_draft / paper_orders 五个外键**没有 ON DELETE CASCADE**，
+// tasks / signals / ratings / orders_draft 四个外键**没有 ON DELETE CASCADE**，
 // 直接删父表会违反外键约束。
 // （bars / instrument_relations / watchlist_items 有 CASCADE，不用显式删。）
 //
@@ -47,8 +47,7 @@ func upsertTestInstrument(t *testing.T, d *db.DB, in db.InstrumentInput) int64 {
 			`DELETE FROM ratings WHERE instrument_id=$1`,
 			`DELETE FROM signals WHERE instrument_id=$1`,
 			`DELETE FROM orders_draft WHERE instrument_id=$1`,
-			`DELETE FROM paper_orders WHERE instrument_id=$1`,
-			`DELETE FROM tasks WHERE instrument_id=$1`,
+					`DELETE FROM tasks WHERE instrument_id=$1`,
 		} {
 			if _, e := d.Exec(q, instID); e != nil {
 				t.Logf("清理测试标的 %d 的子表失败: %v（%s）", instID, e, q)

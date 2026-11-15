@@ -85,7 +85,6 @@ const limitsConfirmPhrase = "我确认修改交易限额"
 // execModeDTO 是 GET /api/exec/mode 的响应。
 type execModeDTO struct {
 	Mode             string `json:"mode"`
-	Frozen           bool   `json:"frozen"`
 	RulesFingerprint string `json:"rules_fingerprint"`
 	LimitsRevision   int64  `json:"limits_revision"`
 
@@ -130,7 +129,6 @@ func (s *Server) pgExecMode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out.Mode = string(mode)
-	out.Frozen = mode == db.ExecModeFrozen
 
 	// 规则指纹：前端用它判断「草案的判定基于哪套规则」。
 	//
@@ -163,8 +161,8 @@ func (s *Server) pgExecMode(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			ref := strings.TrimSpace(a.ChannelAcctID)
-			if ref == "" {
-				continue
+			if ref == "" || strings.HasPrefix(ref, "paper-auto") {
+				continue // 纸面账户不是可授权对象
 			}
 			out.DefaultAccount.Channel = a.Channel
 			out.DefaultAccount.AccountRef = ref
@@ -529,30 +527,9 @@ func (s *Server) pgExecUnfreeze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ---- 先降模式，再解账户 ----
-	//
-	// # 为什么这个顺序（有安全意义，不只是「语义清晰」）
-	//
-	// 两步之间失败的中间态：
-	//   先降模式后解账户 → 中间态「模式 paper，账户仍 blocked」→ 更保守
-	//   先解账户后降模式 → 中间态「账户可用，系统仍 live」   → 更激进
-	//
-	// 只有「更激进」的中间态需要事务；「更保守」的重试一次就好
-	// （用户看到「模式已回 paper 但账户仍 blocked」，再点一次解冻）。
-	//
-	// # 为什么不加 UnfreezeAccountTx
-	//
-	// 因为中间态在保守方向 —— 加事务的收益（省一次重试）小于成本
-	// （多一个事务函数 + 测试）。
-	if _, _, fErr := s.m.pg.ForceSetExecMode(db.ExecModePaper); fErr != nil {
-		writeErrCode(w, 500, fmt.Sprintf("降模式失败：%v", fErr), "EXEC_MODE_SET_FAILED")
-		return
-	}
+	// 解冻 = 只解账户。模式由用户显式决定，程序不改写。
 	if uErr := s.m.pg.ExecAccounts().Unblock(accountID); uErr != nil {
-		// 这里已经降了模式但没解账户 —— 中间态在保守方向，可重试。
-		writeErrCode(w, 500,
-			fmt.Sprintf("模式已降为 paper，但解冻账户失败：%v —— 可重试", uErr),
-			"EXEC_UNFREEZE_PARTIAL")
+		writeErrCode(w, 500, fmt.Sprintf("解冻账户失败：%v —— 可重试", uErr), "EXEC_UNFREEZE_FAILED")
 		return
 	}
 
@@ -571,7 +548,7 @@ func (s *Server) pgExecUnfreeze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, 200, map[string]any{"mode": "paper", "account_id": accountID, "unblocked": true})
+	writeJSON(w, 200, map[string]any{"mode": string(cur), "account_id": accountID, "unblocked": true})
 }
 
 // pgExecOrders 是 GET /api/exec/orders。
@@ -1016,126 +993,6 @@ func (s *Server) cachedRulesFingerprint() (string, error) {
 	return fp, nil
 }
 
-// pgExecDraftExecute 是第 7 个端点：执行一条草案（闸门 + 纸面执行）。
-//
-// # 为什么这是独立于前 6 个的「执行面」
-//
-// 前 6 个是**管理面**（看模式、切模式、授权、解冻、看单、改限额）——
-// 它们改变「系统允许做什么」。
-//
-// 本端点是**执行面** —— 它真的产生一张执行单（当前是 paper_orders）。
-// 两者混在一起会让「管理」和「执行」的权限边界模糊。
-//
-// # 为什么 account_id 必须显式传，不接受默认
-//
-// 这是真实资金路径，不该有隐含默认。
-// CLI（cmd/execdemo）里可以省 account_id，因为那是开发者工具、本机单账户；
-// 而 API 面向真实调用方，默认账户会让「调错了账户」变成静默事故。
-//
-// # 流程
-//
-//  1. Gate.Authorize → 拿判定
-//  2. allow → ExecutePaper（真正建执行单）
-//  3. deny  → 400 + 具体错误码（GateResult.ErrCode 直接透传）
-//  4. ask   → 409 + 「需人工确认」
-func (s *Server) pgExecDraftExecute(w http.ResponseWriter, r *http.Request) {
-	draftID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil || draftID <= 0 {
-		writeErrCode(w, 400, "draft id 必须是正整数", "EXEC_DRAFT_INVALID_ID")
-		return
-	}
-
-	var body struct {
-		AccountID int64 `json:"account_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeErrCode(w, 400, "请求体格式错误："+err.Error(), "EXEC_BAD_BODY")
-		return
-	}
-	// account_id 必填 —— 理由见函数注释。
-	if body.AccountID <= 0 {
-		writeErrCode(w, 400,
-			"account_id 必填且必须为正（执行路径不接受默认账户：调错账户是静默事故）",
-			"EXEC_ACCOUNT_REQUIRED")
-		return
-	}
-
-	// 读当前模式 —— 闸门需要它判断「paper 还是 live」。
-	mode, err := s.m.pg.GetExecMode()
-	if err != nil {
-		writeErrCode(w, 500, "读取执行模式失败："+err.Error(), "EXEC_MODE_READ_FAILED")
-		return
-	}
-
-	gate := exec.NewGate(s.m.pg, nil)
-	res, err := gate.Authorize(r.Context(), exec.GateRequest{
-		DraftID:   draftID,
-		AccountID: body.AccountID,
-		Mode:      mode,
-	})
-	if err != nil {
-		// authorizeInner 只在系统错误时返回 err（判定结果都是 (result, nil)）。
-		writeErrCode(w, 500, "闸门判定失败："+err.Error(), "EXEC_GATE_ERROR")
-		return
-	}
-
-	switch res.Decision {
-	case exec.DecisionDeny:
-		// 400 + 具体错误码：让调用方能按码分支，而不是匹配文案。
-		code := res.ErrCode
-		if code == "" {
-			code = "EXEC_GATE_DENIED"
-		}
-		writeJSON(w, 400, map[string]any{
-			"error":    res.Reason,
-			"code":     code,
-			"decision": string(res.Decision),
-		})
-		return
-	case exec.DecisionAsk:
-		// 409 —— 「需要人工确认」是状态冲突，不是参数错误。
-		//
-		// # 为什么是 409 而不是 400
-		//
-		// 400 意味着「你的请求有问题」，而 409 意味着「请求没问题，但当前状态不允许」。
-		// 调用方对两者的处置不同：400 该改参数，409 该等人工或改状态。
-		code := res.ErrCode
-		if code == "" {
-			code = "EXEC_GATE_NEEDS_MANUAL"
-		}
-		writeJSON(w, 409, map[string]any{
-			"error":    res.Reason,
-			"code":     code,
-			"decision": string(res.Decision),
-			"hint":     "该单需人工确认后才能执行",
-		})
-		return
-	case exec.DecisionAllow:
-		// 继续往下 —— 真正执行。
-	default:
-		writeErrCode(w, 500,
-			"闸门返回未知判定："+string(res.Decision), "EXEC_GATE_UNKNOWN_DECISION")
-		return
-	}
-
-	paperID, err := gate.ExecutePaper(r.Context(), draftID, body.AccountID)
-	if err != nil {
-		// 执行失败不是「判定失败」—— 判定已经 allow 了，是执行的某条前置条件不满足
-		// （或 DB 错误）。用 409 而非 500，因为多数是「状态已变」（如草案被别处改了）。
-		writeErrCode(w, 409, "执行失败："+err.Error(), "EXEC_EXECUTE_FAILED")
-		return
-	}
-
-	writeJSON(w, 200, map[string]any{
-		"paper_order_id":    paperID,
-		"draft_id":          draftID,
-		"account_id":        body.AccountID,
-		"mode":              string(mode),
-		"decision":          string(res.Decision),
-		"rules_fingerprint": res.RulesFingerprint,
-		"limits_revision":   res.LimitsRevision,
-	})
-}
 
 // canonicalExecAccountRef 返回某通道第一个可用账户的 channel_account_id。
 //

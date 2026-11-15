@@ -87,118 +87,9 @@ func (a *recordingAuditor) WriteModeChange(from, to db.ExecMode, reason string) 
 	return nil
 }
 
-// TestRule4DowngradeOnStartup 规则 4：启动时把非 paper 降为 paper 并写审计。
-func TestRule4DowngradeOnStartup(t *testing.T) {
-	d := testDB(t)
-	clearMode(t, d)
 
-	// 先设成 live_manual
-	if ok, err := d.TransitionMode(db.ExecModePaper, db.ExecModeLiveManual); err != nil || !ok {
-		t.Fatalf("设置 live_manual 失败: ok=%v err=%v", ok, err)
-	}
 
-	aud := &recordingAuditor{}
-	if err := DowngradeOnStartup(d, aud); err != nil {
-		t.Fatalf("启动降级失败: %v", err)
-	}
 
-	// 模式已是 paper
-	got, err := d.GetExecMode()
-	if err != nil {
-		t.Fatalf("读模式失败: %v", err)
-	}
-	if got != db.ExecModePaper {
-		t.Errorf("降级后模式 = %q, want paper", got)
-	}
-
-	// 写了一条审计，且含降级前的模式
-	if len(aud.calls) != 1 {
-		t.Fatalf("应写 1 条审计，实际 %d 条", len(aud.calls))
-	}
-	c := aud.calls[0]
-	if c.From != db.ExecModeLiveManual {
-		t.Errorf("审计的 from = %q, want live_manual", c.From)
-	}
-	if c.To != db.ExecModePaper {
-		t.Errorf("审计的 to = %q, want paper", c.To)
-	}
-	if c.Reason == "" {
-		t.Error("审计必须有降级原因")
-	}
-}
-
-// TestRule4NoAuditWhenAlreadyPaper 规则 4 附带：本来就是 paper 时不写审计。
-//
-// # 为什么要测这个
-//
-// 不测的话，实现很容易写成「每次都写一条」—— 而每次重启刷一条
-// 「模式降级」的日志，会把真正的降级事件淹没在噪音里。
-func TestRule4NoAuditWhenAlreadyPaper(t *testing.T) {
-	d := testDB(t)
-	clearMode(t, d) // key 不存在 → 视为 paper
-
-	aud := &recordingAuditor{}
-	if err := DowngradeOnStartup(d, aud); err != nil {
-		t.Fatalf("启动降级失败: %v", err)
-	}
-	if len(aud.calls) != 0 {
-		t.Errorf("本来就是 paper 时不该写审计，实际写了 %d 条: %+v", len(aud.calls), aud.calls)
-	}
-
-	// 显式设成 paper 再跑一次，同样不写
-	if _, err := d.Exec(`INSERT INTO settings (key,value) VALUES ($1,'paper')
-ON CONFLICT (key) DO UPDATE SET value='paper'`, db.ExecModeKey); err != nil {
-		t.Fatalf("写入 paper 失败: %v", err)
-	}
-	aud2 := &recordingAuditor{}
-	if err := DowngradeOnStartup(d, aud2); err != nil {
-		t.Fatalf("第二次启动降级失败: %v", err)
-	}
-	if len(aud2.calls) != 0 {
-		t.Errorf("已是 paper 时不该写审计，实际 %d 条", len(aud2.calls))
-	}
-}
-
-// TestRule4DowngradeFromFrozen frozen 也降为 paper（frozen 是最需要降的状态）。
-func TestRule4DowngradeFromFrozen(t *testing.T) {
-	d := testDB(t)
-	clearMode(t, d)
-	if ok, err := d.TransitionMode(db.ExecModePaper, db.ExecModeFrozen); err != nil || !ok {
-		t.Fatalf("设置 frozen 失败: ok=%v err=%v", ok, err)
-	}
-
-	aud := &recordingAuditor{}
-	if err := DowngradeOnStartup(d, aud); err != nil {
-		t.Fatalf("从 frozen 降级失败: %v", err)
-	}
-	got, _ := d.GetExecMode()
-	if got != db.ExecModePaper {
-		t.Errorf("降级后模式 = %q", got)
-	}
-	if len(aud.calls) != 1 || aud.calls[0].From != db.ExecModeFrozen {
-		t.Errorf("审计应记录 from=frozen，实际 %+v", aud.calls)
-	}
-}
-
-// TestRule4DowngradeIsIdempotent 连续调用两次只降一次（第二次不写审计）。
-func TestRule4DowngradeIsIdempotent(t *testing.T) {
-	d := testDB(t)
-	clearMode(t, d)
-	if _, err := d.TransitionMode(db.ExecModePaper, db.ExecModeLiveManual); err != nil {
-		t.Fatalf("设置失败: %v", err)
-	}
-
-	aud := &recordingAuditor{}
-	if err := DowngradeOnStartup(d, aud); err != nil {
-		t.Fatalf("第一次降级失败: %v", err)
-	}
-	if err := DowngradeOnStartup(d, aud); err != nil {
-		t.Fatalf("第二次降级失败: %v", err)
-	}
-	if len(aud.calls) != 1 {
-		t.Errorf("两次调用应只写 1 条审计，实际 %d 条", len(aud.calls))
-	}
-}
 
 // TestRule5AuditFailureRollsBack 规则 5：审计失败导致转换失败（且 DB 回滚）。
 //
@@ -212,8 +103,8 @@ func TestRule5AuditFailureRollsBack(t *testing.T) {
 
 	// 起点 paper，目标 live_manual，授权与限额齐全
 	req := TransitionRequest{
-		From:                 db.ExecModePaper,
-		To:                   db.ExecModeLiveManual,
+		From:                 db.ExecModeLiveManual,
+		To:                   db.ExecModeLiveAuto,
 		Auth:                 validAuth(1),
 		CurrentLimits:        fullLimits(),
 		CurrentRulesRevision: 1,
@@ -231,7 +122,7 @@ func TestRule5AuditFailureRollsBack(t *testing.T) {
 	if gErr != nil {
 		t.Fatalf("读模式失败: %v", gErr)
 	}
-	if got != db.ExecModePaper {
+	if got != db.ExecModeLiveManual {
 		t.Errorf("审计失败后模式应回滚到 paper，实际 %q —— 「转换成功但没审计」不可接受", got)
 	}
 }
@@ -242,8 +133,8 @@ func TestRule5AuditSuccessCommits(t *testing.T) {
 	clearMode(t, d)
 
 	req := TransitionRequest{
-		From:                 db.ExecModePaper,
-		To:                   db.ExecModeLiveManual,
+		From:                 db.ExecModeLiveManual,
+		To:                   db.ExecModeLiveAuto,
 		Auth:                 validAuth(1),
 		CurrentLimits:        fullLimits(),
 		CurrentRulesRevision: 1,
@@ -254,8 +145,8 @@ func TestRule5AuditSuccessCommits(t *testing.T) {
 		t.Fatalf("ApplyTransition 失败: %v", err)
 	}
 	got, _ := d.GetExecMode()
-	if got != db.ExecModeLiveManual {
-		t.Errorf("模式 = %q, want live_manual", got)
+	if got != db.ExecModeLiveAuto {
+		t.Errorf("模式 = %q, want live_auto", got)
 	}
 	if len(aud.calls) != 1 {
 		t.Errorf("应写 1 条审计，实际 %d", len(aud.calls))
@@ -266,27 +157,26 @@ func TestRule5AuditSuccessCommits(t *testing.T) {
 func TestApplyTransitionRejectsInvalid(t *testing.T) {
 	d := testDB(t)
 	clearMode(t, d)
-	// 设成 frozen
-	if _, err := d.TransitionMode(db.ExecModePaper, db.ExecModeFrozen); err != nil {
-		t.Fatalf("设置 frozen 失败: %v", err)
+	// 设成 live_auto
+	if _, err := d.TransitionMode(db.ExecModeLiveManual, db.ExecModeLiveAuto); err != nil {
+		t.Fatalf("设置 live_auto 失败: %v", err)
 	}
 
 	aud := &recordingAuditor{}
-	// frozen → live_manual 非法
+	// same → same 不在转换表里（重复切换没有意义，也防重复写审计）
 	err := ApplyTransition(d, aud, TransitionRequest{
-		From:                 db.ExecModeFrozen,
-		To:                   db.ExecModeLiveManual,
+		From:                 db.ExecModeLiveAuto,
+		To:                   db.ExecModeLiveAuto,
 		Auth:                 validAuth(1),
 		CurrentLimits:        fullLimits(),
 		CurrentRulesRevision: 1,
 	}, "不该成功")
 
-	if !errors.Is(err, &ModeError{Code: CodeModeFrozenRejectsLive}) {
-		t.Fatalf("应返回 CodeModeFrozenRejectsLive，实际: %v", err)
+	if !errors.Is(err, &ModeError{Code: CodeModeTransitionInvalid}) {
+		t.Fatalf("应返回 CodeModeTransitionInvalid，实际: %v", err)
 	}
 	// DB 未变
-	got, _ := d.GetExecMode()
-	if got != db.ExecModeFrozen {
+	if got, _ := d.GetExecMode(); got != db.ExecModeLiveAuto {
 		t.Errorf("被拒后模式不该变，实际 %q", got)
 	}
 	// 审计未写
@@ -300,7 +190,7 @@ func TestApplyTransitionConflictReturnsSentinel(t *testing.T) {
 	d := testDB(t)
 	clearMode(t, d)
 	// 实际已设成 live_manual
-	if _, err := d.TransitionMode(db.ExecModePaper, db.ExecModeLiveManual); err != nil {
+	if _, err := d.TransitionMode(db.ExecModeLiveManual, db.ExecModeLiveAuto); err != nil {
 		t.Fatalf("设置失败: %v", err)
 	}
 
@@ -310,8 +200,8 @@ func TestApplyTransitionConflictReturnsSentinel(t *testing.T) {
 	// 目标必须与授权模式一致（validAuth 的目标是 live_manual），
 	// 否则会先被「授权不匹配」拦下，测不到冲突那条路径。
 	err := ApplyTransition(d, aud, TransitionRequest{
-		From:                 db.ExecModePaper,
-		To:                   db.ExecModeLiveManual,
+		From:                 db.ExecModeLiveManual,
+		To:                   db.ExecModeLiveAuto,
 		Auth:                 validAuth(1),
 		CurrentLimits:        fullLimits(),
 		CurrentRulesRevision: 1,

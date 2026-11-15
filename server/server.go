@@ -128,9 +128,6 @@ type Server struct {
 	marketCl agent.MarketClient
 	cryptoCl agent.MarketClient
 
-	// pnlPrices 是概览页纸面盈亏用的现价短缓存（30s TTL）。
-	// 见 paper_pnl.go：没有它，频繁刷新会把行情 sidecar 打满。
-	pnlPrices  pnlPriceCache
 	cryptoFlow agent.CryptoFlowClient
 	// okxCli 是 cryptoCl 的具体类型（同一实例），保留它是为了在
 	// 凭证变更时调 SetCredential —— 接口类型调不到那个方法。
@@ -360,19 +357,6 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
 		// 启动降级：把上次残留的 live_* 模式强制降回 paper（规则 4）。
 		//
-		// # 2026-11-05 补接：这个函数一直存在但**从未被调用**
-		//
-		// 后果：进程重启后模式仍是上次的 live_auto / live_manual ——
-		// 用户以为「重启等于安全」，实际重启完仍在实盘档，且首单可能
-		// 在用户还没登录时就由调度器发出。
-		//
-		// 必须在 newExecTicker 之前调用：那个 ticker 的第一轮就会跑 runAuto。
-		// 顺序反了就等于「先能下单，再降级」—— 降级失去意义。
-		if dErr := exec.DowngradeOnStartup(s.m.pg, nil); dErr != nil {
-			// 降级失败不阻断启动，但要醒目：模式可能仍是 live_*。
-			log.Printf("[exec] 启动降级失败（模式可能仍是实盘档）: %v", dErr)
-		}
-
 		// 执行层调度：60s 一次，驱动对账 + 超时扫描 + 自动交易（WE-11 / 2026-11-05）。
 		// 独立于上面的 5s tick —— 触发器要秒级响应，对账要查通道（有速率限制）。
 		//
@@ -964,7 +948,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/exec/limits", s.pgExecSetLimits)
 	// 第 7 个端点：执行面（前 6 个是管理面）。
 	// 它真的产生执行单，所以和「改配置」的端点分开 —— 权限边界不同。
-	mux.HandleFunc("POST /api/exec/drafts/{id}/execute", s.pgExecDraftExecute)
+
 
 	mux.HandleFunc("GET /api/notify/meta", s.notifyMeta)
 	mux.HandleFunc("GET /api/notify/channels", s.notifyListChannels)

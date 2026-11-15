@@ -52,7 +52,7 @@ func TestGateEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读草案失败: %v", err)
 	}
-	decision, err := g.evaluate(t.Context(), draft, inst, db.ExecModePaper)
+	decision, err := g.evaluate(t.Context(), draft, inst, db.ExecModeLiveManual)
 	if err != nil {
 		t.Fatalf("求值失败: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestGateEndToEnd(t *testing.T) {
 
 	// ---- 5. 闸门放行 ----
 	res, err := g.Authorize(t.Context(), GateRequest{
-		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModePaper,
+		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModeLiveManual,
 	})
 	if err != nil {
 		t.Fatalf("闸门返回 error: %v", err)
@@ -115,7 +115,7 @@ func TestGateEndToEnd(t *testing.T) {
 	orderID, err := g.db.ExecOrders().InsertOrder(db.ExecOrderInput{
 		DraftID:       draftID,
 		AccountID:     acct.ID,
-		Mode:          string(db.ExecModePaper),
+		Mode:          string(db.ExecModeLiveManual),
 		ClientOrderID: "e2e-" + t.Name(),
 		Qty:           "1",
 	})
@@ -146,7 +146,7 @@ func TestGateEndToEndDenyPath(t *testing.T) {
 
 	// 闸门应 deny
 	res, err := g.Authorize(t.Context(), GateRequest{
-		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModePaper,
+		DraftID: draftID, AccountID: acct.ID, Mode: db.ExecModeLiveManual,
 	})
 	if err != nil {
 		t.Fatalf("闸门返回 error: %v", err)

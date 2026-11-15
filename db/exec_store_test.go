@@ -202,7 +202,7 @@ func TestExecAuthorizationGrantAndActive(t *testing.T) {
 		Channel:           "okx",
 		AccountRef:        ref,
 		Mode:              string(ExecModeLiveManual),
-		FromMode:          string(ExecModePaper),
+		FromMode:          string(ExecModeLiveManual),
 		DisclaimerVersion: "v1",
 		ConfirmPhrase:     "我已知晓实盘风险",
 		LimitsSnapshot:    json.RawMessage(`{"max_single_amount":"1000"}`),
@@ -222,7 +222,7 @@ func TestExecAuthorizationGrantAndActive(t *testing.T) {
 	if a.Mode != string(ExecModeLiveManual) {
 		t.Errorf("mode = %q", a.Mode)
 	}
-	if a.FromMode != string(ExecModePaper) {
+	if a.FromMode != string(ExecModeLiveManual) {
 		t.Errorf("from_mode = %q", a.FromMode)
 	}
 	if a.DisclaimerVersion != "v1" {
@@ -260,7 +260,7 @@ func TestExecAuthorizationRegrantRevokesOld(t *testing.T) {
 
 	firstID, err := d.ExecAuthorizations().Grant(ExecAuthorizationInput{
 		Channel: "okx", AccountRef: ref,
-		Mode: string(ExecModeLiveWhitelist), FromMode: string(ExecModePaper),
+		Mode: string(ExecModeLiveWhitelist), FromMode: string(ExecModeLiveManual),
 		DisclaimerVersion: "v1", ConfirmPhrase: "确认",
 		RulesRevision: 1,
 	})

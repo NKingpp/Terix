@@ -43,7 +43,6 @@ type dashboardSummaryDTO struct {
 
 type dashboardExecDTO struct {
 	Mode     string                   `json:"mode"`
-	Frozen   bool                     `json:"frozen"`
 	Accounts dashboardAccountCountDTO `json:"accounts"`
 }
 
@@ -108,13 +107,6 @@ type dashboardOrdersDTO struct {
 // 用 string 而非 number：金额精度必须精确保留（NUMERIC），
 // JSON number 会被 JS 的 float64 截断两位以上小数。
 type dashboardPnlDTO struct {
-	// ---- 纸面 ----
-	PaperOrders          int64   `json:"paper_orders"`
-	PaperPositions       int64   `json:"paper_positions"`
-	PaperRealizedPnl     string  `json:"paper_realized_pnl"`
-	PaperUnrealizedPnl   *string `json:"paper_unrealized_pnl"`
-	PaperPricedPositions int64   `json:"paper_priced_positions"`
-	PaperTotalPositions  int64   `json:"paper_total_positions"`
 	// ---- 实盘 ----
 	// LiveFills 是实盘逐笔成交数（来自 trade_fills，每 60s 从交易所同步）。
 	LiveFills int64 `json:"live_fills"`
@@ -140,7 +132,6 @@ func (s *Server) dashboardSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out.Exec.Mode = string(mode)
-	out.Exec.Frozen = mode == db.ExecModeFrozen
 
 	acc, err := db.CountDashboardExecAccounts(ctx, conn)
 	if err != nil {
@@ -211,23 +202,7 @@ func (s *Server) dashboardSummary(w http.ResponseWriter, r *http.Request) {
 	}
 	out.Orders = dashboardOrdersDTO{Total: orders.Total, InFlight: orders.InFlight}
 
-	// ---- pnl ----
-	//
-	// 2026-11-04 起真正计算盈亏（见 paper_pnl.go）。
-	// 失败不阻断整个概览页 —— 盈亏是「锦上添花」的信息，
-	// 而 drafts/ratings 是核心。所以这里降级为 note 而不是返回 500。
-	pnl, pnlErr := s.computePaperPnl(ctx, "paper")
-	if pnlErr != nil {
-		out.Pnl.Note = "盈亏计算失败：" + pnlErr.Error()
-	} else {
-		out.Pnl.PaperOrders = pnl.FilledOrderCount
-		out.Pnl.PaperPositions = pnl.PositionCount
-		out.Pnl.PaperRealizedPnl = pnl.RealizedTotal
-		out.Pnl.PaperUnrealizedPnl = pnl.UnrealizedTotal
-		out.Pnl.PaperPricedPositions = pnl.PricedPositions
-		out.Pnl.PaperTotalPositions = pnl.TotalPositions
-		out.Pnl.Note = pnl.Note
-	}
+	// ---- 盈亏 ----（纸面模式已删除，只统计实盘）
 
 	// ---- 实盘盈亏（2026-11-14 补）----
 	//

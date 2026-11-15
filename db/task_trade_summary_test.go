@@ -6,6 +6,8 @@ import (
 )
 
 // 任务级成交汇总必须按 task_id 隔离：别的任务同标的成交不得污染本任务是否已平仓。
+//
+// 数据源是 trade_fills（实盘），task 归属靠 trade_records.client_order_id 连接。
 func TestTaskTradeSummaryForIsolatesByTask(t *testing.T) {
 	d := testOpen(t)
 	ctx := context.Background()
@@ -15,40 +17,55 @@ func TestTaskTradeSummaryForIsolatesByTask(t *testing.T) {
 	}
 	instID, _ := res.LastInsertId()
 	t.Cleanup(func() {
-		d.Exec(`DELETE FROM paper_orders WHERE instrument_id=$1`, instID)
+		d.Exec(`DELETE FROM trade_fills WHERE instrument_id=$1`, instID)
+		d.Exec(`DELETE FROM trade_records WHERE instrument_id=$1`, instID)
 		d.Exec(`DELETE FROM instruments WHERE id=$1`, instID)
 	})
 
-	insert := func(taskID int64, side, qty, px string) {
-		if _, err := d.Exec(`INSERT INTO paper_orders(task_id, instrument_id, mode, side, qty, filled_qty, avg_fill_price, status, filled_at)
-			VALUES ($1,$2,'live',$3,$4,$4,$5,'filled','2026-11-13T10:00:00Z')`, taskID, instID, side, qty, px); err != nil {
+	// 每个任务两条台账（开/平），成交按 cl_ord_id 挂上去。
+	mkRec := func(taskID int64, cid, side, qty string) {
+		if _, err := d.Exec(`INSERT INTO trade_records(task_id, account_id, instrument_id, inst_id, action, side, qty,
+			client_order_id, state, mode, operator) VALUES ($1,1,$2,'TTS-ACCEPT-TEST','open',$3,$4,$5,'filled','live_auto','agent')`,
+			taskID, instID, side, qty, cid); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// 本任务：买 10@100 再卖 10@101 → 平仓 + 已实现 10
-	insert(9001, "buy", "10", "100")
-	insert(9001, "sell", "10", "101")
-	// 别的任务：买 5@100 未平 —— 不得影响 9001 的 flat 判定
-	insert(9002, "buy", "5", "100")
+	mkFill := func(cid, side, qty, px, at string) {
+		if _, _, err := d.InsertFill(TradeFill{
+			FillID: cid + "-" + at, AccountID: 1, InstID: "TTS-ACCEPT-TEST",
+			Side: side, FillPx: px, FillSz: qty, ClOrdID: cid, FilledAt: at,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-	sum, err := TaskTradeSummaryFor(ctx, d.DB, 9001, "live", instID)
+	// 本任务：买 10@100 再卖 10@101 → 已平仓，已实现 +10
+	mkRec(9001, "c9001a", "buy", "10")
+	mkFill("c9001a", "buy", "10", "100", "2026-11-13T10:00:00Z")
+	mkRec(9001, "c9001b", "sell", "10")
+	mkFill("c9001b", "sell", "10", "101", "2026-11-13T11:00:00Z")
+	// 别的任务：买 5@100 未平 —— 不得影响 9001 的 flat 判定
+	mkRec(9002, "c9002a", "buy", "5")
+	mkFill("c9002a", "buy", "5", "100", "2026-11-13T12:00:00Z")
+
+	sum, err := TaskTradeSummaryFor(ctx, d.DB, 9001, instID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if sum.Fills != 2 || sum.OpenPositions != 0 {
 		t.Fatalf("本任务应 2 笔成交且已平仓，得到 %+v", sum)
 	}
-	if sum.RealizedTotal != "10.0000000000" {
-		t.Fatalf("已实现盈亏应为 10.0000000000，得到 %s", sum.RealizedTotal)
+	if sum.RealizedTotal != "10" {
+		t.Fatalf("已实现盈亏应为 10，得到 %s", sum.RealizedTotal)
 	}
-	other, err := TaskTradeSummaryFor(ctx, d.DB, 9002, "live", instID)
+	other, err := TaskTradeSummaryFor(ctx, d.DB, 9002, instID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if other.OpenPositions != 1 {
 		t.Fatalf("别的任务仍有 1 个未平仓标的，得到 %+v", other)
 	}
-	empty, err := TaskTradeSummaryFor(ctx, d.DB, 9003, "live", instID)
+	empty, err := TaskTradeSummaryFor(ctx, d.DB, 9003, instID)
 	if err != nil || empty.Fills != 0 {
 		t.Fatalf("无成交任务应返回空汇总: %+v err=%v", empty, err)
 	}

@@ -54,9 +54,13 @@ var execToolNames = []string{
 
 // ExecToolSet 持有同步交易工具需要的依赖。
 type ExecToolSet struct {
-	pg    *db.DB
-	gate  *exec.Gate
+	pg   *db.DB
+	gate *exec.Gate
+	// creds 为 nil 时退回 clientOverride。
 	creds func() (*db.OkxTradeCred, error)
+	// clientOverride 是测试注入点：绕过真实凭据与网络。
+	// 生产路径永远为 nil。
+	clientOverride okxTrader
 }
 
 // NewExecToolSet 构造同步交易工具集。nil 依赖安全（调用时才报「未装配」）。
@@ -94,6 +98,9 @@ func (t *ExecToolSet) okxClient() (okxTrader, error) {
 	// 把 typed-nil 装进接口，接口本身**不等于 nil** —— 于是调用方
 	// `if ec.client != nil` 会通过，然后在 nil receiver 上调用方法 panic。
 	// 实测 TestOpenPositionUpgradesSpotToPerp 就是这样崩在 okxrest/market.go:34。
+	if t.clientOverride != nil {
+		return t.clientOverride, nil
+	}
 	c, err := buildOkxClient(t.creds)
 	if err != nil {
 		return nil, err
@@ -142,7 +149,6 @@ type execCtx struct {
 	inst    *db.Instrument
 	mode    db.ExecMode
 	client  okxTrader
-	isPaper bool
 }
 
 // prepareExec 把工具入参解析成可直接下单的上下文。
@@ -233,26 +239,10 @@ func (t *ExecToolSet) prepareExec(ctx context.Context, symbol string) (*execCtx,
 	}
 	out := &execCtx{
 		taskID: task.ID, task: task, acct: acct, params: params,
-		inst: inst, mode: mode, isPaper: mode == db.ExecModePaper,
+		inst: inst, mode: mode,
 	}
-	if mode == db.ExecModeFrozen {
-		// 冻结/降级/未授权都在这里挡掉：工具是「执行」，不是「提案」。
-		return nil, fmt.Errorf("执行模式已冻结，不能下单")
-	}
-	// 客户端**纸面模式也要装配**。
-	//
-	// # 为什么（2026-11-14）
-	//
-	// 1) 取价走公开接口（/market/ticker），不需要凭据 —— 纸面模式一样能取，
-	//    因而一样能做 TP/SL 方向校验。不装配等于纸面模式少一道护栏。
-	// 2) 更硬的理由：closePaper 里写的是 `ec.client.LastPrice(...)`，
-	//    client 为 nil 时那是**空指针解引用**（方法调用不会因为 receiver 是
-	//    nil 而自动跳过）。纸面平仓会直接 panic。
-	//
-	// 所以只在「实盘且装不上」时才失败；纸面模式装配失败就容忍（client 保持 nil，
-	// 调用方必须自己判空 —— closePaper 已改为先判空再取价）。
 	client, cErr := t.okxClient()
-	if cErr != nil && !out.isPaper {
+	if cErr != nil {
 		return nil, cErr
 	}
 	out.client = client
@@ -355,17 +345,12 @@ func (t *ExecToolSet) openPosition() actool.CoreTool {
 
 			// ---- 读现有持仓，判定这一单的真实效果 ----
 			//
-			// 实盘读失败必须拒绝：没有持仓快照就无法知道要不要撤旧 OCO、
+			// 读失败必须拒绝：没有持仓快照就无法知道要不要撤旧 OCO、
 			// 会不会反手 —— 盲下单会留下两组保护单或按旧方向平掉新仓。
-			// 纸面读失败视为空仓（纸面账本坏了不该阻断交易模拟）。
 			snap, sErr := t.snapshotPositions(cctx, ec)
 			if sErr != nil {
-				if !ec.isPaper {
-					return actool.Errorf(fmt.Sprintf(
-						"%v —— 无法判定加仓/减仓/反手，拒绝盲下单。稍后重试", sErr)), nil
-				}
-				slog.Warn("开仓：读纸面持仓失败，按空仓处理", "inst", ec.inst.Symbol, "err", sErr)
-				snap = &positionSnapshot{BySide: map[string]heldPosition{}, Paper: true}
+				return actool.Errorf(fmt.Sprintf(
+					"%v —— 无法判定加仓/减仓/反手，拒绝盲下单。稍后重试", sErr)), nil
 			}
 			plan, cErr := exec.ClassifyEntry(ec.params.PosMode, side, qty,
 				snap.qtyOf(posSide), snap.qtyOf(oppSide))
@@ -388,17 +373,11 @@ func (t *ExecToolSet) openPosition() actool.CoreTool {
 				}
 			}
 			if px == "" {
-				slog.Info("开仓：未取到现价，跳过 TP/SL 方向校验",
-					"inst", ec.inst.Symbol, "paper", ec.isPaper)
+				slog.Info("开仓：未取到现价，跳过 TP/SL 方向校验", "inst", ec.inst.Symbol)
 			} else if tp != "" || sl != "" {
 				if why := bracketSideInvalid(posSide, px, tp, sl); why != "" {
 					return actool.Errorf(fmt.Sprintf("%s（开仓被本地拒绝，未提交交易所）", why)), nil
 				}
-			}
-
-			// ---- 纸面模式 ----
-			if ec.isPaper {
-				return t.openPaper(ctx, ec, side, posSide, qty, tp, sl, reason, plan)
 			}
 
 			// ---- 实盘：设杠杆 → settleBracket 按 effect 分派 ----
@@ -527,207 +506,6 @@ func positionViewAfter(post *positionSnapshot, plan exec.EntryPlan, side string)
 	return map[string]any{"side": side, "qty": plan.PostNet, "avg_px": "", "estimated": true}
 }
 
-// openPaper 在纸面模式下开仓（写 paper_orders + paper_trade_plans）。
-//
-// # 为什么必须走草案而不是直接 INSERT paper_orders
-//
-// InsertFilledOrder 要求 draftID > 0（executed_note 写在草案上，用于防重复执行），
-// 而 ExecutePaper 还要校验「草案有 allow 判定 + 限额版本一致」。
-// 绕开它直接插单，纸面账本就会与实盘账本长出两套形状，盈亏不可比。
-//
-// # 为什么必须建 signal（2026-11-14）
-//
-// orders_draft 表**没有 task_id 列** —— 任务的归属靠 JOIN signals 带出。
-// 不建信号的话，ExecutePaper 拿到的 draft.TaskID 是 nil，
-// 落下的 paper_orders.task_id 也是 NULL，于是这一仓永远不出现在任务盈亏里。
-// 实测第一次联调就是这样：纸面开了仓，任务详情却显示 0 笔。
-func (t *ExecToolSet) openPaper(ctx context.Context, ec *execCtx,
-	side, posSide, qty, tp, sl, reason string, plan exec.EntryPlan) (actool.Result, error) {
-	// 纸面成交必须有参考价（ExecutePaper 会拒绝没有 ref_price 的草案）。
-	// 用公开行情取价 —— 不需要凭据。
-	px := ""
-	if ec.client != nil {
-		if p, pErr := ec.client.LastPrice(ctx, ec.inst.Symbol); pErr == nil {
-			px = p
-		}
-	}
-	if px == "" {
-		return actool.Errorf("纸面开仓需要现价来计价，但取价失败。" +
-			"这会让纸面收益失真，所以拒绝执行；稍后重试"), nil
-	}
-
-	// ---- 仓位可行性校验：名义金额必须能被账户权益支撑 ----
-	//
-	// # 为什么纸面也要校验（2026-11-15 荒谬仓位事故）
-	//
-	// 原来这里零校验。模型按「用全部余额」算出 10000 张 NVDA 永续
-	// （名义约 160 万 USD），而账户权益只有 8.7 万 —— 引擎照单全收，
-	// dashboard 于是显示「模拟盘赚 2766 USDT」。
-	//
-	// 那个数字没有决策含义：它来自一笔现实中必然被交易所拒绝的单。
-	// 纸面模拟的意义是「约束都是真的，只是不花真钱」，允许不可能成交的
-	// 单就等于把模拟结果变成噪声。
-	//
-	// 读不到权益时 fail-closed：宁可这次不开，也不要记一笔无法兑现的账。
-	if ec.client != nil {
-		bal, bErr := ec.client.FetchAccountBalance(ctx)
-		if bErr != nil {
-			return actool.Errorf(fmt.Sprintf(
-				"纸面开仓需要账户权益来校验仓位是否可承受，但读取失败: %v。稍后重试", bErr)), nil
-		}
-		equity := bal.EquityOf("USDT")
-		if equity == "0" {
-			if eq := strings.TrimSpace(bal.TotalEq); eq != "" && eq != "0" {
-				equity = eq // 没有 USDT 明细时回退总权益（USD 计价）
-			}
-		}
-		notional := mulDecimal(qty, px)
-		lever := strings.TrimSpace(ec.params.Lever)
-		if ok, why := okxrest.FitsMargin(notional, equity, lever); !ok {
-			return actool.Errorf(fmt.Sprintf(
-				"纸面开仓被本地拒绝：%s。\n"+
-					"这一单在交易所同样会被拒绝（保证金不足），记进纸面账本只会让模拟盈亏失真。\n"+
-					"请按权益重算 qty：qty × %s ≤ %s × %s 倍", why, px, equity, lever)), nil
-		}
-	}
-
-	// ---- 加仓：合并到已有计划，不插新行 ----
-	//
-	// 同标的同方向插两条计划会让 get_positions 显示两行残余、
-	// close_position 只平掉其中一条 —— 另一条成永远平不掉的幽灵仓。
-	// 成交仍要记一笔 paper_orders（那是「发生了什么」的流水）。
-	if plan.Effect == exec.EffectScaleIn {
-		if pid, ok := t.findPaperPlan(ctx, ec, posSide); ok {
-			return t.scaleInPaper(ctx, ec, pid, side, posSide, qty, px, tp, sl, reason, plan)
-		}
-	}
-
-	sigID, draftID, err := t.createPaperDraft(ctx, ec, side, posSide, qty, px, tp, sl)
-	if err != nil {
-		return actool.Errorf(err.Error()), nil
-	}
-	// 纸面执行要求先有 allow 判定（Gate.ExecutePaper 的硬前置）。
-	if _, err := t.gate.Authorize(ctx, exec.GateRequest{
-		DraftID: draftID, AccountID: ec.acct.ID, Mode: db.ExecModePaper,
-	}); err != nil {
-		return actool.Errorf(fmt.Sprintf("纸面过闸失败: %v", err)), nil
-	}
-	paperID, err := t.gate.ExecutePaper(ctx, draftID, ec.acct.ID)
-	if err != nil {
-		return actool.Errorf(fmt.Sprintf("纸面开仓失败: %v", err)), nil
-	}
-	if _, iErr := t.pg.InsertTradeRecord(db.TradeRecord{
-		TaskID: ec.taskID, AccountID: ec.acct.ID, InstrumentID: ec.inst.ID,
-		InstID: ec.inst.Symbol, Action: "open", Side: side, PosSide: posSide,
-		Qty: qty, OrdType: "market", Px: px, TpPrice: tp, SlPrice: sl,
-		State: db.TradeRecordFilled, Mode: string(ec.mode), Operator: "agent",
-		PositionEffect: plan.Effect,
-	}); iErr != nil {
-		slog.Warn("纸面开仓台账写入失败", "draft", draftID, "err", iErr)
-	}
-	return tradeJSON(map[string]any{
-		"result": "filled", "mode": "paper", "paper_order_id": paperID,
-		"draft_id": draftID, "signal_id": sigID,
-		"symbol": ec.inst.Symbol, "side": side, "pos_side": posSide,
-		"qty": qty, "fill_px": px, "tp": tp, "sl": sl, "reason": reason,
-		"position_effect": plan.Effect,
-		"pre_position":    map[string]any{"side": posSide, "qty": plan.HeldSame},
-		"post_position":   map[string]any{"side": posSide, "qty": plan.PostNet},
-		"protection":      paperProtection(tp, sl),
-		"note": "纸面账本已记账（按现价 " + px + "），不涉及真实资金。" +
-			"纸面模式没有交易所级 OCO —— 止盈止损只记录在案，到点需调 close_position",
-	})
-}
-
-// scaleInPaper 纸面加仓：累加已有计划的数量，并记一笔成交流水。
-func (t *ExecToolSet) scaleInPaper(ctx context.Context, ec *execCtx, planID int64,
-	side, posSide, qty, px, tp, sl, reason string, plan exec.EntryPlan) (actool.Result, error) {
-	paperID, insErr := t.pg.PaperOrders().InsertClosingOrder(db.PaperOrderInput{
-		TaskID:       taskIDPtr(ec.taskID),
-		InstrumentID: &ec.inst.ID, AccountID: &ec.acct.ID,
-		Mode: db.OrderModePaper, Side: side, Qty: qty, Price: px,
-		Status: db.OrderStatusFilled,
-	}, "tool scale_in: "+reason)
-	if insErr != nil {
-		return actool.Errorf(fmt.Sprintf("纸面加仓记账失败: %v", insErr)), nil
-	}
-	if aErr := t.pg.AddToPaperTradePlan(planID, qty, tp, sl); aErr != nil {
-		return actool.Errorf(fmt.Sprintf("纸面加仓合并计划失败: %v", aErr)), nil
-	}
-	if _, iErr := t.pg.InsertTradeRecord(db.TradeRecord{
-		TaskID: ec.taskID, AccountID: ec.acct.ID, InstrumentID: ec.inst.ID,
-		InstID: ec.inst.Symbol, Action: "open", Side: side, PosSide: posSide,
-		Qty: qty, OrdType: "market", Px: px, TpPrice: tp, SlPrice: sl,
-		State: db.TradeRecordFilled, Mode: string(ec.mode), Operator: "agent",
-		PositionEffect: plan.Effect,
-	}); iErr != nil {
-		slog.Warn("纸面加仓台账写入失败", "plan", planID, "err", iErr)
-	}
-	return tradeJSON(map[string]any{
-		"result": "filled", "mode": "paper", "paper_order_id": paperID, "plan_id": planID,
-		"symbol": ec.inst.Symbol, "side": side, "pos_side": posSide,
-		"qty": qty, "fill_px": px, "tp": tp, "sl": sl,
-		"position_effect": plan.Effect,
-		"pre_position":    map[string]any{"side": posSide, "qty": plan.HeldSame},
-		"post_position":   map[string]any{"side": posSide, "qty": plan.PostNet},
-		"protection":      paperProtection(tp, sl),
-		"note":            "纸面加仓已合并到同方向计划（均价由 paper_orders 流水加权算出）",
-	})
-}
-
-// findPaperPlan 找该标的该方向的第一条未平计划。
-func (t *ExecToolSet) findPaperPlan(ctx context.Context, ec *execCtx, posSide string) (int64, bool) {
-	plans, err := t.pg.ListOpenPaperTradePlans(0)
-	if err != nil {
-		return 0, false
-	}
-	for _, p := range plans {
-		if p.InstrumentID == ec.inst.ID && p.PosSide == posSide {
-			return p.ID, true
-		}
-	}
-	return 0, false
-}
-
-// paperProtection 纸面模式的保护状态：有 TP/SL 记为 protected（仅记录值）。
-func paperProtection(tp, sl string) string {
-	if strings.TrimSpace(tp) == "" && strings.TrimSpace(sl) == "" {
-		return ProtectionNaked
-	}
-	return ProtectionProtected
-}
-
-// createPaperDraft 建纸面信号 + 草案 + 执行参数（不含执行）。
-//
-// 抽出来是为了可测：归属断言不该依赖能否从交易所取到现价。
-// 这里 px 由调用方给，测试可以直接传一个固定价验证 task_id 归属。
-func (t *ExecToolSet) createPaperDraft(ctx context.Context, ec *execCtx,
-	side, posSide, qty, px, tp, sl string) (sigID, draftID int64, err error) {
-	sigID, err = t.pg.Signals().InsertSignal(db.SignalInput{
-		TaskID:       &ec.taskID,
-		InstrumentID: &ec.inst.ID,
-		SignalType:   "technical",
-		Direction:    posSide,
-		Action:       "entry",
-	})
-	if err != nil {
-		return 0, 0, fmt.Errorf("建纸面信号失败: %v", err)
-	}
-	draftID, err = t.pg.OrderDrafts().InsertDraft(db.OrderDraftInput{
-		SignalID:     &sigID,
-		InstrumentID: &ec.inst.ID, Side: side, Qty: qty, RefPrice: px,
-	})
-	if err != nil {
-		return 0, 0, fmt.Errorf("建纸面草案失败: %v", err)
-	}
-	if err = t.pg.UpsertDraftExecParams(db.DraftExecParams{
-		DraftID: draftID, OrderType: "market", PosSide: posSide,
-		TpPrice: tp, SlPrice: sl,
-	}); err != nil {
-		return 0, 0, fmt.Errorf("写纸面执行参数失败: %v", err)
-	}
-	return sigID, draftID, nil
-}
 
 // ---------------------------------------------------------------------
 // close_position
@@ -770,11 +548,6 @@ func (t *ExecToolSet) closePosition() actool.CoreTool {
 			}
 			cctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 			defer cancel()
-
-			// ---- 纸面：写一笔反向纸面单 ----
-			if ec.isPaper {
-				return t.closePaper(ctx, ec, posSide, strings.TrimSpace(a.Qty), a.Reason)
-			}
 
 			// ---- 实盘：用统一快照定数量 ----
 			//
@@ -862,118 +635,6 @@ func (t *ExecToolSet) closePosition() actool.CoreTool {
 	)
 }
 
-// closePaper 在纸面模式平仓（写反向 paper_order + 关掉计划）。
-//
-// # 为什么读 paper_trade_plans 而不是 live_positions（2026-11-14 任务 30）
-//
-// live_positions 是**实盘**持仓跟踪表：它回答「这个仓是哪张草案开的、
-// 谁已经把它平了」。纸面仓不在交易所，从来不写这张表。
-// 原来 closePaper 读 live_positions，于是恒返回「纸面账本没有持仓」——
-// 而纸面账本里明明有一条。模型反复重试后只能报「找不到该仓」。
-//
-// 纸面仓的唯一真相是 paper_trade_plans（开仓时 Gate.ExecutePaper 写入，
-// 含 qty/tp/sl，closed_at 表平仓）。
-func (t *ExecToolSet) closePaper(ctx context.Context, ec *execCtx, posSide, qty, reason string) (actool.Result, error) {
-	plans, err := t.pg.ListOpenPaperTradePlans(0)
-	if err != nil {
-		return actool.Errorf(fmt.Sprintf("读纸面持仓失败: %v", err)), nil
-	}
-	// 该标的该方向的**全部**未平计划（历史 bug 留下过同向多条重复行）。
-	mine := make([]db.PaperTradePlan, 0, 2)
-	held := "0"
-	for _, p := range plans {
-		if p.InstrumentID != ec.inst.ID || p.PosSide != posSide {
-			continue
-		}
-		mine = append(mine, p)
-		held = addDecimal(held, p.Qty)
-	}
-	if len(mine) == 0 {
-		return actool.Errorf(fmt.Sprintf(
-			"纸面账本没有 %s 的 %s 持仓（可能已平）。先用 get_positions 核对", ec.inst.Symbol, posSide)), nil
-	}
-	if qty == "" {
-		qty = held
-	} else if !lessOrEqualDecimal(qty, held) {
-		return actool.Errorf(fmt.Sprintf("平仓量 %s 超过纸面持仓 %s", qty, held)), nil
-	}
-
-	// 纸面平仓必须有价（否则算不出盈亏）。读不到就拒绝，
-	// 而不是按 0 记账 —— 那会把盈利算成巨亏。
-	px := ""
-	if ec.client != nil {
-		if p, pErr := ec.client.LastPrice(ctx, ec.inst.Symbol); pErr == nil {
-			px = p
-		}
-	}
-	if px == "" {
-		return actool.Errorf("纸面平仓需要现价来计价，但取价失败。稍后重试或在真实模式下平仓"), nil
-	}
-
-	side := "sell"
-	if posSide == "short" {
-		side = "buy"
-	}
-	paperID, insErr := t.pg.PaperOrders().InsertClosingOrder(db.PaperOrderInput{
-		TaskID:       taskIDPtr(ec.taskID),
-		InstrumentID: &ec.inst.ID, AccountID: &ec.acct.ID,
-		Mode: db.OrderModePaper, Side: side, Qty: qty, Price: px,
-		Status: db.OrderStatusFilled,
-	}, "tool close: "+reason)
-	if insErr != nil {
-		return actool.Errorf(fmt.Sprintf("纸面平仓失败: %v", insErr)), nil
-	}
-	// 按 FIFO 逐条消耗计划：整条平完就关闭，只平一部分就扣减数量。
-	//
-	// # 为什么不直接 MarkPaperTradePlanClosed（2026-11-14）
-	//
-	// 那个方法无条件关闭整条计划。部分平仓时调它，剩余那部分仓位就从
-	// 账本上消失了 —— get_positions（读 plans）看不见，close_position
-	// 也找不到，最终在盈亏统计里变成「凭空获利」。
-	remaining := qty
-	for _, p := range mine {
-		r, ok := new(big.Rat).SetString(strings.TrimSpace(remaining))
-		if !ok || r.Sign() <= 0 {
-			break
-		}
-		pq, okp := new(big.Rat).SetString(strings.TrimSpace(p.Qty))
-		if !okp || pq.Sign() <= 0 {
-			continue
-		}
-		if r.Cmp(pq) >= 0 {
-			if _, cErr := t.pg.MarkPaperTradePlanClosed(p.ID, "tool close: "+reason); cErr != nil {
-				slog.Warn("纸面平仓：关闭计划失败（仓位可能被重复统计）", "plan", p.ID, "err", cErr)
-			}
-			remaining = decimalString(new(big.Rat).Sub(r, pq))
-			continue
-		}
-		// 只够平一部分：扣减数量，计划继续存活。
-		if _, rErr := t.pg.ReducePaperTradePlanQty(p.ID, decimalString(new(big.Rat).Sub(pq, r))); rErr != nil {
-			slog.Warn("纸面平仓：扣减计划数量失败（剩余仓可能不准）", "plan", p.ID, "err", rErr)
-		}
-		remaining = "0"
-	}
-	_, _ = t.pg.InsertTradeRecord(db.TradeRecord{
-		TaskID: ec.taskID, AccountID: ec.acct.ID, InstrumentID: ec.inst.ID,
-		InstID: ec.inst.Symbol, Action: "close", Side: side, PosSide: posSide,
-		Qty: qty, OrdType: "market", Px: px, ReduceOnly: true,
-		State: db.TradeRecordFilled, Mode: string(ec.mode), Operator: "agent",
-	})
-	postQty := "0"
-	if v, ok := new(big.Rat).SetString(strings.TrimSpace(held)); ok {
-		if c, ok2 := new(big.Rat).SetString(strings.TrimSpace(qty)); ok2 {
-			postQty = decimalString(new(big.Rat).Sub(v, c))
-		}
-	}
-	return tradeJSON(map[string]any{
-		"result": "filled", "mode": "paper", "paper_order_id": paperID,
-		"symbol": ec.inst.Symbol, "pos_side": posSide, "qty": qty, "exit_px": px,
-		"position_effect": "close",
-		"post_position":   map[string]any{"side": posSide, "qty": postQty},
-		"protection":      paperProtection("", ""), // 平仓后无保护（占位，语义由 post_position 表达）
-		"note":            "纸面账本已平仓，盈亏按 paper 口径（不含手续费）",
-	})
-}
 
 // ---------------------------------------------------------------------
 // set_leverage
@@ -1017,13 +678,6 @@ func (t *ExecToolSet) setLeverage() actool.CoreTool {
 				TaskID: ec.taskID, AccountID: ec.acct.ID, InstrumentID: ec.inst.ID,
 				InstID: ec.inst.Symbol, Action: "set_leverage", Leverage: lever,
 				State: db.TradeRecordFilled, Mode: string(ec.mode), Operator: "agent",
-			}
-			if ec.isPaper {
-				_, _ = t.pg.InsertTradeRecord(rec)
-				return tradeJSON(map[string]any{
-					"result": "ok", "mode": "paper", "symbol": ec.inst.Symbol, "leverage": lever,
-					"note": "纸面模式不计保证金，杠杆设置已记录但不影响账本",
-				})
 			}
 			cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()

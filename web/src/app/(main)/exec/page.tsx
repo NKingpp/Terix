@@ -36,14 +36,12 @@ import type { ExecAccount, TradeLoopStatus } from "@/lib/types";
 
 import { useExecMode } from "./_components/exec-mode-provider";
 
+// 只有实盘三档。纸面模式与冻结状态已删除 —— 这是无人值守系统，
+// 「停下来」靠关任务或拉黑账户，不靠一个模式值。
 const MODE_OPTIONS = [
-  { value: "paper", label: "模拟盘（paper）", hint: "自动成交，仅记纸面账本" },
   { value: "live_whitelist", label: "实盘·白名单", hint: "只允许白名单标的" },
   { value: "live_manual", label: "实盘·人工确认", hint: "每笔都要人工确认" },
-  // 2026-11-05：实盘自动。提示文案必须说清「不询问」——
-  // 这是用户最容易误判的一点（以为还会弹确认框）。
   { value: "live_auto", label: "实盘·自动", hint: "系统自行下单，不再逐笔询问" },
-  { value: "frozen", label: "冻结", hint: "停止一切自动执行" },
 ];
 
 export default function ExecPage() {
@@ -118,22 +116,10 @@ export default function ExecPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {frozen ? (
-            <Alert variant="destructive">
-              <LockIcon className="size-4" />
-              <AlertTitle>系统已冻结</AlertTitle>
-              <AlertDescription>
-                冻结状态下不会执行任何自动交易（含 paper）。切换模式已禁用，需先解冻（要求先回 paper）。
-              </AlertDescription>
-            </Alert>
-          ) : null}
-
-          {/* 切模式：frozen 时全部禁用 —— 不只是显示横幅，按钮也要禁掉。
-              否则用户点了才发现失败，还得读一遍 409 的原因。 */}
           <div className="flex flex-wrap items-end gap-3">
             <div className="w-56">
               <Label>切换模式</Label>
-              <Select value={targetMode} onValueChange={setTargetMode} disabled={frozen || busy}>
+              <Select value={targetMode} onValueChange={setTargetMode} disabled={busy}>
                 <SelectTrigger>
                   <SelectValue placeholder="选择目标模式" />
                 </SelectTrigger>
@@ -146,14 +132,13 @@ export default function ExecPage() {
                 </SelectContent>
               </Select>
             </div>
-            <Button disabled={!targetMode || frozen || busy} onClick={() => void doSetMode(targetMode)}>
+            <Button disabled={!targetMode || busy} onClick={() => void doSetMode(targetMode)}>
               应用
             </Button>
           </div>
 
           <p className="text-xs text-muted-foreground">
-            选择目标模式后点「应用」即直接切换，无需授权实盘或限额确认。
-            模拟盘（paper）会把已过闸的草案自动成交为纸面订单；实盘·自动会下发真实通道。
+            选择目标模式后点「应用」即直接切换。实盘·自动会下发真实通道。
           </p>
         </CardContent>
       </Card>

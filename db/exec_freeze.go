@@ -8,7 +8,6 @@ package db
 //
 //	exec_authorizations  —— 撤掉凭据
 //	exec_accounts        —— 拉黑账户
-//	settings(exec_mode)  —— 降级为 paper
 //
 // 拆到 exec 层去写 SQL 会让语句散落，而项目的既有范式是
 // 「事务封在 db 方法内部」（见 config.go:420 / 597 / 763 / 894 的 4 处先例）。
@@ -38,13 +37,11 @@ type FreezeResult struct {
 	AuthorizationRevoked bool
 	// AccountBlocked 本次是否拉黑了账户。
 	AccountBlocked bool
-	// ModeDowngraded 本次是否把 exec_mode 从 live_* 降到了 paper。
-	ModeDowngraded bool
 }
 
 // Changed 报告本次冻结是否有任何实际改动。
 func (r FreezeResult) Changed() bool {
-	return r.AuthorizationRevoked || r.AccountBlocked || r.ModeDowngraded
+	return r.AuthorizationRevoked || r.AccountBlocked
 }
 
 // FreezeAccountTx 在一个事务里冻结账户：撤授权 + 拉黑 + 降模式。
@@ -54,8 +51,7 @@ func (r FreezeResult) Changed() bool {
 // 「冻结」的语义是「停止一切自动执行」，不只是「这个账户不能用了」。
 //
 //	只撤授权不拉黑 → 账户还能被重新授权，凭据断得不彻底
-//	只拉黑不降模式 → 系统还在 live，其它账户仍可自动下单，
-//	                  「冻结」没达到目的
+//	只拉黑不撤授权 → 旧授权仍在，重新启用后凭据会立刻复活
 //
 // 三件事拆开做，任何一步失败都会留下半成品状态。同事务保证
 // 「要么全冻，要么一点没动」。
@@ -120,45 +116,7 @@ func (d *DB) FreezeAccountTx(accountID int64, channel, accountRef, reason string
 	// 提交后 Rollback 是 no-op，所以这里无条件 defer 是安全的。
 	defer func() { _ = tx.Rollback() }()
 
-	// ---- ① 降模式 ----
-	//
-	// 应急响应的顺序是「先关总闸，再查细节」。
-	// 降模式是全局关闸 —— 它失败时后面两步不该发生：
-	// 即使事务回滚能撤销数据，也撤销不了「行锁/触发器已产生」这件事。
-	//
-	// # 只改 live_*
-	//
-	//   paper  不动：避免无谓写库
-	//   frozen 不动：**那是更严格的状�态，改成 paper 是放宽，与冻结意图相反**
-	//
-	// 如果用户需要冻结后在 paper 上验证，应由他显式 TransitionMode(frozen, paper)——
-	// 而不是冻结动作顺手放宽。
-	//
-	// # 已知前提：单实例部署
-	//
-	// PG 默认 read committed：事务未提交时其他连接读不到中间状态。
-	// 所以「降模式后失败回滚」在单实例下 UI 看不到闪回。
-	//
-	// 如果将来多实例部署，这个前提失效 —— 那时要么用 advisory lock 让降模式
-	// 全局可见，要么改成「先封账户→再降模式」接受锁持有更久。
-	//
-	// # 为什么不用 ON CONFLICT DO UPDATE
-	//
-	// settings 里可能根本没有 exec_mode 这个 key（首次启动前 GetExecMode 也当它是 paper）。
-	// 裸 UPDATE 在 key 不存在时是 no-op，语义正确 —— 「不存在」等于 paper。
-	// 用 ON CONFLICT 会凭空创建一行 exec_mode=paper，而「没配过」和「配置成 paper」
-	// 在 GetExecMode 里虽然等价，但审计上不是一回事。
-	r, err := tx.Exec(`UPDATE settings SET value = $1, updated_at = now()
-WHERE key = $2 AND value IN ($3, $4, $5)`,
-		string(ExecModePaper), ExecModeKey, string(ExecModeLiveWhitelist), string(ExecModeLiveManual), string(ExecModeLiveAuto))
-	if err != nil {
-		return res, fmt.Errorf("降模式失败: %w", err)
-	}
-	if n, _ := r.RowsAffected(); n > 0 {
-		res.ModeDowngraded = true
-	}
-
-	// ---- ② 撤授权 ----
+	// ---- ① 撤授权 ----
 	//
 	// 授权表按 (channel, account_ref) 定位，不是 account_id —— 那是它的自然键。
 	// 没有活跃授权时不算失败：账户可能从未授权过（paper 模式不需要授权）。
@@ -175,11 +133,11 @@ WHERE channel = $1 AND account_ref = $2 AND revoked_at IS NULL`,
 		}
 	}
 
-	// ---- ③ 拉黑账户 ----
+	// ---- ② 拉黑账户 ----
 	//
 	// WHERE blocked_at IS NULL 让重复冻结成为 no-op（而不是覆盖首次的
 	// blocked_at 与 block_reason —— 首次的原因才是审计要的）。
-	r, err = tx.Exec(`UPDATE exec_accounts
+	r, err := tx.Exec(`UPDATE exec_accounts
 SET blocked_at = now(), block_reason = $2
 WHERE id = $1 AND blocked_at IS NULL`, accountID, reason)
 	if err != nil {
@@ -200,7 +158,7 @@ WHERE id = $1 AND blocked_at IS NULL`, accountID, reason)
 		}
 	}
 
-	// ---- ④ 审计（必须在事务内）----
+	// ---- ③ 审计（必须在事务内）----
 	//
 	// # 为什么在事务内（ARCH §3.5 硬约束 1、2）
 	//
@@ -226,7 +184,6 @@ WHERE id = $1 AND blocked_at IS NULL`, accountID, reason)
 		"reason":                reason,
 		"authorization_revoked": res.AuthorizationRevoked,
 		"account_blocked":       res.AccountBlocked,
-		"mode_downgraded":       res.ModeDowngraded,
 	}); err != nil {
 		// 审计写不进 → 整个事务回滚 → 冻结不生效。
 		// 调用方（对账）会在下一 tick 重试。

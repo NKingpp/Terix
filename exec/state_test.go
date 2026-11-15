@@ -43,40 +43,14 @@ func validAuth(rev int64) *db.ExecAuthorization {
 	}
 }
 
-// TestRule1FrozenRejectsLive 规则 1：frozen → live_* 被拒。
-func TestRule1FrozenRejectsLive(t *testing.T) {
-	for _, target := range []db.ExecMode{db.ExecModeLiveWhitelist, db.ExecModeLiveManual} {
-		err := ValidateTransition(TransitionRequest{
-			From: db.ExecModeFrozen,
-			To:   target,
-			// 即使授权和限额都齐全，也必须拒绝 —— 这就是「硬规则」
-			Auth:                 validAuth(1),
-			CurrentLimits:        fullLimits(),
-			CurrentRulesRevision: 1,
-		})
-		if err == nil {
-			t.Fatalf("frozen → %s 必须被拒（即使授权齐全）", target)
-		}
-		if !errors.Is(err, &ModeError{Code: CodeModeFrozenRejectsLive}) {
-			t.Errorf("frozen → %s 应返回 CodeModeFrozenRejectsLive，实际: %v", target, err)
-		}
-	}
-}
 
-// TestRule1FrozenToPaperAllowed frozen → paper 是唯一合法出口。
-func TestRule1FrozenToPaperAllowed(t *testing.T) {
-	err := ValidateTransition(TransitionRequest{From: db.ExecModeFrozen, To: db.ExecModePaper})
-	if err != nil {
-		t.Fatalf("frozen → paper 应合法: %v", err)
-	}
-}
 
 // TestRule2AuthRequired 规则 2a：升级到 live 没有授权 → 拒绝。
 func TestRule2AuthRequired(t *testing.T) {
 	err := ValidateTransition(TransitionRequest{
-		From:          db.ExecModePaper,
-		To:            db.ExecModeLiveWhitelist,
-		Auth:          nil, // 没有授权
+		From:          db.ExecModeLiveWhitelist,
+		To:            db.ExecModeLiveManual, // 升级方向（约束更松）
+		Auth:          nil,                   // 没有授权
 		CurrentLimits: fullLimits(),
 	})
 	if !errors.Is(err, &ModeError{Code: CodeAuthRequired}) {
@@ -95,7 +69,7 @@ func TestRule2AuthModeMustMatch(t *testing.T) {
 	auth.Mode = string(db.ExecModeLiveWhitelist) // 只授权了白名单
 
 	err := ValidateTransition(TransitionRequest{
-		From:                 db.ExecModePaper,
+		From:                 db.ExecModeLiveWhitelist,
 		To:                   db.ExecModeLiveManual, // 想升到手动（更宽松）
 		Auth:                 auth,
 		CurrentLimits:        fullLimits(),
@@ -109,7 +83,7 @@ func TestRule2AuthModeMustMatch(t *testing.T) {
 // TestRule2RulesRevisionMismatch 规则 2c：规则版本变了 → 授权过期。
 func TestRule2RulesRevisionMismatch(t *testing.T) {
 	err := ValidateTransition(TransitionRequest{
-		From:                 db.ExecModePaper,
+		From:                 db.ExecModeLiveWhitelist,
 		To:                   db.ExecModeLiveManual,
 		Auth:                 validAuth(1), // 授权时 rev=1
 		CurrentLimits:        fullLimits(),
@@ -131,7 +105,7 @@ func TestRule2LimitsSnapshotMismatch(t *testing.T) {
 	changed.MaxSingleAmount = strPtr("1000000") // 改成 100 万
 
 	err := ValidateTransition(TransitionRequest{
-		From:                 db.ExecModePaper,
+		From:                 db.ExecModeLiveWhitelist,
 		To:                   db.ExecModeLiveManual,
 		Auth:                 auth,
 		CurrentLimits:        changed,
@@ -145,7 +119,7 @@ func TestRule2LimitsSnapshotMismatch(t *testing.T) {
 // TestRule2AllMatchPasses 规则 2：三重一致时放行。
 func TestRule2AllMatchPasses(t *testing.T) {
 	err := ValidateTransition(TransitionRequest{
-		From:                 db.ExecModePaper,
+		From:                 db.ExecModeLiveWhitelist,
 		To:                   db.ExecModeLiveManual,
 		Auth:                 validAuth(1),
 		CurrentLimits:        fullLimits(),
@@ -181,7 +155,7 @@ func TestRule3LimitsIncomplete(t *testing.T) {
 				RulesRevision:  1,
 			}
 			err := ValidateTransition(TransitionRequest{
-				From:                 db.ExecModePaper,
+				From:                 db.ExecModeLiveWhitelist,
 				To:                   db.ExecModeLiveManual,
 				Auth:                 auth,
 				CurrentLimits:        c.limits,
@@ -197,7 +171,7 @@ func TestRule3LimitsIncomplete(t *testing.T) {
 // TestRule3LimitsCompletePasses 限额完整时放行。
 func TestRule3LimitsCompletePasses(t *testing.T) {
 	err := ValidateTransition(TransitionRequest{
-		From:                 db.ExecModePaper,
+		From:                 db.ExecModeLiveWhitelist,
 		To:                   db.ExecModeLiveManual,
 		Auth:                 validAuth(1),
 		CurrentLimits:        fullLimits(),
@@ -212,22 +186,22 @@ func TestRule3LimitsCompletePasses(t *testing.T) {
 func TestDowngradeDoesNotNeedAuth(t *testing.T) {
 	// live_manual → paper：无授权、无限额、规则版本 0，都应该放行
 	err := ValidateTransition(TransitionRequest{
-		From:          db.ExecModeLiveManual,
-		To:            db.ExecModePaper,
+		From:          db.ExecModeLiveAuto,
+		To:            db.ExecModeLiveWhitelist,
 		Auth:          nil,
 		CurrentLimits: nil,
 	})
 	if err != nil {
-		t.Fatalf("降级不该要求授权，实际: %v", err)
+		t.Fatalf("降档不该要求授权，实际: %v", err)
 	}
 
-	// live_manual → frozen 也应放行
+	// live_manual → live_whitelist（收紧）也应放行
 	err = ValidateTransition(TransitionRequest{
 		From: db.ExecModeLiveManual,
-		To:   db.ExecModeFrozen,
+		To:   db.ExecModeLiveWhitelist,
 	})
 	if err != nil {
-		t.Fatalf("任意 → frozen 应放行: %v", err)
+		t.Fatalf("收紧应放行: %v", err)
 	}
 }
 

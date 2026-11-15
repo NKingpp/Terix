@@ -157,6 +157,20 @@ func (d *DB) initSchemaAndSeed() error {
 		return fmt.Errorf("迁移 trade_records.position_effect: %w", err)
 	}
 
+	// 纸面模式删除后，存量库里的 exec_mode='paper' / 'frozen' 已经没有对应常量。
+	// ParseExecMode 会直接报错，导致整个执行模式接口不可用。
+	// 一次性改写成 live_manual：它是「每笔人工确认」，最接近原来 paper 的保守程度。
+	if _, err := tx.Exec(`UPDATE settings SET value='live_manual', updated_at=now()
+WHERE key='exec_mode' AND value IN ('paper','frozen')`); err != nil {
+		return fmt.Errorf("迁移 exec_mode: %w", err)
+	}
+
+	// execute_paper_order 工具已从代码删除，但 tools 表里还留着注册行，
+	// 于是 /api/tools 依然把它列给模型 —— 模型会调一个不存在的工具。
+	if _, err := tx.Exec(`DELETE FROM tools WHERE key='execute_paper_order'`); err != nil {
+		return fmt.Errorf("清理 execute_paper_order 工具行: %w", err)
+	}
+
 	// seed 顺序即依赖顺序：agents 必须先建，agent_prompt_vars 才有 agent_id。
 	steps := []struct {
 		name string

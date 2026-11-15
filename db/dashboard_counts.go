@@ -189,32 +189,6 @@ func (c DashboardRatingCounts) SumByRating() int64 {
 	return c.Buy + c.Overweight + c.Hold + c.Underweight + c.Sell + c.Review
 }
 
-// CountDashboardPaperOrders 返回纸面**成交**单数（已成交的，不是全部下单）。
-//
-// # 2026-11-04 修正：原来统计整表，把未成交的也算成成交
-//
-// 原实现 `SELECT COUNT(*) FROM paper_orders` 包含 status='draft' 的下单记录 ——
-// 那张表同时承载「下单意图」和「成交结果」。后果：
-//   - 卡片说「有成交」，但实际全是 draft（渠道没回执）
-//   - pnl 分支因此走进「暂不支持盈亏计算（P1）」，而真相是「还没成交」
-//
-// 现口径：只数真正有成交量的行。
-//
-//	filled_qty > 0
-//
-// # 为什么用 filled_qty 而不是 status
-//
-// status 是渠道回执的状态字符串（draft/submitted/filled…），它会随渠道
-// 实现变化；而 filled_qty 是**成交量的数字事实** —— 无论状态叫什么，
-// 没成交就是 0。用数字而非枚举，对「统计成交」这个目的更稳。
-//
-// 用 filled_qty 也自然覆盖部分成交：0.5 手成交算一笔成交。
-func CountDashboardPaperOrders(ctx context.Context, conn *sql.DB) (int64, error) {
-	var n int64
-	err := conn.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM paper_orders WHERE filled_qty > 0`).Scan(&n)
-	return n, err
-}
 
 // CountDashboardRanTasks 返回「至少运行过一次」的任务数。
 //

@@ -56,7 +56,7 @@ func TestFinancialGoalSettlementRejectsTextEvidence(t *testing.T) {
 						t.Fatal(err)
 					}
 					t.Cleanup(func() {
-						for _, q := range []string{"DELETE FROM ratings WHERE instrument_id=$1", "DELETE FROM signals WHERE instrument_id=$1", "DELETE FROM orders_draft WHERE instrument_id=$1", "DELETE FROM paper_orders WHERE instrument_id=$1", "DELETE FROM tasks WHERE instrument_id=$1", "DELETE FROM instruments WHERE id=$1"} {
+						for _, q := range []string{"DELETE FROM ratings WHERE instrument_id=$1", "DELETE FROM signals WHERE instrument_id=$1", "DELETE FROM orders_draft WHERE instrument_id=$1", "DELETE FROM tasks WHERE instrument_id=$1", "DELETE FROM instruments WHERE id=$1"} {
 							if _, err := d.Exec(q, instID); err != nil {
 								t.Errorf("cleanup %s: %v", q, err)
 							}

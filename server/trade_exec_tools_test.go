@@ -9,7 +9,6 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/exec"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -84,6 +83,7 @@ func TestTradeRecordsTaskAttribution(t *testing.T) {
 func TestOpenPositionRequiresBracket(t *testing.T) {
 	e := newTradeE2E(t)
 	ets := NewExecToolSet(e.pg, e.tts.gate, nil)
+	ets.clientOverride = &fakeOkxTrader{lastPrice: "100"}
 	ctx := agent.WithRunInfo(context.Background(), e.runInfo(t, &e.instID))
 
 	out := callToolCtx(t, ctx, ets.openPosition(), map[string]any{
@@ -250,10 +250,10 @@ func TestPrepareExecHealsSpotBinding(t *testing.T) {
 	}
 
 	ets := NewExecToolSet(e.pg, e.tts.gate, nil)
+	ets.clientOverride = &fakeOkxTrader{lastPrice: "100"}
 	ctx := agent.WithRunInfo(context.Background(), ri)
 	ec, err := ets.prepareExec(ctx, "HEAL-USDT-SWAP")
 	if err != nil {
-		// 纸面模式下不需要凭据，应当能走到这里
 		t.Fatalf("应自动改绑到永续: %v", err)
 	}
 	if ec.inst.Symbol != "HEAL-USDT-SWAP" {
@@ -292,78 +292,6 @@ func TestPrepareExecRejectsDifferentAsset(t *testing.T) {
 	}
 }
 
-// 纸面平仓不能因为 client 为 nil 而 panic。
-//
-// # 这是真实的空指针路径
-//
-// closePaper 原来写的是 `ec.client.LastPrice(...)` —— nil 指针上的方法调用
-// 不会自动跳过，纸面平仓会直接 panic（而不是返回一个可读的错误）。
-// 顺序必须是「先判空，再取价」。
-func TestPaperCloseNoNilDeref(t *testing.T) {
-	ec := &execCtx{isPaper: true, client: nil}
-	if ec.client != nil {
-		t.Skip("前提不成立")
-	}
-	// 直接断言判空顺序：只要能走到「没有 client 就不取价」这一步即可。
-	// 这里构造的是一个极简调用，验证 nil 分支不会 panic。
-	var px string
-	if ec.client != nil {
-		p, _ := ec.client.LastPrice(t.Context(), "X-USDT-SWAP")
-		px = p
-	}
-	if px != "" {
-		t.Fatalf("无 client 时不该取到价，得到 %q", px)
-	}
-}
-
-// 纸面开仓必须能归属到任务。
-//
-// # orders_draft 没有 task_id 列
-//
-// 归属靠 JOIN signals 带出，所以 openPaper 必须建一条带 task_id 的 signal。
-// 不建的话 ExecutePaper 拿到的 draft.TaskID 是 nil，paper_orders.task_id 也是
-// NULL —— 纸面开了仓，任务详情却显示 0 笔（实测第一次联调就是这样）。
-//
-// 直接测 createPaperDraft 而不是走 openPosition：后者要先从交易所取价，
-// 测试环境拿不到（假标的不存在于 OKX），归属断言就永远跑不到。
-func TestCreatePaperDraftAttributesTask(t *testing.T) {
-	e := newTradeE2E(t)
-	if err := e.pg.SetSetting(db.ExecModeKey, string(db.ExecModePaper)); err != nil {
-		t.Fatal(err)
-	}
-	ri := e.runInfo(t, &e.instID)
-	ets := NewExecToolSet(e.pg, e.tts.gate, nil)
-	ec := &execCtx{
-		taskID: ri.TaskID, acct: &db.ExecAccount{ID: e.acctID},
-		inst: &db.Instrument{ID: e.instID, Symbol: "E2ETEST-USDT"},
-		mode: db.ExecModePaper, isPaper: true,
-	}
-	t.Cleanup(func() {
-		_, _ = e.pg.Exec(`DELETE FROM draft_exec_params WHERE draft_id IN (SELECT id FROM orders_draft WHERE signal_id IN (SELECT id FROM signals WHERE task_id=$1))`, ri.TaskID)
-		_, _ = e.pg.Exec(`DELETE FROM orders_draft WHERE signal_id IN (SELECT id FROM signals WHERE task_id=$1)`, ri.TaskID)
-		_, _ = e.pg.Exec(`DELETE FROM signals WHERE task_id=$1`, ri.TaskID)
-	})
-
-	sigID, draftID, err := ets.createPaperDraft(context.Background(), ec, "buy", "long", "1", "100", "110", "90")
-	if err != nil {
-		t.Fatalf("建纸面草案失败: %v", err)
-	}
-	if sigID <= 0 || draftID <= 0 {
-		t.Fatalf("signal/draft id 无效: %d/%d", sigID, draftID)
-	}
-	// 关键断言：草案能带出 task_id（ExecutePaper 靠它写 paper_orders.task_id）
-	d, err := e.pg.OrderDrafts().GetDraft(draftID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if d.TaskID == nil || *d.TaskID != ri.TaskID {
-		t.Fatalf("草案应带出任务 %d，实际 %v（paper_orders 会因此没有归属）", ri.TaskID, d.TaskID)
-	}
-	if d.RefPrice == nil || strings.TrimSpace(*d.RefPrice) == "" {
-		t.Fatal("草案必须有 ref_price，否则 ExecutePaper 会拒绝")
-	}
-}
-
 // sameUnderlying 必须把「裸股票代码」与「该股票的永续」判为同一资产。
 //
 // # 任务 30 的卡点
@@ -392,165 +320,6 @@ func TestSameUnderlying(t *testing.T) {
 		if sameUnderlying(c[0], c[1]) {
 			t.Errorf("%q 与 %q 不该判为同一资产", c[0], c[1])
 		}
-	}
-}
-
-// 已有同向持仓时 open_position **不再拒绝**，而是识别为加仓并如实回报。
-//
-// # 这是 2026-11-14 的规格变更
-//
-// 旧设计用 guardNoOpenPosition 一刀切拦掉「任意方向有仓就拒绝」，
-// 理由是净持仓模式下反向开仓会静默抵消现有仓。但那条限制同时
-// 也把合法的加仓挡掉了 —— 用户明确的诉求是「不要限制，让模型发挥」。
-//
-// 新设计的处理方式：
-//   - 不阻断，但用 exec.ClassifyEntry 判定这一单的真实效果
-//   - scale_in 时工具自动重挂 OCO（保证该方向同时只有一组保护）
-//   - 回执里明确 position_effect / pre_position / post_position / protection
-//
-// 这条测试钉住「语义识别正确」—— 而不是「拒绝」。
-func TestOpenPositionScalesInOnExistingSameSide(t *testing.T) {
-	e := newTradeE2E(t)
-	if err := e.pg.SetSetting(db.ExecModeKey, string(db.ExecModePaper)); err != nil {
-		t.Fatal(err)
-	}
-	ri := e.runInfo(t, &e.instID)
-	ets := NewExecToolSet(e.pg, e.tts.gate, nil)
-	ec := &execCtx{
-		taskID: ri.TaskID, acct: &db.ExecAccount{ID: e.acctID},
-		inst: &db.Instrument{ID: e.instID, Symbol: "E2ETEST-USDT-SWAP"},
-		mode: db.ExecModePaper, isPaper: true,
-	}
-	// 已有同向（多）纸面仓 1 张
-	planID, err := e.pg.InsertPaperTradePlan(db.PaperTradePlan{
-		AccountID: e.acctID, InstrumentID: e.instID, PosSide: "long",
-		Qty: "1", TpPrice: "110", SlPrice: "90",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_, _ = e.pg.Exec(`DELETE FROM paper_trade_plans WHERE id=$1`, planID)
-	})
-
-	// 快照应认出 1 张多仓
-	snap, sErr := ets.snapshotPositions(context.Background(), ec)
-	if sErr != nil {
-		t.Fatalf("读纸面持仓失败: %v", sErr)
-	}
-	plan, cErr := exec.ClassifyEntry("net", "buy", "0.5", snap.qtyOf("long"), snap.qtyOf("short"))
-	if cErr != nil {
-		t.Fatal(cErr)
-	}
-	if plan.Effect != exec.EffectScaleIn {
-		t.Fatalf("同向已有仓应判 scale_in，实际 %q（这是加仓，不是拒绝）", plan.Effect)
-	}
-	if plan.PostNet != "1.5" {
-		t.Errorf("PostNet = %q, want 1.5", plan.PostNet)
-	}
-
-	// 反向（净持仓模式下）应判 reduce 而不是 open
-	rev, _ := exec.ClassifyEntry("net", "sell", "0.3", snap.qtyOf("short"), snap.qtyOf("long"))
-	if rev.Effect != exec.EffectReduce {
-		t.Errorf("净持仓模式下反向小额应判 reduce，实际 %q", rev.Effect)
-	}
-}
-
-// 纸面部分平仓后剩余仓必须仍可见。
-//
-// # 原来的 bug
-//
-// closePaper 无条件调 MarkPaperTradePlanClosed，平一半就把整条计划关掉。
-// 剩余那半从账本消失：get_positions 看不见、close_position 找不到，
-// 最终在盈亏统计里变成「凭空获利」。
-func TestPaperPartialCloseKeepsRemainder(t *testing.T) {
-	e := newTradeE2E(t)
-	if err := e.pg.SetSetting(db.ExecModeKey, string(db.ExecModePaper)); err != nil {
-		t.Fatal(err)
-	}
-	planID, err := e.pg.InsertPaperTradePlan(db.PaperTradePlan{
-		AccountID: e.acctID, InstrumentID: e.instID, PosSide: "long",
-		Qty: "2", TpPrice: "110", SlPrice: "90",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_, _ = e.pg.Exec(`DELETE FROM paper_trade_plans WHERE id=$1`, planID)
-		_, _ = e.pg.Exec(`DELETE FROM paper_orders WHERE account_id=$1`, e.acctID)
-	})
-
-	// 直接调 db 层：closePaper 需要现价（测试环境取不到），
-	// 但「扣减而不是关闭」这个语义在 db 层就能钉住。
-	left, rErr := e.pg.ReducePaperTradePlanQty(planID, "1.5")
-	if rErr != nil {
-		t.Fatalf("扣减数量失败: %v", rErr)
-	}
-	if left != "1.5" {
-		t.Errorf("剩余量 = %q, want 1.5", left)
-	}
-	plans, lErr := e.pg.ListOpenPaperTradePlans(0)
-	if lErr != nil {
-		t.Fatal(lErr)
-	}
-	found := false
-	for _, p := range plans {
-		if p.ID == planID {
-			found = true
-			if p.Qty != "1.5" {
-				t.Errorf("未平计划数量 = %q, want 1.5", p.Qty)
-			}
-		}
-	}
-	if !found {
-		t.Fatal("部分平仓后计划不该被关闭（剩余仓会从账本消失）")
-	}
-}
-
-// 纸面加仓必须合并到同方向计划，不能插新行。
-//
-// 插两条会让 get_positions 显示两行残余、close_position 只平掉一条 ——
-// 另一条成永远平不掉的幽灵仓。
-func TestPaperScaleInMergesPlan(t *testing.T) {
-	e := newTradeE2E(t)
-	if err := e.pg.SetSetting(db.ExecModeKey, string(db.ExecModePaper)); err != nil {
-		t.Fatal(err)
-	}
-	planID, err := e.pg.InsertPaperTradePlan(db.PaperTradePlan{
-		AccountID: e.acctID, InstrumentID: e.instID, PosSide: "long",
-		Qty: "1", TpPrice: "110", SlPrice: "90",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_, _ = e.pg.Exec(`DELETE FROM paper_trade_plans WHERE id=$1`, planID)
-	})
-
-	if aErr := e.pg.AddToPaperTradePlan(planID, "0.5", "115", "88"); aErr != nil {
-		t.Fatalf("加仓合并失败: %v", aErr)
-	}
-	got, gErr := e.pg.GetPaperTradePlan(planID)
-	if gErr != nil {
-		t.Fatal(gErr)
-	}
-	if got.Qty != "1.5" {
-		t.Errorf("合并后数量 = %q, want 1.5", got.Qty)
-	}
-	if got.TpPrice != "115" || got.SlPrice != "88" {
-		t.Errorf("TP/SL 应被新值覆盖，得到 tp=%q sl=%q", got.TpPrice, got.SlPrice)
-	}
-
-	// 同方向仍只有一条计划
-	plans, _ := e.pg.ListOpenPaperTradePlans(0)
-	n := 0
-	for _, p := range plans {
-		if p.InstrumentID == e.instID && p.PosSide == "long" {
-			n++
-		}
-	}
-	if n != 1 {
-		t.Errorf("同方向计划应只有 1 条，实际 %d 条", n)
 	}
 }
 
@@ -591,52 +360,5 @@ func TestTradeRecordPositionEffect(t *testing.T) {
 	rec.Action = "close"
 	if _, err := e.pg.InsertTradeRecord(rec); err == nil {
 		t.Error("action=close 带 position_effect 应被拒")
-	}
-}
-
-// 纸面开仓必须校验名义金额能否被账户权益支撑。
-//
-// # 为什么（2026-11-15 荒谬仓位事故）
-//
-// 旧版 openPaper 零校验。模型按「用全部余额」算出 10000 张 NVDA 永续
-// （名义约 160 万 USD），账户权益只有 8.7 万 —— 引擎照单全收，
-// dashboard 于是显示「模拟盘赚 2766 USDT」。
-//
-// 那个数字没有决策含义：它来自一笔现实中必然被交易所拒绝的单。
-// 允许不可能成交的单，模拟结果就是纯噪声。
-//
-// 这条测试钉住「超额名义金额会被本地拦住」，且错误信息要说明
-// 这是保证金不足（不是随便的参数错误）。
-func TestOpenPaperRejectsOversizedNotional(t *testing.T) {
-	e := newTradeE2E(t)
-	if err := e.pg.SetSetting(db.ExecModeKey, string(db.ExecModePaper)); err != nil {
-		t.Fatal(err)
-	}
-	ri := e.runInfo(t, &e.instID)
-	ets := NewExecToolSet(e.pg, e.tts.gate, nil)
-	ec := &execCtx{
-		taskID: ri.TaskID, acct: &db.ExecAccount{ID: e.acctID},
-		inst: &db.Instrument{ID: e.instID, Symbol: "E2ETEST-USDT-SWAP"},
-		mode: db.ExecModePaper, isPaper: true,
-		params: db.ExecAccountParams{PosMode: "net", MgnMode: "cross", Lever: "3"},
-		// 用假客户端：权益 87000，现价 160 → 上限 261000 名义
-		client: &fakeOkxTrader{lastPrice: "160"},
-	}
-	plan := exec.EntryPlan{Effect: exec.EffectOpen, PostNet: "10000"}
-
-	// 10000 张 × 160 = 160 万名义，远超 87000×3
-	// 注意：工具用 actool.Errorf 表达业务拒绝（Result.IsError），
-	// 不是 Go error —— 所以断言要看 Result。
-	res, err := ets.openPaper(context.Background(), ec, "buy", "long",
-		"10000", "200", "120", "验证仓位校验", plan)
-	if err != nil {
-		t.Fatalf("不该返回 Go error: %v", err)
-	}
-	if !res.IsError {
-		t.Fatalf("超额名义金额必须被判为错误（现实中会被交易所拒绝），实际返回: %s", res.Flatten())
-	}
-	msg := res.Flatten()
-	if !strings.Contains(msg, "权益") && !strings.Contains(msg, "保证金") && !strings.Contains(msg, "名义金额") {
-		t.Errorf("错误应说明是保证金/名义金额问题，实际: %s", msg)
 	}
 }

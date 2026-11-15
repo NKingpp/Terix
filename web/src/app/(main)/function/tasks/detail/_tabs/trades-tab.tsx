@@ -169,9 +169,7 @@ export function TradesTab({ taskId }: { taskId: string }) {
   }
 
   const live = data?.live;
-  const paper = data?.paper;
   const liveCount = live?.fills.length ?? 0;
-  const paperCount = paper?.orders.length ?? 0;
 
   return (
     <div className="flex flex-col gap-4">
@@ -200,63 +198,6 @@ export function TradesTab({ taskId }: { taskId: string }) {
         <CardContent className="space-y-4">
           <TotalsRow totals={live?.totals ?? { realized: "0", fee_total: "0", net_realized: "0" }} feeNote="含手续费" />
           <PnLTable pnl={live?.pnl ?? []} />
-        </CardContent>
-      </Card>
-
-      {/* ---- 模拟盘 ---- */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-sm">
-            模拟盘
-            <Badge variant={paperCount > 0 ? "default" : "outline"}>
-              {paperCount > 0 ? `${paperCount} 笔成交` : "无成交"}
-            </Badge>
-          </CardTitle>
-          <CardDescription>
-            纸面账本，不涉及真实资金。<span className="text-amber-600">不记手续费</span>
-            ，所以这里的净盈亏等于已实现盈亏 —— 实盘会更低。
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <TotalsRow
-            totals={paper?.totals ?? { realized: "0", fee_total: "0", net_realized: "0" }}
-            feeNote={paper?.fee_included ? "含手续费" : "不含手续费"}
-          />
-          <PnLTable pnl={paper?.pnl ?? []} />
-          {paperCount > 0 && paper && (
-            <div className="max-h-[40vh] overflow-auto">
-              <table className="w-full text-sm">
-                <thead className="sticky top-0 bg-background">
-                  <tr className="border-b text-left text-muted-foreground">
-                    <th className="py-2 pr-3 font-medium">时间</th>
-                    <th className="py-2 pr-3 font-medium">标的</th>
-                    <th className="py-2 pr-3 font-medium">方向</th>
-                    <th className="py-2 pr-3 font-medium">价格</th>
-                    <th className="py-2 pr-3 font-medium">数量</th>
-                    <th className="py-2 font-medium">状态</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {paper.orders.map((o) => (
-                    <tr key={o.id} className="border-b last:border-0">
-                      <td className="py-2 pr-3 text-xs text-muted-foreground">
-                        {o.filled_at ? new Date(o.filled_at).toLocaleString("zh-CN") : "—"}
-                      </td>
-                      <td className="py-2 pr-3 font-mono text-xs">{o.inst_id}</td>
-                      <td
-                        className={`py-2 pr-3 text-xs font-medium ${o.side === "buy" ? "text-red-500" : "text-green-600"}`}
-                      >
-                        {o.side === "buy" ? "买入" : "卖出"}
-                      </td>
-                      <td className="py-2 pr-3 font-mono text-xs">{fmtPlain(o.price, 4)}</td>
-                      <td className="py-2 pr-3 font-mono text-xs">{o.qty}</td>
-                      <td className="py-2 text-xs text-muted-foreground">{o.status}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
         </CardContent>
       </Card>
 
@@ -345,7 +286,7 @@ export function TradesTab({ taskId }: { taskId: string }) {
         <CardContent>
           {liveCount === 0 ? (
             <p className="text-muted-foreground text-sm">
-              {paperCount === 0 ? "本任务还没有任何成交。" : "本任务暂无实盘成交。"}
+              {"本任务还没有任何成交。"}
             </p>
           ) : (
             <div className="max-h-[50vh] overflow-auto">

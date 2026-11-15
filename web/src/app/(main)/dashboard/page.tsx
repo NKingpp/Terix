@@ -694,49 +694,6 @@ export default function DashboardPage() {
           </CardContent>
         </Card>
 
-        {/* 纸面盈亏：已实现 / 浮动分开呈现。
-            ⚠️ 已实现（落袋）与浮动（账面）的决策含义完全不同 ——
-            合并成「总盈亏」会让用户无法判断那笔钱会不会吐回去。 */}
-        <Card className="gap-1">
-          <CardHeader className="pb-0">
-            <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-              <CoinsIcon className="size-3" /> 纸面盈亏
-            </div>
-            <div className="text-2xl font-semibold tabular-nums">
-              {!summary ? (
-                "—"
-              ) : summary.pnl.paper_orders === 0 ? (
-                // 「无成交」与「¥0.00」是两件事：后者会被读成「有成交但打平」
-                <span className="text-muted-foreground text-base font-normal">无成交</span>
-              ) : (
-                <PnlValue value={summary.pnl.paper_unrealized_pnl} />
-              )}
-            </div>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-0.5 text-[10px]">
-            {summary && summary.pnl.paper_orders > 0 && (
-              <>
-                <div className="flex justify-between gap-2">
-                  <span className="text-muted-foreground">已实现</span>
-                  <span className={cn("tabular-nums", pnlColor(summary.pnl.paper_realized_pnl))}>
-                    {formatPnl(summary.pnl.paper_realized_pnl)}
-                  </span>
-                </div>
-                <div className="flex justify-between gap-2">
-                  <span className="text-muted-foreground">持仓</span>
-                  <span className="tabular-nums">{summary.pnl.paper_positions}</span>
-                </div>
-              </>
-            )}
-            <span className="text-muted-foreground leading-snug">
-              {summary
-                ? summary.pnl.note ||
-                  (summary.pnl.paper_orders > 0 ? "浮动盈亏按最新收盘价计算" : "")
-                : "加载中…"}
-            </span>
-          </CardContent>
-        </Card>
-
         {/* 实盘盈亏：与纸面分开呈现。
             ⚠️ 两边的钱不是一回事 —— 合并会得出「模拟赚 50 + 实盘亏 30 = 赚 20」，
             那个数字没有任何决策含义。实盘口径含手续费（交易所返回负值）。 */}

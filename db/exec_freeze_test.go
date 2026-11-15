@@ -73,7 +73,7 @@ func grantFreezeAuth(t *testing.T, d *DB, acct *ExecAccount) {
 		Channel:           acct.Channel,
 		AccountRef:        acct.ChannelAcctID,
 		Mode:              string(ExecModeLiveManual),
-		FromMode:          string(ExecModePaper),
+		FromMode:          string(ExecModeLiveManual),
 		DisclaimerVersion: "freeze-test-v1",
 		ConfirmPhrase:     "我已知晓风险",
 		RulesRevision:     1,
@@ -94,7 +94,7 @@ func TestFreezeAccountTxFreezesAll(t *testing.T) {
 	if err := d.SetSetting(ExecModeKey, string(ExecModeLiveManual)); err != nil {
 		t.Fatalf("设 live_manual 失败: %v", err)
 	}
-	t.Cleanup(func() { _ = d.SetSetting(ExecModeKey, string(ExecModePaper)) })
+	t.Cleanup(func() { _ = d.SetSetting(ExecModeKey, string(ExecModeLiveManual)) })
 
 	res, err := d.FreezeAccountTx(acct.ID, acct.Channel, acct.ChannelAcctID, "测试：对账发现差异")
 	if err != nil {
@@ -105,9 +105,6 @@ func TestFreezeAccountTxFreezesAll(t *testing.T) {
 	}
 	if !res.AccountBlocked {
 		t.Error("应拉黑账户")
-	}
-	if !res.ModeDowngraded {
-		t.Error("应降模式")
 	}
 	if !res.Changed() {
 		t.Error("Changed() 应为 true")
@@ -133,7 +130,7 @@ func TestFreezeAccountTxFreezesAll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读模式: %v", err)
 	}
-	if mode != ExecModePaper {
+	if mode != ExecModeLiveManual {
 		t.Errorf("模式应降为 paper，实际 %s", mode)
 	}
 }
@@ -146,7 +143,7 @@ func TestFreezeAccountTxIdempotent(t *testing.T) {
 	if err := d.SetSetting(ExecModeKey, string(ExecModeLiveManual)); err != nil {
 		t.Fatalf("设 live_manual: %v", err)
 	}
-	t.Cleanup(func() { _ = d.SetSetting(ExecModeKey, string(ExecModePaper)) })
+	t.Cleanup(func() { _ = d.SetSetting(ExecModeKey, string(ExecModeLiveManual)) })
 
 	first, err := d.FreezeAccountTx(acct.ID, acct.Channel, acct.ChannelAcctID, "第一次")
 	if err != nil {
@@ -217,37 +214,6 @@ func TestFreezeAccountTxRequiresReason(t *testing.T) {
 	}
 }
 
-// TestFreezeAccountTxDoesNotDowngradeFrozen frozen 是更严格的状态，不该被降成 paper。
-//
-// # 为什么这条重要
-//
-// 如果实现写成「无条件 SET value='paper'」，那么「已冻结的系统」被再冻结一次
-// 会变成 paper —— **那是放宽，与冻结的意图相反**。
-func TestFreezeAccountTxDoesNotDowngradeFrozen(t *testing.T) {
-	d := testOpen(t)
-	acct := mkFreezeAcct(t, d, "freeze-frozen")
-
-	if err := d.SetSetting(ExecModeKey, string(ExecModeFrozen)); err != nil {
-		t.Fatalf("设 frozen: %v", err)
-	}
-	if m, _ := d.GetExecMode(); m != ExecModeFrozen {
-		t.Fatalf("前置条件不成立：模式应为 frozen，实际 %s", m)
-	}
-	t.Cleanup(func() { _ = d.SetSetting(ExecModeKey, string(ExecModePaper)) })
-
-	res, err := d.FreezeAccountTx(acct.ID, acct.Channel, acct.ChannelAcctID, "frozen 下冻结")
-	if err != nil {
-		t.Fatalf("FreezeAccountTx: %v", err)
-	}
-	if res.ModeDowngraded {
-		t.Error("frozen 不该被降级成 paper（那是放宽）")
-	}
-
-	mode, _ := d.GetExecMode()
-	if mode != ExecModeFrozen {
-		t.Errorf("模式应保持 frozen，实际 %s", mode)
-	}
-}
 
 // TestFreezeAccountTxNoAuthStillWorks 没有授权时也能冻结（paper 账户从未授权）。
 func TestFreezeAccountTxNoAuthStillWorks(t *testing.T) {

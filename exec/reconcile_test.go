@@ -103,7 +103,7 @@ func (e *reconcileEnv) mkSubmittedOrder(t *testing.T, stateAt time.Time) *db.Exe
 	orderID, err := e.g.db.ExecOrders().InsertOrder(db.ExecOrderInput{
 		DraftID:       draftID,
 		AccountID:     e.acct.ID,
-		Mode:          string(db.ExecModePaper),
+		Mode:          string(db.ExecModeLiveManual),
 		State:         db.ExecStateSubmitted,
 		ClientOrderID: clientID,
 		Qty:           "1",
@@ -444,7 +444,7 @@ WHERE action='exec_frozen' AND json_extract(detail, '$.account_id') = $1`, e.acc
 WHERE action='exec_frozen' AND json_extract(detail, '$.account_id') = $1`, e.acct.ID).Scan(&detail); err != nil {
 		t.Fatalf("读 detail: %v", err)
 	}
-	for _, want := range []string{"account_id", "reason", "mode_downgraded"} {
+	for _, want := range []string{"account_id", "reason"} {
 		if !strings.Contains(detail, want) {
 			t.Errorf("审计 detail 应含 %q，实际 %s", want, detail)
 		}

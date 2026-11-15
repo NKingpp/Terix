@@ -216,18 +216,7 @@ func (g *Gate) authorizeInner(ctx context.Context, req GateRequest) (GateResult,
 			"调用方传入的模式（%s）与系统当前模式（%s）不一致，拒绝执行", req.Mode, actualMode), nil
 	}
 
-	// ---- 2. 冻结检查 ----
-	// frozen 拒绝一切，**含 paper**。
-	//
-	// 冻结意味着「发现了问题，暂停执行」。
-	// 允许 paper 会让用户以为「至少还能跑模拟」，而模拟结果建立在
-	// 一个已知有问题的系统上 —— 那比完全不跑更误导。
-	if actualMode == db.ExecModeFrozen {
-		return deny(CodeModeFrozen,
-			"系统处于冻结状态，拒绝一切执行（含纸面）。请先解冻到 paper 模式确认问题已解决"), nil
-	}
-
-	// ---- 3. 账户可用性 ----
+	// ---- 2. 账户可用性 ----
 	// 注意 err 已在上面 GetExecMode 处声明，这里用 = 而不是 :=
 	if _, err = g.db.ExecAccounts().RequireUsable(req.AccountID); err != nil {
 		if err == db.ErrExecAccountNotFound {
@@ -237,7 +226,7 @@ func (g *Gate) authorizeInner(ctx context.Context, req GateRequest) (GateResult,
 		return deny(CodeAccountBlocked, "%v", err), nil
 	}
 
-	// ---- 4. 草案完整性 ----
+	// ---- 3. 草案完整性 ----
 	draft, err := g.db.OrderDrafts().GetDraft(req.DraftID)
 	if err != nil {
 		return deny(CodeDraftNotFound, "草案 %d 不存在或不可读：%v", req.DraftID, err), nil

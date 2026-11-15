@@ -175,7 +175,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
   const [acceptEvidence, setAcceptEvidence] = React.useState("");
   const [acceptKind, setAcceptKind] = React.useState<GoalAcceptanceKind>("flat");
   const [acceptSource, setAcceptSource] = React.useState<"auto" | "ledger" | "evidence">("auto");
-  const [acceptMode, setAcceptMode] = React.useState<"auto" | "paper" | "live">("auto");
+  const [acceptMode, setAcceptMode] = React.useState<"auto" | "live">("auto");
   const [acceptThreshold, setAcceptThreshold] = React.useState("");
   const [acceptBusy, setAcceptBusy] = React.useState(false);
   const [acceptErr, setAcceptErr] = React.useState("");
@@ -280,7 +280,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
     setAcceptObserved(null);
     setAcceptKind(g.acceptance?.kind ?? "flat");
     setAcceptSource((g.acceptance?.source as "ledger" | "evidence" | undefined) ?? "auto");
-    setAcceptMode((g.acceptance?.mode as "paper" | "live" | undefined) ?? "auto");
+    setAcceptMode((g.acceptance?.mode as "live" | undefined) ?? "auto");
     setAcceptThreshold(g.acceptance?.threshold ?? "");
   };
 
@@ -748,12 +748,11 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                   <NativeSelect
                     size="sm"
                     value={acceptMode}
-                    onChange={(e) => setAcceptMode(e.target.value as "auto" | "paper" | "live")}
+                    onChange={(e) => setAcceptMode(e.target.value as "auto" | "live")}
                     disabled={acceptBusy}
                   >
-                    <NativeSelectOption value="auto">账本:按执行模式</NativeSelectOption>
-                    <NativeSelectOption value="paper">账本:paper</NativeSelectOption>
-                    <NativeSelectOption value="live">账本:live</NativeSelectOption>
+                    <NativeSelectOption value="auto">账本:自动</NativeSelectOption>
+                    <NativeSelectOption value="live">账本:实盘</NativeSelectOption>
                   </NativeSelect>
                   {acceptKind === "pnl_ge" && (
                     <Input

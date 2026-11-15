@@ -40,15 +40,7 @@ type dashboardResp struct {
 		InFlight int64 `json:"in_flight"`
 	} `json:"orders"`
 	Pnl struct {
-		// 纸面字段全部带 paper_ 前缀：光看名字就知道这钱是不是真的
-		// （2026-11-15 改名，原来叫 positions/realized_pnl，被误读成总盈亏）。
-		PaperOrders          int64   `json:"paper_orders"`
-		PaperPositions       int64   `json:"paper_positions"`
-		PaperRealizedPnl     string  `json:"paper_realized_pnl"`
-		PaperUnrealizedPnl   *string `json:"paper_unrealized_pnl"`
-		PaperPricedPositions int64   `json:"paper_priced_positions"`
-		PaperTotalPositions  int64   `json:"paper_total_positions"`
-		// 实盘
+		// 实盘（纸面模式已删除）
 		LiveFills       int64  `json:"live_fills"`
 		LiveRealizedPnl string `json:"live_realized_pnl"`
 		LiveFeeTotal    string `json:"live_fee_total"`
@@ -93,10 +85,6 @@ func TestDashboardSummaryShape(t *testing.T) {
 		t.Error("exec.mode 为空")
 	}
 
-	// ④ pnl.note 必须非空 —— 它是「为什么没有盈亏数字」的唯一说明。
-	if got.Pnl.Note == "" {
-		t.Error("pnl.note 为空 —— 前端将无法区分「没成交」与「没算」")
-	}
 
 }
 
@@ -107,12 +95,12 @@ func TestDashboardSummaryEmptyStateNotes(t *testing.T) {
 	if _, err := e.m.pg.Exec(`DELETE FROM ratings`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.m.pg.Exec(`DELETE FROM paper_orders`); err != nil {
+	if _, err := e.m.pg.Exec(`DELETE FROM trade_fills`); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		_, _ = e.m.pg.Exec(`DELETE FROM ratings`)
-		_, _ = e.m.pg.Exec(`DELETE FROM paper_orders`)
+		_, _ = e.m.pg.Exec(`DELETE FROM trade_fills`)
 	})
 
 	w := e.do(e.s.dashboardSummary, "GET", "/api/dashboard/summary", "", nil)
@@ -132,11 +120,8 @@ func TestDashboardSummaryEmptyStateNotes(t *testing.T) {
 		t.Error("ratings.total=0 时 ratings.note 必须说明原因")
 	}
 
-	if got.Pnl.PaperOrders != 0 {
-		t.Fatalf("期望 paper_orders=0，实际 %d", got.Pnl.PaperOrders)
-	}
-	if got.Pnl.Note != "尚未产生纸面成交" {
-		t.Errorf("paper_orders=0 时 note 应为「尚未产生纸面成交」，实际 %q", got.Pnl.Note)
+	if got.Pnl.LiveFills != 0 {
+		t.Fatalf("期望 live_fills=0，实际 %d", got.Pnl.LiveFills)
 	}
 }
 
@@ -243,58 +228,6 @@ INSERT INTO orders_draft (side, qty, ref_price, risk_verdict, exported_at, execu
 	}
 }
 
-// TestDashboardPaperOrdersCountOnlyFilled 纸面成交数只数真正成交的。
-//
-// # 2026-11-04 修正的回归保护
-//
-// 原实现 COUNT(*) FROM paper_orders —— 把 status='draft'（还没成交）
-// 的下单意图也算成「有成交」，导致 pnl 走进「有成交」分支。
-//
-// paper_orders 同时承载「下单意图」与「成交结果」，所以必须按
-// filled_qty 筛。这条测试造 3 条：2 条未成交 + 1 条成交。
-func TestDashboardPaperOrdersCountOnlyFilled(t *testing.T) {
-	e := newExecAPIEnv(t)
-
-	if _, err := e.s.m.pg.Exec(`DELETE FROM paper_orders`); err != nil {
-		t.Fatalf("清理: %v", err)
-	}
-	defer func() { _, _ = e.s.m.pg.Exec(`DELETE FROM paper_orders`) }()
-
-	// ⚠️ 必须给 instrument_id：持仓聚合按标的关联，
-	// 而 instrument_id 为 NULL 的行会被排除（取不到现价，算不出盈亏）。
-	var instID int64
-	if err := e.s.m.pg.QueryRow(
-		`SELECT id FROM instruments WHERE symbol='600000' LIMIT 1`).Scan(&instID); err != nil {
-		t.Skipf("库里没有 600000，跳过: %v", err)
-	}
-
-	if _, err := e.s.m.pg.Exec(`
-INSERT INTO paper_orders (instrument_id, mode, side, qty, price, filled_qty, avg_fill_price, status) VALUES
-  ($1,'paper','buy','1','100','0', NULL,   'draft'),
-  ($1,'paper','buy','1','100','0', NULL,   'submitted'),
-  ($1,'paper','buy','1','100','1', '100.5','filled')`, instID); err != nil {
-		t.Fatalf("造数据: %v", err)
-	}
-
-	w := e.do(e.s.dashboardSummary, "GET", "/api/dashboard/summary", "", nil)
-	if w.Code != 200 {
-		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
-	}
-	var got dashboardResp
-	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
-		t.Fatalf("解析: %v", err)
-	}
-
-	if got.Pnl.PaperOrders != 1 {
-		t.Errorf("纸面成交数 = %d, want 1（未成交的下单意图不该计入）；note=%q",
-			got.Pnl.PaperOrders, got.Pnl.Note)
-	}
-	// 有成交时 note 必须说明「为什么还是没有盈亏数字」——
-	// 只说「暂不支持」会让用户以为功能坏了，而真相是缺字段。
-	if got.Pnl.Note == "" {
-		t.Error("pnl.note 为空")
-	}
-}
 
 // 盈亏字段必须成对出现 paper_ / live_ 前缀。
 //
@@ -323,11 +256,7 @@ func TestDashboardPnlFieldsAreNamespaced(t *testing.T) {
 	}
 
 	// 必须存在的带前缀字段
-	want := []string{
-		"paper_orders", "paper_positions", "paper_realized_pnl",
-		"paper_unrealized_pnl", "paper_priced_positions", "paper_total_positions",
-		"live_fills", "live_realized_pnl", "live_fee_total",
-	}
+	want := []string{"live_fills", "live_realized_pnl", "live_fee_total"}
 	for _, k := range want {
 		if _, ok := raw.Pnl[k]; !ok {
 			t.Errorf("缺少字段 %q", k)

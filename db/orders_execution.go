@@ -140,7 +140,6 @@ type ExecOrderInput struct {
 
 // validExecOrderModes 是订单模式白名单，与 CHECK 一致。
 var validExecOrderModes = map[string]bool{
-	string(ExecModePaper):         true,
 	string(ExecModeLiveWhitelist): true,
 	string(ExecModeLiveManual):    true,
 	string(ExecModeLiveAuto):      true,

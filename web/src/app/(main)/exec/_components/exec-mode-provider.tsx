@@ -12,11 +12,7 @@
 // # 三种状态必须区分（这是最容易写错的地方）
 //
 //   undefined（还没拉到）    → 不显示任何横幅
-//   "frozen"                → 显示冻结横幅
 //   其它                    → 不显示
-//
-// 如果横幅条件写成 `mode !== "paper"`，那「加载中」就会显示「已冻结」——
-// 一个是等，一个是报，视觉上都是「没有正常状态」，但含义完全不同。
 
 import * as React from "react";
 
@@ -113,7 +109,7 @@ export function ExecModeProvider({ children }: { children: React.ReactNode }) {
 
   const state: ExecModeState = {
     mode,
-    frozen: mode === "frozen",
+    frozen: false,
     fingerprint,
     limitsRevision,
     loaded,
@@ -152,25 +148,6 @@ function ExecBanner({ state }: { state: ExecModeState }) {
   // ② 还没拉到过：不显示（不要用「加载中」占位，那会闪一下）。
   if (!state.loaded) {
     return null;
-  }
-
-  // ③ 已冻结：红色常驻。
-  if (state.frozen) {
-    return (
-      <div className="px-4 pt-3">
-        <Alert variant="destructive">
-          <LockIcon className="size-4" />
-          <AlertTitle>执行已冻结</AlertTitle>
-          <AlertDescription>
-            系统已停止一切自动执行（含模拟盘）。请到
-            <a className="mx-1 underline" href="/exec">
-              执行模式页
-            </a>
-            查看原因并解冻。
-          </AlertDescription>
-        </Alert>
-      </div>
-    );
   }
 
   // ④ 正常：不显示。

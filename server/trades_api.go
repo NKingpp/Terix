@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -25,7 +24,6 @@ import (
 type tradeRecordResp struct {
 	TaskID string      `json:"task_id"`
 	Live   tradeBucket `json:"live"`
-	Paper  paperBucket `json:"paper"`
 	// Actions 是工具级交易台账（开仓/平仓/调杠杆的原始动作）。
 	//
 	// # 为什么与 live/paper 分开
@@ -46,13 +44,6 @@ type tradeBucket struct {
 	Synced bool `json:"synced"`
 }
 
-type paperBucket struct {
-	Orders []paperTradeRow `json:"orders"`
-	PnL    []exec.PnL      `json:"pnl"`
-	Totals tradeTotals     `json:"totals"`
-	// FeeIncluded 恒 false —— 纸面账本不记手续费，前端必须标注。
-	FeeIncluded bool `json:"fee_included"`
-}
 
 type paperTradeRow struct {
 	ID     int64  `json:"id"`
@@ -81,8 +72,6 @@ func (s *Server) taskTrades(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	numID, _ := strconv.ParseInt(id, 10, 64)
-	ctx := r.Context()
-
 	resp := tradeRecordResp{TaskID: id}
 
 	// ---- 实盘 ----
@@ -96,78 +85,18 @@ func (s *Server) taskTrades(w http.ResponseWriter, r *http.Request) {
 	resp.Live.Totals = sumPnL(resp.Live.PnL)
 	resp.Live.Synced = len(fills) > 0
 
-	// ---- 模拟盘 ----
-	paperRows, pErr := listPaperTrades(ctx, pg, numID)
-	if pErr != nil {
-		writeErr(w, 500, pErr.Error())
-		return
-	}
-	resp.Paper.Orders = paperRows
-	resp.Paper.PnL = paperPnL(paperRows)
-	resp.Paper.Totals = sumPnL(resp.Paper.PnL)
-	resp.Paper.FeeIncluded = false
-
 	// ---- 工具台账 ----
 	if recs, rErr := pg.ListTradeRecords(db.TradeRecordFilter{TaskID: numID, Limit: 300}); rErr == nil {
 		resp.Actions = recs
 	}
 
-	if !resp.Live.Synced && len(paperRows) == 0 {
-		resp.Note = "本任务还没有任何成交记录。实盘成交每 60 秒从交易所同步一次；" +
-			"模拟盘成交在下单后立刻入账。"
-	} else if !resp.Live.Synced {
-		resp.Note = "只有模拟盘成交。实盘尚无成交记录（未下单，或同步还没跑到）。"
+	if !resp.Live.Synced {
+		resp.Note = "本任务还没有任何成交记录。实盘成交每 60 秒从交易所同步一次。"
 	}
 	writeJSON(w, 200, resp)
 }
 
-// listPaperTrades 读任务的纸面成交。
-//
-// 直接查表而不是复用 db.ListPaperPositions：那个聚合的是「当前持仓」，
-// 而这里要的是「成交流水」（含已完全平掉的单）。
-func listPaperTrades(ctx context.Context, d *db.DB, taskID int64) ([]paperTradeRow, error) {
-	rows, err := d.Query(`SELECT po.id, COALESCE(i.symbol, ''), po.side, po.filled_qty,
-COALESCE(po.avg_fill_price, po.price, ''), po.status,
-COALESCE(po.filled_at, po.created_at, '')
-FROM paper_orders po
-LEFT JOIN instruments i ON i.id = po.instrument_id
-WHERE po.task_id = $1
-  AND po.status IN ('filled', 'partial')
-  AND CAST(po.filled_qty AS REAL) > 0
-ORDER BY COALESCE(po.filled_at, po.created_at) ASC, po.id ASC
-LIMIT 2000`, taskID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make([]paperTradeRow, 0, 16)
-	for rows.Next() {
-		var p paperTradeRow
-		if err := rows.Scan(&p.ID, &p.InstID, &p.Side, &p.Qty, &p.Price, &p.Status, &p.Filled); err != nil {
-			return nil, err
-		}
-		out = append(out, p)
-	}
-	return out, rows.Err()
-}
 
-// paperPnL 把纸面成交转成 exec.PnL 的形状，复用同一套盈亏算法。
-//
-// # 为什么复用而不是另写一套
-//
-// 两处算法不同会让「模拟盘赚了、实盘亏了」的对比失去意义 ——
-// 而那正是模拟盘存在的唯一理由。纸面侧没有手续费，fee 置 0 即可。
-func paperPnL(rows []paperTradeRow) []exec.PnL {
-	fills := make([]db.TradeFill, 0, len(rows))
-	for _, r := range rows {
-		fills = append(fills, db.TradeFill{
-			ID: r.ID, FillID: "paper:" + strconv.FormatInt(r.ID, 10),
-			InstID: r.InstID, Side: r.Side, FillPx: r.Price, FillSz: r.Qty,
-			Fee: "0", FilledAt: r.Filled,
-		})
-	}
-	return exec.ComputePnLByInst(fills)
-}
 
 // sumPnL 合计各标的的盈亏（精确十进制，不用 float）。
 func sumPnL(pnl []exec.PnL) tradeTotals {

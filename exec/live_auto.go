@@ -108,6 +108,11 @@ func NewAutoTrader(d *db.DB, gate *Gate, client ChannelSubmitter) *AutoTrader {
 	return &AutoTrader{db: d, gate: gate, client: client}
 }
 
+// limitsKeyGlobal 是全局限额配置集在 execution_limits 里的 key。
+//
+// 只有一个全局集：用户配的是「我的交易上限」，不是「某个模式的限额」。
+const limitsKeyGlobal = "global"
+
 // Degraded 返回是否已降级，以及原因。
 func (a *AutoTrader) Degraded() (bool, string) {
 	a.mu.Lock()
@@ -115,18 +120,10 @@ func (a *AutoTrader) Degraded() (bool, string) {
 	return a.degraded, a.why
 }
 
-// degrade 把自动交易标记为降级，并把执行模式切回 paper。
+// degrade 把自动交易标记为降级，之后拒绝本进程内的一切自动下单。
 //
-// # 为什么要同时改模式
-//
-// 只标记 degraded 而不改模式，会出现「模式显示 live_auto 但实际不下单」
-// 的状态 —— 用户看模式以为在跑，看订单列表却没有新单，无法判断是
-// 「没信号」还是「系统停了」。切回 paper 让状态自解释。
-//
-// # 为什么用 Freeze 而不是直接 SetExecMode
-//
-// Freeze 会走完整的降级流程（记录原因、冻结账户、写审计）。
-// 直接改 settings 会绕过这些，事后无法解释「为什么自己降级了」。
+// 只标记，不改模式：模式是用户的意图，不该被程序改写。
+// 降级状态在重启后自然清除（内存字段）。
 func (a *AutoTrader) degrade(ctx context.Context, reason string) {
 	a.mu.Lock()
 	if a.degraded {
@@ -137,18 +134,7 @@ func (a *AutoTrader) degrade(ctx context.Context, reason string) {
 	a.why = reason
 	a.mu.Unlock()
 
-	slog.Error("自动交易降级", "reason", reason)
-
-	// 切回 paper：live_auto 的合法出口只有 paper / frozen，这里选 paper
-	// —— 冻结会连纸面单都停，而降级后仍需继续验证策略。
-	if _, _, err := a.db.ForceSetExecMode(db.ExecModePaper); err != nil {
-		// 切模式失败是严重问题：模式还停在 live_auto 但已 degraded。
-		// 再试一次 frozen（宁可停死也不要留在 live_auto）。
-		slog.Error("降级切 paper 失败，尝试 frozen", "err", err)
-		if _, _, err2 := a.db.ForceSetExecMode(db.ExecModeFrozen); err2 != nil {
-			slog.Error("critical: 降级后两个模式都切不动", "err", err2, "state", "仍在 live_auto 但已 degraded")
-		}
-	}
+	slog.Error("自动交易降级（本进程不再自动下单，重启后恢复）", "reason", reason)
 }
 
 // Execute 执行一条草案的自动下单。
@@ -167,32 +153,17 @@ func (a *AutoTrader) degrade(ctx context.Context, reason string) {
 func (a *AutoTrader) Execute(ctx context.Context, draftID, accountID int64) (*AutoOutcome, error) {
 	out := &AutoOutcome{DraftID: draftID}
 
-	// ① 模式守卫
-	//
-	// 两种自动模式：
-	//   - live_auto：走真实通道（vaultd），需 live_auto 授权 + 通道可用
-	//   - paper    ：只落纸面账本，不碰真实通道，无需授权
-	// 其它模式（live_whitelist / live_manual / frozen）一律不自动执行。
+	// ① 模式守卫：只有 live_auto 会自动下单
 	mode, err := a.db.GetExecMode()
 	if err != nil {
 		return nil, fmt.Errorf("读执行模式: %w", err)
 	}
-	if mode != db.ExecModeLiveAuto && mode != db.ExecModePaper {
+	if mode != db.ExecModeLiveAuto {
 		out.Decision = "error"
-		out.Reason = fmt.Sprintf("当前模式 %s 不支持自动下单（仅 live_auto / paper）", mode)
+		out.Reason = fmt.Sprintf("当前模式 %s 不支持自动下单（仅 live_auto）", mode)
 		return out, nil
 	}
-	isPaper := mode == db.ExecModePaper
-
-	// ②③④ 都是**实盘专属**守卫：降级来自对账失败/单笔超限，授权与通道
-	// 也只对真实资金有意义。paper 没有真实敞口，跳过它们但仍保留闸门判定。
-	if !isPaper {
-		// ② 降级守卫
-		if bad, why := a.Degraded(); bad {
-			out.Decision = "error"
-			out.Reason = "自动交易已降级：" + why
-			return out, ErrAutoDegraded
-		}
+	{
 
 		// ③ 授权守卫
 		ok, err := a.hasLiveAutoAuth(ctx, accountID)
@@ -236,21 +207,6 @@ func (a *AutoTrader) Execute(ctx context.Context, draftID, accountID int64) (*Au
 		out.Reason = "闸门要求人工确认（自动模式下不执行）：" + res.Reason
 		return out, nil
 	case DecisionAllow:
-		// paper：最后一跳落到纸面账本，不碰真实通道。
-		//
-		// 仍复用上面的 Gate.Authorize（同一套模式/账户/草案/风控判定与审计），
-		// 只是把「下发渠道」换成 ExecutePaper —— 模拟成交与实盘口径一致。
-		if isPaper {
-			paperID, pErr := a.gate.ExecutePaper(ctx, draftID, accountID)
-			if pErr != nil {
-				out.Decision = "error"
-				out.Reason = "模拟盘自动成交失败：" + pErr.Error()
-				return out, pErr
-			}
-			out.ChannelID = fmt.Sprintf("paper:%d", paperID)
-			out.Reason = "模拟盘自动成交（不涉及真实资金）"
-			return out, nil
-		}
 		// live_auto：继续下发真实通道
 	default:
 		return nil, fmt.Errorf("闸门返回未知判定 %q", res.Decision)

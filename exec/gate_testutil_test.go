@@ -44,8 +44,11 @@ func gateTestEnv(t *testing.T) (*Gate, func()) {
 // modeOf 把字符串转成 db.ExecMode。
 func modeOf(s string) db.ExecMode { return db.ExecMode(s) }
 
-func paperMode() db.ExecMode         { return db.ExecModePaper }
-func frozenMode() db.ExecMode        { return db.ExecModeFrozen }
+// 模式 helper：纸面与冻结已删除，这里保留名字只为让既有测试少改。
+// paperMode 现在是「最低档」，frozenMode 是「最高档」—— 两者必须不同，
+// 否则 TransitionMode(from, to) 会因 from==to 被判非法。
+func paperMode() db.ExecMode         { return db.ExecModeLiveManual }
+func frozenMode() db.ExecMode        { return db.ExecModeLiveAuto }
 func liveManualMode() db.ExecMode    { return db.ExecModeLiveManual }
 func liveWhitelistMode() db.ExecMode { return db.ExecModeLiveWhitelist }
 

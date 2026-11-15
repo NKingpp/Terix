@@ -115,29 +115,18 @@ func TestTraderClosedBranch(t *testing.T) {
 
 // TestTraderAccountModeBranches paper 与实盘的措辞必须不同。
 func TestTraderAccountModeBranches(t *testing.T) {
+	// 纸面模式已删除：现在只有实盘一种口径，不再按 AccountMode 分叉。
 	base := traderVarsForSession()
 	base.TradingSession = TradingSessionView{IsOpen: true, Timezone: "America/New_York"}
 
-	paper := base
-	paper.AccountMode = "paper"
-	outPaper := renderTrader(t, paper)
-	if !strings.Contains(outPaper, "模拟盘") {
-		t.Error("AccountMode=paper 时应说「模拟盘」")
+	out := renderTrader(t, base)
+	if strings.Contains(out, "模拟盘") {
+		t.Error("不该再出现「模拟盘」分支")
 	}
-	if !strings.Contains(outPaper, "不要说「即将下单」") {
-		t.Error("paper 模式应禁止「即将下单」的措辞")
+	if !strings.Contains(out, "实盘") {
+		t.Error("应说明本次是实盘")
 	}
-
-	live := base
-	live.AccountMode = "live_whitelist"
-	outLive := renderTrader(t, live)
-	if strings.Contains(outLive, "本次为**模拟盘**") {
-		t.Error("实盘模式不该出现「模拟盘」")
-	}
-	if !strings.Contains(outLive, "实盘授权模式") {
-		t.Error("实盘模式应说明「实盘授权模式」")
-	}
-	if !strings.Contains(outLive, "不要写「已下单」") {
-		t.Error("实盘模式必须禁止「已下单/已成交」—— 输出是意图不是指令")
+	if !strings.Contains(out, "不要写「已下单」") {
+		t.Error("必须禁止「已下单/已成交」—— 输出是意图不是指令")
 	}
 }
