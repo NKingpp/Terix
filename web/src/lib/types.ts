@@ -1861,23 +1861,27 @@ export interface DashboardSummary {
     in_flight: number;
   };
   pnl: {
+    // ⚠️ 纸面与实盘字段全部带 paper_ / live_ 前缀（2026-11-15 改名）。
+    //
+    // 原来纸面叫 realized_pnl、实盘叫 live_realized_pnl —— 命名不对称的
+    // 后果是实打实的误读：有人看到 realized_pnl=2766.73 以为是「系统总盈亏」，
+    // 而它是纸面的数字（还含一笔现实中必然被拒的超大单），
+    // 同一时刻实盘是 -307.48。光看字段名就该知道这钱是不是真的。
+
     /** 有成交的纸面单数（filled_qty > 0），不是全部下单数 */
     paper_orders: number;
     /** 有净持仓（买卖差额不为 0）的标的数 */
-    positions: number;
+    paper_positions: number;
     /**
-     * 已实现盈亏 —— 已平仓部分，只依赖成交数据，永远可算。
+     * 纸面已实现盈亏 —— 已平仓部分，只依赖成交数据，永远可算。
      *
      * ⚠️ 是字符串不是 number：金额精度必须精确保留（数据库 NUMERIC），
      * JSON number 会被 JS 的 float64 截断。
      * 展示时用 Number() 转，但**不要**在计算链里转换后再转回字符串。
      */
-    realized_pnl: string;
-  live_fills: number;
-  live_realized_pnl: string;
-  live_fee_total: string;
+    paper_realized_pnl: string;
     /**
-     * 浮动盈亏 —— 持仓 × (现价 - 成本)。
+     * 纸面浮动盈亏 —— 持仓 × (现价 - 成本)。
      *
      * ⚠️ `null` 与 `"0"` 完全不同：
      *   null → 算不出来（没有现价 / 没有持仓）
@@ -1885,10 +1889,17 @@ export interface DashboardSummary {
      *
      * 展示时必须把 null 渲染成「—」，绝不能兜底成 0 —— 那会被读成「不赚不亏」。
      */
-    unrealized_pnl: string | null;
+    paper_unrealized_pnl: string | null;
     /** 浮动盈亏覆盖了多少持仓（取不到现价的标的会落在这两个数的差值里） */
-    priced_positions: number;
-    total_positions: number;
+    paper_priced_positions: number;
+    paper_total_positions: number;
+
+    /** 实盘逐笔成交数（每 60s 从交易所同步一次） */
+    live_fills: number;
+    /** 实盘已实现盈亏（含手续费，交易所口径） */
+    live_realized_pnl: string;
+    /** 实盘手续费合计（负数） */
+    live_fee_total: string;
     /**
      * 状态说明。
      *

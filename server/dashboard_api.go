@@ -75,17 +75,30 @@ type dashboardOrdersDTO struct {
 	InFlight int64 `json:"in_flight"`
 }
 
-// dashboardPnlDTO 是纸面盈亏段。
+// dashboardPnlDTO 是盈亏段。**纸面与实盘字段全部带前缀**。
 //
-// # 2026-11-04 从「只有成交数」扩展为「真实盈亏」
+// # 为什么每个字段都带 paper_ / live_ 前缀（2026-11-15 改名）
 //
-// 原实现只有 paper_orders 计数 + 一句「暂不支持盈亏计算」。
-// 现在给出：
-//   - realized_pnl   已实现盈亏（只依赖成交数据，永远可算）
-//   - unrealized_pnl 浮动盈亏（需现价；取不到时为 null，**不是 0**）
-//   - positions      持仓数
+// 原来纸面字段叫 realized_pnl / unrealized_pnl / positions，
+// 实盘叫 live_realized_pnl。命名不对称的后果是实打实的误读：
 //
-// # 为什么用指针表示 unrealized_pnl
+//	2026-11-15 有人看到 realized_pnl=2766.73，以为是「系统总盈亏」，
+//	而它其实是**纸面**的数字 —— 其中还包含一笔现实中必然被拒的
+//	10000 张单（名义 160 万 vs 权益 8.7 万）。同一时刻实盘是 -307.48。
+//
+// 两个数一个天上一个地下，却只有一个带 live_ 前缀。所以现在
+// 纸面侧全部补上 paper_：光看字段名就知道这钱是不是真的。
+//
+// # 纸面字段
+//
+//	paper_orders              有成交的纸面单数
+//	paper_positions           有净持仓（买卖差额 != 0）的标的数
+//	paper_realized_pnl        已实现盈亏（只依赖成交数据，永远可算）
+//	paper_unrealized_pnl      浮动盈亏（需现价；取不到时为 null，**不是 0**）
+//	paper_priced_positions    浮动盈亏覆盖了几个持仓
+//	paper_total_positions     一共几个持仓（与上者的差值 = 取不到现价的）
+//
+// # 为什么用指针表示 paper_unrealized_pnl
 //
 // null 与 "0" 在金融上完全不同：
 //
@@ -95,7 +108,14 @@ type dashboardOrdersDTO struct {
 // 用 string 而非 number：金额精度必须精确保留（NUMERIC），
 // JSON number 会被 JS 的 float64 截断两位以上小数。
 type dashboardPnlDTO struct {
-	PaperOrders int64 `json:"paper_orders"`
+	// ---- 纸面 ----
+	PaperOrders          int64   `json:"paper_orders"`
+	PaperPositions       int64   `json:"paper_positions"`
+	PaperRealizedPnl     string  `json:"paper_realized_pnl"`
+	PaperUnrealizedPnl   *string `json:"paper_unrealized_pnl"`
+	PaperPricedPositions int64   `json:"paper_priced_positions"`
+	PaperTotalPositions  int64   `json:"paper_total_positions"`
+	// ---- 实盘 ----
 	// LiveFills 是实盘逐笔成交数（来自 trade_fills，每 60s 从交易所同步）。
 	LiveFills int64 `json:"live_fills"`
 	// LiveRealizedPnl 是实盘已实现盈亏（含手续费）。与纸面分开算 ——
@@ -103,15 +123,6 @@ type dashboardPnlDTO struct {
 	LiveRealizedPnl string `json:"live_realized_pnl"`
 	// LiveFeeTotal 是实盘手续费合计（负数，交易所口径）。
 	LiveFeeTotal string `json:"live_fee_total"`
-	// Positions 是有净持仓（买卖差额不为 0）的标的数。
-	Positions int64 `json:"positions"`
-	// RealizedPnl 是已实现盈亏（已平仓部分），精确 decimal 字符串。
-	RealizedPnl string `json:"realized_pnl"`
-	// UnrealizedPnl 是浮动盈亏。null = 无法计算（无现价/无持仓）。
-	UnrealizedPnl *string `json:"unrealized_pnl"`
-	// PricedPositions / TotalPositions 说明浮动盈亏覆盖了多少持仓。
-	PricedPositions int64 `json:"priced_positions"`
-	TotalPositions  int64 `json:"total_positions"`
 	// Note 说明当前状态（为什么没有浮动盈亏、覆盖了多少）。
 	Note string `json:"note"`
 }
@@ -210,11 +221,11 @@ func (s *Server) dashboardSummary(w http.ResponseWriter, r *http.Request) {
 		out.Pnl.Note = "盈亏计算失败：" + pnlErr.Error()
 	} else {
 		out.Pnl.PaperOrders = pnl.FilledOrderCount
-		out.Pnl.Positions = pnl.PositionCount
-		out.Pnl.RealizedPnl = pnl.RealizedTotal
-		out.Pnl.UnrealizedPnl = pnl.UnrealizedTotal
-		out.Pnl.PricedPositions = pnl.PricedPositions
-		out.Pnl.TotalPositions = pnl.TotalPositions
+		out.Pnl.PaperPositions = pnl.PositionCount
+		out.Pnl.PaperRealizedPnl = pnl.RealizedTotal
+		out.Pnl.PaperUnrealizedPnl = pnl.UnrealizedTotal
+		out.Pnl.PaperPricedPositions = pnl.PricedPositions
+		out.Pnl.PaperTotalPositions = pnl.TotalPositions
 		out.Pnl.Note = pnl.Note
 	}
 

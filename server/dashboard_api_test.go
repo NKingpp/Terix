@@ -40,13 +40,19 @@ type dashboardResp struct {
 		InFlight int64 `json:"in_flight"`
 	} `json:"orders"`
 	Pnl struct {
-		Positions       int64   `json:"positions"`
-		RealizedPnl     string  `json:"realized_pnl"`
-		UnrealizedPnl   *string `json:"unrealized_pnl"`
-		PricedPositions int64   `json:"priced_positions"`
-		TotalPositions  int64   `json:"total_positions"`
-		PaperOrders     int64   `json:"paper_orders"`
-		Note            string  `json:"note"`
+		// 纸面字段全部带 paper_ 前缀：光看名字就知道这钱是不是真的
+		// （2026-11-15 改名，原来叫 positions/realized_pnl，被误读成总盈亏）。
+		PaperOrders          int64   `json:"paper_orders"`
+		PaperPositions       int64   `json:"paper_positions"`
+		PaperRealizedPnl     string  `json:"paper_realized_pnl"`
+		PaperUnrealizedPnl   *string `json:"paper_unrealized_pnl"`
+		PaperPricedPositions int64   `json:"paper_priced_positions"`
+		PaperTotalPositions  int64   `json:"paper_total_positions"`
+		// 实盘
+		LiveFills       int64  `json:"live_fills"`
+		LiveRealizedPnl string `json:"live_realized_pnl"`
+		LiveFeeTotal    string `json:"live_fee_total"`
+		Note            string `json:"note"`
 	} `json:"pnl"`
 }
 
@@ -287,5 +293,65 @@ INSERT INTO paper_orders (instrument_id, mode, side, qty, price, filled_qty, avg
 	// 只说「暂不支持」会让用户以为功能坏了，而真相是缺字段。
 	if got.Pnl.Note == "" {
 		t.Error("pnl.note 为空")
+	}
+}
+
+// 盈亏字段必须成对出现 paper_ / live_ 前缀。
+//
+// # 为什么这条测试值得写（2026-11-15 误读事故）
+//
+// 原来纸面字段叫 realized_pnl / unrealized_pnl / positions，
+// 而实盘叫 live_realized_pnl。命名不对称的后果是实打实的：
+//
+//	有人看到 realized_pnl=2766.73 以为是「系统总盈亏」—— 那是纸面的
+//	数字，还含一笔现实中必然被拒的 10000 张单（名义 160 万 vs 权益
+//	8.7 万）。同一时刻实盘是 -307.48。
+//
+// 两个数一个天上一个地下，却只有一个带 live_ 前缀。
+// 这条测试钉住「不许再出现无前缀的业务字段」。
+func TestDashboardPnlFieldsAreNamespaced(t *testing.T) {
+	e := newExecAPIEnv(t)
+	w := e.do(e.s.dashboardSummary, "GET", "/api/dashboard/summary", "", nil)
+	if w.Code != 200 {
+		t.Fatalf("status=%d", w.Code)
+	}
+	var raw struct {
+		Pnl map[string]json.RawMessage `json:"pnl"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	// 必须存在的带前缀字段
+	want := []string{
+		"paper_orders", "paper_positions", "paper_realized_pnl",
+		"paper_unrealized_pnl", "paper_priced_positions", "paper_total_positions",
+		"live_fills", "live_realized_pnl", "live_fee_total",
+	}
+	for _, k := range want {
+		if _, ok := raw.Pnl[k]; !ok {
+			t.Errorf("缺少字段 %q", k)
+		}
+	}
+
+	// 业务字段不允许无前缀（note 是说明文字，不属业务指标）
+	allowed := map[string]bool{"note": true}
+	for _, k := range want {
+		allowed[k] = true
+	}
+	for k := range raw.Pnl {
+		if allowed[k] {
+			continue
+		}
+		t.Errorf("字段 %q 没有 paper_/live_ 前缀 —— "+
+			"纸面与实盘的钱不是一回事，光看名字就要能分清", k)
+	}
+
+	// 旧的裸字段名必须消失（否则前端可能悄悄读错那个）
+	for _, gone := range []string{"positions", "realized_pnl", "unrealized_pnl",
+		"priced_positions", "total_positions"} {
+		if _, ok := raw.Pnl[gone]; ok {
+			t.Errorf("旧字段 %q 应已移除（它的口径是纸面，但名字看起来像总账）", gone)
+		}
 	}
 }

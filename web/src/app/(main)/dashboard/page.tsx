@@ -709,7 +709,7 @@ export default function DashboardPage() {
                 // 「无成交」与「¥0.00」是两件事：后者会被读成「有成交但打平」
                 <span className="text-muted-foreground text-base font-normal">无成交</span>
               ) : (
-                <PnlValue value={summary.pnl.unrealized_pnl} />
+                <PnlValue value={summary.pnl.paper_unrealized_pnl} />
               )}
             </div>
           </CardHeader>
@@ -718,13 +718,13 @@ export default function DashboardPage() {
               <>
                 <div className="flex justify-between gap-2">
                   <span className="text-muted-foreground">已实现</span>
-                  <span className={cn("tabular-nums", pnlColor(summary.pnl.realized_pnl))}>
-                    {formatPnl(summary.pnl.realized_pnl)}
+                  <span className={cn("tabular-nums", pnlColor(summary.pnl.paper_realized_pnl))}>
+                    {formatPnl(summary.pnl.paper_realized_pnl)}
                   </span>
                 </div>
                 <div className="flex justify-between gap-2">
                   <span className="text-muted-foreground">持仓</span>
-                  <span className="tabular-nums">{summary.pnl.positions}</span>
+                  <span className="tabular-nums">{summary.pnl.paper_positions}</span>
                 </div>
               </>
             )}
