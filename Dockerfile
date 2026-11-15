@@ -12,23 +12,105 @@
 #   docker build -t artex:local .
 FROM python:3.12-slim-bookworm
 ARG TARGETARCH
-# 常用工具：ripgrep / curl / vim，加一批 recon 常备件（按需增删）。
-# Node 从 NodeSource 装 20.x：bookworm 自带的 apt nodejs 是 18，Playwright 要求 >=20。
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates ripgrep curl wget vim git jq unzip \
-      dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
+
+# ── 国内镜像源（2026-11-15）──────────────────────────────────────────
+#
+# # 为什么整条链都要换源
+#
+# NAS 的 docker build 访问境外源会长时间无响应。表现不是报错，而是**卡住**：
+# `playwright install --with-deps chromium` 要装 40+ 个 lib/fonts 包，
+# apt 没有进度输出，于是构建 34 分钟没动静，看起来像死锁。
+#
+# 这条链上有四个互相独立的外网源，缺一个就卡：
+#
+#   apt        deb.debian.org            → mirrors.aliyun.com
+#   Node       deb.nodesource.com        → npmmirror 的二进制 tarball
+#   npm 包      registry.npmjs.org        → registry.npmmirror.com
+#   chromium   cdn.playwright.dev        → cdn.npmmirror.com
+#
+# Node 顺手改成 tarball 而不是给 NodeSource 换镜像：少一个源，也少一次
+# `curl | bash` —— 那个脚本会把境外地址写死进 sources.list.d，换源时
+# 还要再拦一层，不如直接用官方二进制包。
+#
+# # 换源的边界
+#
+# 镜像源只影响**获取渠道**，不影响内容校验：apt 仍验签名（deb822 的
+# Signed-By 指向镜像自带的 keyring），npm 仍验 integrity，pip 仍验 hash。
+# 所以换源不是「信任降级」。
+#
+# 全部可用 --build-arg 覆盖回官方源，例如：
+#   docker build --build-arg APT_MIRROR=https://deb.debian.org ...
+ARG APT_MIRROR=https://mirrors.aliyun.com
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+ARG NODE_MIRROR=https://cdn.npmmirror.com/binaries/node
+ARG PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
+# bookworm 自带的 apt nodejs 是 18，Playwright 要求 >=20，所以必须自装。
+ARG NODE_VERSION=20.18.1
+
+# 换 apt 源 + 装常用工具。
+#
+# # 为什么要兼容两种源格式
+#
+# bookworm 用 deb822（/etc/apt/sources.list.d/debian.sources），但 slim 镜像
+# 的版本差异会导致某些 tag 还留着传统 sources.list。两个都扫一遍。
+#
+# # sed 规则的顺序有讲究
+#
+# deb822 里 security 那条的 URI 是 deb.debian.org/**debian-security**
+# （不是 security.debian.org）。若先替换短的 debian 前缀，会得到
+# mirrors.aliyun.com/debian-security —— 结果碰巧正确；但若先替换成
+# mirrors.aliyun.com/debian 再拼 -security，就成了
+# mirrors.aliyun.com/debian/debian-security（404）。
+# 显式先长后短，不依赖巧合。
+RUN set -eux; \
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+      [ -f "$f" ] || continue; \
+      sed -i -E \
+        -e "s|https?://deb\.debian\.org/debian-security|${APT_MIRROR}/debian-security|g" \
+        -e "s|https?://security\.debian\.org/debian-security|${APT_MIRROR}/debian-security|g" \
+        -e "s|https?://deb\.debian\.org/debian|${APT_MIRROR}/debian|g" \
+        "$f"; \
+    done; \
+    grep -E '^URIs:' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      ca-certificates ripgrep curl wget vim git jq unzip xz-utils \
+      dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap; \
+    rm -rf /var/lib/apt/lists/*
+
+# Node 20 从二进制 tarball 装。
+#
+# 解到 /usr/local 是官方 node 镜像的做法：与 python 的 /usr/local
+# 不冲突（python 占 bin/python* 和 lib/python3.12，node 占 bin/node*、
+# lib/node_modules、include/node）。
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) node_arch=x64 ;; \
+      arm64) node_arch=arm64 ;; \
+      *) echo "[build] 不支持的架构: $arch（只准备了 amd64/arm64 的 Node 包）" >&2; exit 1 ;; \
+    esac; \
+    url="${NODE_MIRROR}/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz"; \
+    echo "[build] Node 包: $url"; \
+    curl -fsSL --retry 3 "$url" \
+      | tar -xJ -C /usr/local --strip-components=1 --no-same-owner; \
+    node -v; npm -v
+
 # 预装 Playwright MCP 与 CLI（全局），运行时不再 npx 联网下载。
 # @playwright/mcp：browser MCP 直接 `npx @playwright/mcp`（已全局装好，无需 -y/@latest）。
 # @playwright/cli：提供 playwright-cli，装完顺带 --help 验证可执行。
 # 再装 playwright（提供浏览器管理），装完用 --with-deps 预置 chromium 及其系统依赖，
 # 这样容器内 MCP/CLI 首次启动即可用，不再联网下载浏览器。
-RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@latest \
-    && playwright-cli --help \
-    && playwright install --with-deps chromium \
-    && rm -rf /var/lib/apt/lists/*
+#
+# PLAYWRIGHT_DOWNLOAD_HOST 只影响 chromium 的**下载地址**；浏览器二进制
+# 校验仍由 playwright 自身的 sha256 完成。
+# --with-deps 内部会再跑一次 apt-get update/install，用的是上面已换好的源。
+RUN set -eux; \
+    npm config set registry "${NPM_REGISTRY}"; \
+    npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@latest; \
+    playwright-cli --help; \
+    PLAYWRIGHT_DOWNLOAD_HOST="${PLAYWRIGHT_DOWNLOAD_HOST}" playwright install --with-deps chromium; \
+    rm -rf /var/lib/apt/lists/*
 
 
 # 内置 akshare sidecar（与 artex 同一个容器）。
