@@ -82,9 +82,12 @@ func TestFullExpandStillHasAllStages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Expand: %v", err)
 	}
+	// trader 刻意不在期望里（2026-11-20）：它由 planner 按 PM 评级派单，
+	// 不再是阶段图的固定节点。
 	want := map[string]bool{
 		"analyst_market": false, "analyst_fundamental": false, "analyst_news": false,
-		"debate_bull": false, "research_manager": false, "trader": false,
+		"debate_bull": false, "research_manager": false,
+		"risk_conservative": false,
 		"portfolio_manager": false,
 	}
 	for _, n := range g.Nodes {

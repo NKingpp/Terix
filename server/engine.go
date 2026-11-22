@@ -119,7 +119,7 @@ type Engine struct {
 	started sync.Map // taskID -> bool, so Run is idempotent per task
 	// planner waiting：本轮零产出时给任务一个降频冷却（见 planner_waiting.go）。
 	waitMu    sync.Mutex
-	waitUntil map[string]time.Time
+	waitUntil map[string]waitState
 	lastAct   sync.Map // taskID -> int64 unix, last planner/worker activity (heartbeat)
 	llmCalls  sync.Map // taskID -> *int64, actual planner/worker/main-agent LLM calls
 	paused    sync.Map // taskID -> bool, user-paused (planner + workers idle but loops alive)
@@ -830,11 +830,26 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 
 	// runRound 跑一轮规划(含 debounce 合并 + 各 guard)。src 仅用于日志区分触发来源。
 	runRound := func(src string) {
-		// 等待态：吞掉本轮唤醒，不调用 LLM。心跳仍按原间隔复查，
-		// 冷却到期后 inWaiting 会自动清除并恢复规划。
-		if e.inWaiting(t.ID) {
-			t.drainTriggers()
+		// 等待态分两种，穿透规则不同：
+		//
+		//  ① 隐式冷却（本轮零产出后自动降频 10 分钟）
+		//     **任何触发都穿透** —— 尤其是 worker done/finding。零产出的含义是
+		//     「此刻没有新方向」，不是「接下来 10 分钟别理我」。worker 跑完恰恰
+		//     是最该唤醒的时刻：它的产出就是下一轮规划的输入。
+		//
+		//     实测（任务 44，2026-11-20）：crypto 链 2 分析师+2 辩论+2 风控，
+		//     整条流水线 7 分钟跑完，正好落在 10 分钟冷却窗口内 —— 6 个 stage
+		//     意图全部 done 的触发被逐个丢弃，planner 从 08:35 睡到 08:52，
+		//     醒来看到的是「全跑完了」。冷却把「等 worker 回来」变成了「错过 worker」。
+		//
+		//  ② 显式等待（planner 调 wait_for 声明「等 X，已知要等多久」）
+		//     只放外部输入穿透（人改目标/加提示/删意图/验收）。worker done 不穿透 ——
+		//     声明等待时就已经知道有 worker 在跑，等它们结束再看是有意的选择；
+		//     否则「等到明天收盘」会退化成「每个 worker 结束都醒一次」。
+		if proceed, clear := waitGate(e.inWaiting(t.ID), e.isExplicitWait(t.ID), t.drainTriggers()); !proceed {
 			return
+		} else if clear {
+			e.clearWaiting(t.ID)
 		}
 		// debounce: coalesce a burst of changes into one planning round
 		timer := time.NewTimer(e.debounce)
@@ -912,8 +927,12 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// 本轮没有真正产出新意图（重复方向已被抑制）→ 进入等待降频。
 		// 目标已判定达成或 Plan 出错时不进入，避免掩盖终态或故障。
 		if !met && err == nil && beforeIntents >= 0 && intentCount(t.Store) == beforeIntents {
-			e.beginWaiting(t.ID, plannerWaitingCooldown)
-			e.emitWaitingActivity(t)
+			// planner 本轮已显式调 wait_for → 保留它声明的到点时间，
+			// 别用 10 分钟冷却把它覆盖掉（那会让「等到明天收盘」变成 10 分钟一醒）。
+			if !e.isExplicitWait(t.ID) {
+				e.beginWaiting(t.ID, plannerWaitingCooldown)
+				e.emitWaitingActivity(t)
+			}
 		} else {
 			e.clearWaiting(t.ID)
 		}

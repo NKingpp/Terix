@@ -79,6 +79,8 @@ const engine: Record<string, StatusMeta> = {
   exploring: { label: "探索中", tone: "blue" },
   paused: { label: "已暂停", tone: "amber" },
   stalled: { label: "停滞", tone: "red" },
+  // waiting = 引擎主动等待（等到点/等人验收），是**正常**状态，不是故障。
+  waiting: { label: "等待中", tone: "violet" },
   idle: { label: "空闲", tone: "neutral" },
 };
 

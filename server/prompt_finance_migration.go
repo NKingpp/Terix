@@ -104,6 +104,48 @@ func (s *Server) reseedFinanceContextPrompts() {
 	}
 }
 
+// reseedPortfolioManagerPrompt 把组合经理提示词刷成当前代码默认。
+//
+// # 为什么需要单独一次迁移（2026-11-20）
+//
+// 新模板加了「研究裁决」输入（{{.ResearchVerdict}} / {{.ResearchVerdictJSON}}）——
+// 在此之前 PMVars 里根本没有裁决字段，而模板的六值评级映射与 review 门槛
+// 第 2 项全建立在裁决方向上。存量库的 PM 提示词是旧快照（SeedPromptIfEmpty
+// 首插入 only），不刷就永远收不到新字段。
+//
+// 实测任务 44：PM 拿不到裁决 → 诚实报「缺 debate verdict」→ rating=review(0.25)，
+// 尽管裁决 bear_wins(0.62) 就在库里。而 review 会让 planner 按新规则
+// （评级方向明确才派 trader）永不派单，整条链断在这里。
+//
+// 与 reseedFinanceContextPrompts 分开的原因：那个函数只覆盖 5 个通用角色
+// （mainagent/planner/worker/goals/auto），金融角色不在其列 —— 硬塞进去会让
+// 「金融语境迁移」这个 flag 的语义变模糊，且可能重刷掉用户自定义过的金融角色提示词。
+func (s *Server) reseedPortfolioManagerPrompt() {
+	const flag = "pm_prompt_research_verdict_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }()
+
+	tmpl := agent.BuiltinPromptSeeds()[agent.RolePortfolioManager]
+	if tmpl == "" {
+		log.Printf("[prompts] portfolio_manager 无代码默认，跳过迁移")
+		return
+	}
+	a, err := s.m.pg.GetAgentByKey(agent.RolePortfolioManager)
+	if err != nil || a == nil {
+		return // 全新库尚未建该 agent 行 —— seedPrompts 会用最新默认，无需迁移
+	}
+	if cur, err := s.m.pg.CurrentPrompt(a.ID); err == nil && cur == tmpl {
+		return // 已是默认，不产生重复版本
+	}
+	if _, err := s.m.pg.ResetPromptToDefault(a.ID, tmpl); err != nil {
+		log.Printf("[prompts] portfolio_manager 重刷失败: %v", err)
+		return
+	}
+	log.Printf("[prompts] portfolio_manager 提示词已加入「研究裁决」输入（旧版本保留在历史）")
+}
+
 // financeContextToolKeys 是需要刷新描述的工具。
 //
 // # 为什么工具描述也属于「提示词」

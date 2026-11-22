@@ -271,8 +271,22 @@ type RiskVars struct {
 
 // PMVars 是组合经理的变量。
 type PMVars struct {
-	// PM 有 3 个大数据输入，各自双层。渲染时三个全量节分开小标题
+	// PM 有 4 个大数据输入，各自双层。渲染时全量节分开小标题
 	// （见 prompt 的「附：完整数据」），避免混成一坨。
+	//
+	// # 为什么必须有 ResearchVerdict（2026-11-20 修）
+	//
+	// PM 提示词的「review 门槛检查」第 2 项直接判「研究裁决的 conclusion 不等于
+	// inconclusive」，六值评级映射也全建立在裁决方向上（buy = bull_wins + long、
+	// sell = bear_wins + short）。而 PMVars 原本**没有这个字段** ——
+	// research_manager 产出的 thesis 从来没传给 PM。
+	//
+	// 后果（实测任务 44）：PM 提示词要求它核对裁决，但输入里没有 → 它诚实
+	// 地报了「缺 debate verdict」→ rating=review（conf 0.25），尽管裁决
+	// bear_wins(0.62) 就在库里。而 review 会让 planner 按新规则永不派 trader，
+	// 整条链断在这里。
+	ResearchVerdict       string
+	ResearchVerdictJSON   string
 	TraderProposal        string
 	TraderProposalJSON    string
 	RiskDebateSummary     string

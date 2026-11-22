@@ -583,6 +583,9 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	pl.SetKillWork(s.engine.KillWork)
 	pl.SetSteerWork(s.engine.SteerWork)
+	// wait_for：planner 显式声明「等客观阻塞解除」→ 引擎停掉常规唤醒，
+	// 只在到点或外部输入变更时恢复。见 server/planner_waiting.go 顶部注释。
+	pl.SetWaitFor(s.beginPlannerWait(t))
 	// materialize_downstream：screener 失败后下游节点从未建出时，planner 能自己补。
 	// 不装配的话工具存在但报「当前不可用」—— 比没有还容易误导。
 	pl.SetMaterializeDownstream(func() (int, error) { return s.materializeTaskDownstream(t.ID) })

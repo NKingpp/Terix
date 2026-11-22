@@ -24,12 +24,14 @@ func TestExpandStockNodeCount(t *testing.T) {
 		t.Fatalf("Expand(stock): %v", err)
 	}
 	// 2026-10-30：分析师的 fundamental + news 数据源落地，从 1 个恢复到 3 个
-	// （见 analystsFor 的注释）。节点数 3+1+4+1+1+3+1+1 = 15。
-	if len(g.Nodes) != 15 {
-		t.Errorf("stock 节点数 = %d, want 15（3分析师+1join+4辩论+1研究+1交易+3风控+1join+1组合）", len(g.Nodes))
+	// （见 analystsFor 的注释）。
+	// 2026-11-20：trader 移出串行链（改由 planner 按 PM 评级派单），
+	// 节点数 3+1+4+1+3+1+1 = 14，边数 15。
+	if len(g.Nodes) != 14 {
+		t.Errorf("stock 节点数 = %d, want 14（3分析师+1join+4辩论+1研究+3风控+1join+1组合，trader 已移出）", len(g.Nodes))
 	}
-	if len(g.Edges) != 16 {
-		t.Errorf("stock 边数 = %d, want 16", len(g.Edges))
+	if len(g.Edges) != 15 {
+		t.Errorf("stock 边数 = %d, want 15", len(g.Edges))
 	}
 	// stock 现在有 1 条 skipped：analyst_sentiment（股票情绪源未接入）。
 	// 「缺失要可见」—— 不写会让人误以为情绪维度已覆盖。
@@ -78,11 +80,12 @@ func TestExpandCryptoNodeCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Expand(crypto): %v", err)
 	}
-	if len(g.Nodes) != 11 {
-		t.Errorf("crypto 节点数 = %d, want 11（2分析师+1join+2辩论+1研究+1交易+2风控+1join+1组合）", len(g.Nodes))
+	// 2026-11-20：trader 移出串行链 → 2+1+2+1+2+1+1 = 10
+	if len(g.Nodes) != 10 {
+		t.Errorf("crypto 节点数 = %d, want 10（2分析师+1join+2辩论+1研究+2风控+1join+1组合，trader 已移出）", len(g.Nodes))
 	}
-	if len(g.Edges) != 11 {
-		t.Errorf("crypto 边数 = %d, want 11", len(g.Edges))
+	if len(g.Edges) != 10 {
+		t.Errorf("crypto 边数 = %d, want 10", len(g.Edges))
 	}
 
 	// skipped 必须 3 条（fundamental / news / risk_aggressive），且 Reason 非空可读中文
@@ -207,8 +210,8 @@ func TestExpandCustomRounds(t *testing.T) {
 			t.Fatal(err)
 		}
 		// 3+1+2+1+1+3+1+1 = 13（2026-10-30 恢复 fundamental + news，分析师 1→3）
-		if len(g.Nodes) != 13 {
-			t.Errorf("节点数 = %d, want 13（3分析师+1join+2辩论+1研究+1交易+3风控+1join+1组合）", len(g.Nodes))
+		if len(g.Nodes) != 12 {
+			t.Errorf("节点数 = %d, want 12（3分析师+1join+2辩论+1研究+3风控+1join+1组合，trader 已移出）", len(g.Nodes))
 		}
 	})
 
@@ -218,8 +221,8 @@ func TestExpandCustomRounds(t *testing.T) {
 			t.Fatal(err)
 		}
 		// 3+1+6+1+1+3+1+1 = 17（分析师 3 个 + 辩论 6 个）
-		if len(g.Nodes) != 17 {
-			t.Errorf("节点数 = %d, want 17（3分析师+1join+6辩论+1研究+1交易+3风控+1join+1组合）", len(g.Nodes))
+		if len(g.Nodes) != 16 {
+			t.Errorf("节点数 = %d, want 16（3分析师+1join+6辩论+1研究+3风控+1join+1组合，trader 已移出）", len(g.Nodes))
 		}
 		var debate int
 		for _, n := range g.Nodes {
@@ -262,9 +265,9 @@ func TestExpandCustomRounds(t *testing.T) {
 		if risk != 4 {
 			t.Errorf("crypto 风控节点 = %d, want 4（2 × 2 轮）", risk)
 		}
-		// 2+1+2+1+1+4+1+1 = 13（v1.7 分析师收缩到 2）
-		if len(g.Nodes) != 13 {
-			t.Errorf("节点数 = %d, want 13", len(g.Nodes))
+		// 2+1+2+1+4+1+1 = 12（v1.7 分析师收缩到 2；2026-11-20 trader 移出）
+		if len(g.Nodes) != 12 {
+			t.Errorf("节点数 = %d, want 12", len(g.Nodes))
 		}
 	})
 
@@ -273,9 +276,9 @@ func TestExpandCustomRounds(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// 2+1+6+1+1+4+1+1 = 17（v1.7 分析师收缩到 2）
-		if len(g.Nodes) != 17 {
-			t.Errorf("节点数 = %d, want 17", len(g.Nodes))
+		// 2+1+6+1+4+1+1 = 16（v1.7 分析师收缩到 2；2026-11-20 trader 移出）
+		if len(g.Nodes) != 16 {
+			t.Errorf("节点数 = %d, want 16", len(g.Nodes))
 		}
 	})
 }
@@ -600,6 +603,53 @@ func TestExpandCryptoSkippedOrderIsStable(t *testing.T) {
 			}
 			if g.SkippedAnalysts[j].Reason == "" {
 				t.Errorf("skipped[%d].Reason 不能为空（必须是可读中文）", j)
+			}
+		}
+	}
+}
+
+// TestTraderNotInSerialChain 锁住 2026-11-20 的设计变更：trader 不在阶段图里。
+//
+// # 为什么必须锁
+//
+// 旧设计把 trader 串在 research_manager 与风控之间，于是**先成交、后审批**：
+// 实测任务 42 中 trader 07:29:23 下单成交，portfolio_manager 07:31:31 才跑完，
+// 风控与终审拿到的都是一个既成仓位，没有任何回写路径能约束它。
+//
+// 现在串行链只到 PM；下单由 planner 看完全部分析后显式派 role=trader 的意图。
+// 这条断言防的是「有人觉得 trader 该回到链上」—— 那会把审批环又倒回来。
+func TestTraderNotInSerialChain(t *testing.T) {
+	for _, ac := range []string{AssetClassStock, AssetClassCrypto} {
+		g, err := Expand(ac, fixedOpts())
+		if err != nil {
+			t.Fatalf("Expand(%q): %v", ac, err)
+		}
+		var trader *StageNode
+		var pm *StageNode
+		for i := range g.Nodes {
+			switch g.Nodes[i].Role {
+			case RoleTrader:
+				trader = &g.Nodes[i]
+			case RolePortfolioManager:
+				pm = &g.Nodes[i]
+			}
+		}
+		if trader != nil {
+			t.Errorf("%q: 阶段图不该含 trader 节点（应由 planner 派单）", ac)
+		}
+		if pm == nil {
+			t.Fatalf("%q: 阶段图必须含 portfolio_manager（串行链终点）", ac)
+		}
+		// 期望角色清单同样不含 trader —— 否则 graph_overview 会每轮误报缺失。
+		for _, r := range ExpectedStageRoles(ac) {
+			if r == RoleTrader {
+				t.Errorf("%q: ExpectedStageRoles 不该含 trader", ac)
+			}
+		}
+		// 无任何 gates 边指向 trader（它不在图里，自然也没有）
+		for _, e := range g.Edges {
+			if e.To == "trader" || e.From == "trader" {
+				t.Errorf("%q: 不该有 trader 相关的 gates 边: %q→%q", ac, e.From, e.To)
 			}
 		}
 	}

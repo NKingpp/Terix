@@ -54,7 +54,7 @@ func verifyGoalAcceptance(ctx context.Context, t *Task, goal *db.Node, acc db.Go
 	}
 	observed["mode"] = mode
 
-	summary, err := db.TaskTradeSummaryFor(ctx, conn.DB, taskIDInt(t.ID), acc.InstrumentID)
+	summary, err := db.TaskTradeSummaryFor(ctx, conn, taskIDInt(t.ID), acc.InstrumentID)
 	if err != nil {
 		return false, observed, "无法汇总本任务成交：" + err.Error()
 	}

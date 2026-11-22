@@ -36,6 +36,14 @@ type tradeRecordResp struct {
 	Note    string           `json:"note,omitempty"`
 }
 
+// tradeBucket 的数组字段必须永远序列化成 []，不能是 null。
+//
+// Go 的 nil slice → JSON `null`，而前端写的是 `live.fills.length` /
+// `.map(...)` —— `null.length` 直接抛 TypeError，整页变
+// "This page couldn't load"（实测任务 44：从未成交）。
+//
+// 修复方式：handler 构造响应时就把两个数组初始化成空切片（见 taskTrades 开头）。
+// 那里是唯一的构造点 —— 谁要新增分支，也只会从同一个零值出发。
 type tradeBucket struct {
 	Fills  []db.TradeFill `json:"fills"`
 	PnL    []exec.PnL     `json:"pnl"`
@@ -43,7 +51,6 @@ type tradeBucket struct {
 	// Synced 为 false 表示「还没拉到任何成交」（≠ 有单但没成交）。
 	Synced bool `json:"synced"`
 }
-
 
 type paperTradeRow struct {
 	ID     int64  `json:"id"`
@@ -72,7 +79,13 @@ func (s *Server) taskTrades(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	numID, _ := strconv.ParseInt(id, 10, 64)
-	resp := tradeRecordResp{TaskID: id}
+	// 数组字段从这里起就不是 nil（见 tradeBucket 的注释）：本任务没成交时
+	// 前端拿到的是 []，不是 null。
+	resp := tradeRecordResp{
+		TaskID:  id,
+		Live:    tradeBucket{Fills: []db.TradeFill{}, PnL: []exec.PnL{}},
+		Actions: []db.TradeRecord{},
+	}
 
 	// ---- 实盘 ----
 	fills, err := pg.ListFills(db.FillsFilter{TaskID: numID, Limit: 1000})
@@ -80,14 +93,14 @@ func (s *Server) taskTrades(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	resp.Live.Fills = fills
-	resp.Live.PnL = exec.ComputePnLByInst(fills)
+	resp.Live.Fills = append(resp.Live.Fills, fills...)
+	resp.Live.PnL = append(resp.Live.PnL, exec.ComputePnLByInst(fills)...)
 	resp.Live.Totals = sumPnL(resp.Live.PnL)
 	resp.Live.Synced = len(fills) > 0
 
 	// ---- 工具台账 ----
 	if recs, rErr := pg.ListTradeRecords(db.TradeRecordFilter{TaskID: numID, Limit: 300}); rErr == nil {
-		resp.Actions = recs
+		resp.Actions = append(resp.Actions, recs...)
 	}
 
 	if !resp.Live.Synced {
@@ -95,8 +108,6 @@ func (s *Server) taskTrades(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, resp)
 }
-
-
 
 // sumPnL 合计各标的的盈亏（精确十进制，不用 float）。
 func sumPnL(pnl []exec.PnL) tradeTotals {

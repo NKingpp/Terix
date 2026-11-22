@@ -48,7 +48,7 @@ func TestTaskTradeSummaryForIsolatesByTask(t *testing.T) {
 	mkRec(9002, "c9002a", "buy", "5")
 	mkFill("c9002a", "buy", "5", "100", "2026-11-13T12:00:00Z")
 
-	sum, err := TaskTradeSummaryFor(ctx, d.DB, 9001, instID)
+	sum, err := TaskTradeSummaryFor(ctx, d, 9001, instID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,14 +58,14 @@ func TestTaskTradeSummaryForIsolatesByTask(t *testing.T) {
 	if sum.RealizedTotal != "10" {
 		t.Fatalf("已实现盈亏应为 10，得到 %s", sum.RealizedTotal)
 	}
-	other, err := TaskTradeSummaryFor(ctx, d.DB, 9002, instID)
+	other, err := TaskTradeSummaryFor(ctx, d, 9002, instID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if other.OpenPositions != 1 {
 		t.Fatalf("别的任务仍有 1 个未平仓标的，得到 %+v", other)
 	}
-	empty, err := TaskTradeSummaryFor(ctx, d.DB, 9003, instID)
+	empty, err := TaskTradeSummaryFor(ctx, d, 9003, instID)
 	if err != nil || empty.Fills != 0 {
 		t.Fatalf("无成交任务应返回空汇总: %+v err=%v", empty, err)
 	}

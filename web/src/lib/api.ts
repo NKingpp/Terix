@@ -834,7 +834,15 @@ export const api = {
   notifyRetryDelivery: (id: number) => post<{ ok: boolean }>(`/notify/deliveries/${id}/retry`),
   // 任务级交易记录：成交明细 + 按标的汇总的已实现盈亏。
   // 盈亏由后端用 big.Rat 逐笔算（均价×总量算不出手续费），前端只负责展示。
-  taskTrades: (taskId: string) => get<TaskTrades>(`/tasks/${taskId}/trades`),
+  // 数组字段全部归一化：后端对「没有数据」可能发 null（Go nil slice），
+  // 而消费点写的是 .length / .map。后端已改成发 []（server/trades_api.go），
+  // 这里再兜一层 —— 一处归一，所有调用点都不用各自判空。
+  taskTrades: (taskId: string) =>
+    get<TaskTrades>(`/tasks/${taskId}/trades`).then((r) => ({
+      ...r,
+      live: { ...r.live, fills: arr(r.live?.fills), pnl: arr(r.live?.pnl) },
+      actions: arr(r.actions),
+    })),
   taskTradesSync: (taskId: string) =>
     post<{ inserted: number; accounts: number; warning?: string }>(`/tasks/${taskId}/trades/sync`, {}),
 

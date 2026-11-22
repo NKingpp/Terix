@@ -33,32 +33,35 @@ type TaskTradeSummary struct {
 // TaskTradeSummaryFor 汇总某任务的实盘成交。
 //
 // instrumentID > 0 时只统计该标的（目标可以只针对一个标的验收）。
-func TaskTradeSummaryFor(ctx context.Context, conn *sql.DB, taskID int64, instrumentID int64) (TaskTradeSummary, error) {
+func TaskTradeSummaryFor(ctx context.Context, conn *DB, taskID int64, instrumentID int64) (TaskTradeSummary, error) {
 	out := TaskTradeSummary{RealizedTotal: "0", NetQty: map[int64]string{}}
 	if conn == nil || taskID <= 0 {
 		return out, nil
 	}
 
-	// 用 client_order_id 把成交连回任务：trade_records 存了 task_id，
-	// 而 fills 存 cl_ord_id —— 这是两边唯一的连接键。
-	// instrument_id 取自 trade_records（trade_fills 只有 inst_id 字符串）。
-	q := `
-SELECT tr.instrument_id, tf.side, tf.fill_sz, tf.fill_px
-FROM trade_fills tf
-JOIN trade_records tr ON tr.client_order_id = tf.cl_ord_id
-WHERE tr.task_id = $1 AND tr.instrument_id IS NOT NULL`
-	args := []any{taskID}
-	if instrumentID > 0 {
-		q += ` AND tr.instrument_id = $2`
-		args = append(args, instrumentID)
-	}
-	q += ` ORDER BY tr.instrument_id, tf.filled_at, tf.id`
-
-	rows, err := conn.QueryContext(ctx, q, args...)
+	// 成交按「持仓回合」归属本任务（db/fill_attribution.go）。
+	//
+	// 早先这里是 `trade_fills JOIN trade_records ON client_order_id = cl_ord_id`：
+	// 交易所 OCO/TP/SL 触发的平仓腿 clOrdId 是 `O` 前缀、平台从不写台账行，
+	// 于是整腿被丢弃 —— 实测任务 39 漏 26 笔 / 53 张，算出的净持仓 -53 与
+	// 母账 pos=0 相反，人工验收因此永远 409。
+	fills, err := conn.TaskFills(ctx, taskID, 0, "")
 	if err != nil {
 		return out, err
 	}
-	defer rows.Close()
+	// instrument_id 只能从台账取（trade_fills 只有 inst_id 字符串）。
+	instOf := map[string]int64{}
+	if rows, iErr := conn.QueryContext(ctx, `SELECT DISTINCT inst_id, COALESCE(instrument_id,0)
+FROM trade_records WHERE task_id = $1 AND instrument_id IS NOT NULL`, taskID); iErr == nil {
+		for rows.Next() {
+			var sym string
+			var id int64
+			if rows.Scan(&sym, &id) == nil && id > 0 {
+				instOf[sym] = id
+			}
+		}
+		rows.Close()
+	}
 
 	type led struct {
 		net  *big.Rat
@@ -67,21 +70,22 @@ WHERE tr.task_id = $1 AND tr.instrument_id IS NOT NULL`
 	leds := map[int64]*led{}
 	realized := new(big.Rat)
 
-	for rows.Next() {
-		var (
-			instID int64
-			side   string
-			qtyS   string
-			pxS    string
-		)
-		if err := rows.Scan(&instID, &side, &qtyS, &pxS); err != nil {
-			return out, err
+	for _, f := range fills {
+		instID := instOf[f.InstID]
+		if instID == 0 {
+			// 归属不到 instrument 的成交（该标的没有任何台账行）不计入 ——
+			// 计进去会让 instrumentID 过滤失准。
+			continue
 		}
-		qty, okQ := new(big.Rat).SetString(strings.TrimSpace(qtyS))
-		px, okP := new(big.Rat).SetString(strings.TrimSpace(pxS))
+		if instrumentID > 0 && instID != instrumentID {
+			continue
+		}
+		qty, okQ := new(big.Rat).SetString(strings.TrimSpace(f.FillSz))
+		px, okP := new(big.Rat).SetString(strings.TrimSpace(f.FillPx))
 		if !okQ || !okP || qty.Sign() <= 0 {
 			continue
 		}
+		side := f.Side
 		l, exists := leds[instID]
 		if !exists {
 			l = &led{net: new(big.Rat), cost: new(big.Rat)}
@@ -123,9 +127,6 @@ WHERE tr.task_id = $1 AND tr.instrument_id IS NOT NULL`
 			l.cost.Mul(new(big.Rat).Abs(l.net), avg)
 		}
 		out.Fills++
-	}
-	if err := rows.Err(); err != nil {
-		return out, err
 	}
 
 	for instID, l := range leds {

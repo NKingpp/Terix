@@ -122,11 +122,18 @@ func TestExpectedStageRolesDedupes(t *testing.T) {
 		}
 		seen[r] = true
 	}
-	// 关键角色必须在（这几个是阶段主轴）
-	for _, want := range []string{RoleAnalystMarket, RoleTrader, RolePortfolioManager} {
+	// 关键角色必须在（这几个是阶段主轴）。
+	// trader 不在其中：2026-11-20 起它由 planner 按 PM 评级显式派单，
+	// 不属于「本该自动存在」的阶段节点 —— 列在这里会让 graph_overview
+	// 每轮误报「缺 trader」。
+	for _, want := range []string{RoleAnalystMarket, RolePortfolioManager} {
 		if !seen[want] {
 			t.Errorf("stock 阶段图应含 %q，实际: %v", want, roles)
 		}
+	}
+	// trader 必须不在：它是 planner 的派单产物，不是阶段图节点
+	if seen[RoleTrader] {
+		t.Error("ExpectedStageRoles 不该含 trader（它由 planner 派单，不在串行链里）")
 	}
 	// 不含 screener：那由「任务是否绑标的」判断，不靠这张表
 	if seen[RoleScreener] {

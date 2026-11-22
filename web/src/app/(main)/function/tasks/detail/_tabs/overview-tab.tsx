@@ -466,6 +466,8 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                 goals_total: activeTask.goals_total,
                 goals_met: activeTask.goals_met,
                 engine_mode: statsResp.engine_mode ?? activeTask.engine_mode,
+                wait_reason: (activeTask as { wait_reason?: string }).wait_reason ?? taskResp.wait_reason,
+                wait_until: (activeTask as { wait_until?: number }).wait_until ?? taskResp.wait_until,
                 paused: activeTask.paused,
               }
             : taskResp,
@@ -1125,6 +1127,17 @@ export function OverviewTab({ taskId }: { taskId: string }) {
               dot
               className="mt-1"
             />
+            {task?.wait_until ? (
+              <div className="mt-1 text-[10px] leading-snug text-muted-foreground">
+                {task.wait_reason || "等待中"} · 至{" "}
+                {new Date(task.wait_until * 1000).toLocaleString("zh-CN", {
+                  month: "2-digit",
+                  day: "2-digit",
+                  hour: "2-digit",
+                  minute: "2-digit",
+                })}
+              </div>
+            ) : null}
           </div>
           <div>
             <div className="text-xs text-muted-foreground">运行中 Worker</div>

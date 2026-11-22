@@ -97,6 +97,19 @@ type ToolSet struct {
 	// intent id (engine callback, wired by the planner): the worker injects it before
 	// its next tool call and re-plans, without being killed. nil = tool unavailable.
 	steerWork func(intentID int64, msg string) error
+	// waitFor, if set, puts the task's planner into an explicit wait until
+	// now+minutes (engine callback, wired by the planner). Returns the wake time.
+	//
+	// # 为什么 planner 需要一个「等待」工具（2026-11-20，任务 39）
+	//
+	// 客观阻塞（等人工验收、等下个交易日收盘、等下一条外部数据）在当前设计里
+	// 只能靠「本轮产出 0 意图」隐式表达 —— 引擎按 10 分钟冷却复查。而等待的真正
+	// 长度可能是几小时，于是它每 10 分钟醒一次、每轮都输出「还在等」：
+	// 实测 89 轮规划、8000 万 token，任务永远 running。
+	//
+	// 有了这个工具，等待是声明式的：一轮说清「等谁、等到何时」，引擎据此
+	// 停掉常规唤醒，只在到点或外部输入变更时恢复。nil = 工具报不可用。
+	waitFor func(reason string, minutes int) (string, error)
 	// materializeDownstream, if set, 补建本任务的阶段图（engine/server 回调）。
 	//
 	// # 为什么需要它（2026-11-11 task 11）
@@ -2051,6 +2064,63 @@ func (t *ToolSet) addHint() actool.CoreTool {
 		})
 }
 
+// waitForTool 让 planner 显式声明「本轮到此为止，等到什么时候」。
+//
+// # 与「本轮产出 0 意图」的区别（2026-11-20）
+//
+// 产出 0 意图只是「这轮没想出新方向」，引擎按 10 分钟冷却复查 —— 适合
+// 「下一步依赖在跑 work」，不适合客观阻塞。任务 39 等人工验收时正是这种
+// 情况：planner 每 10 分钟醒一次、每轮都说「仍在等待」，89 轮 / 8000 万 token。
+//
+// 调本工具 = 我明确知道在等什么、等到何时。引擎据此不再唤醒，只在：
+// 到点 / 人改目标 / 人加提示 / 人删意图 / 任务控制时恢复。
+//
+// # 为什么参数是「分钟」而不是时间戳
+//
+// 模型对「现在几点 + 目标时刻」做减法很容易错一小时（时区、UTC 本地混用）。
+// 给「还要等多久」它只需要懂相对时长。
+func (t *ToolSet) waitForTool() actool.CoreTool {
+	return t.writeExpTool("wait_for",
+		"声明本轮进入等待：等你已知的**客观阻塞条件**解除（人工验收、下个交易日开盘/收盘、某条外部数据到点、在跑 work 的产出）。\n\n"+
+			"调用后引擎将**停止常规唤醒**（不再按心跳每 10 分钟烧一轮 LLM），只在【到点】或【人改目标/加提示/删意图/恢复任务】时重新规划。\n\n"+
+			"什么时候该用：你已经查清当前所有可查的数据、结论是「条件尚未满足」，且下一步依赖的不是你自己能做的事。典型：金融任务目标只能人工验收（prove_goal 被拦），此时用 wait_for 等操作员点验收，而不是每轮都重试。\n\n"+
+			"什么时候不该用：还有未覆盖的分析方向（那该派意图）；还有 open/running 意图在跑（等它们完成即可，本轮直接结束）；等你自己的下一步动作（那不是等待）。\n\n"+
+			"一次等待最长 24 小时，会被截断。到点前若有新方向，人改目标会自动唤醒你。",
+		obj(map[string]any{
+			"reason":  str("在等什么、等它做什么（一句话，会显示在任务状态与轨迹里）"),
+			"minutes": intp("还要等多少分钟（1..1440，超上限按 1440 截断）"),
+		}, "reason", "minutes"),
+		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+			if t.waitFor == nil {
+				return actool.Errorf("wait_for 当前不可用（未装配引擎等待回调）"), nil
+			}
+			var a struct {
+				Reason  string          `json:"reason"`
+				Minutes json.RawMessage `json:"minutes"`
+			}
+			_ = json.Unmarshal(in, &a)
+			reason := strings.TrimSpace(a.Reason)
+			if reason == "" {
+				return actool.Errorf("reason 必填 —— 等待必须有可审计的原因"), nil
+			}
+			minutes := 0
+			if len(a.Minutes) > 0 {
+				var n int
+				if err := json.Unmarshal(a.Minutes, &n); err == nil {
+					minutes = n
+				}
+			}
+			if minutes <= 0 {
+				return actool.Errorf("minutes 必填，且必须 > 0（这是「还要等多久」，不是绝对时间）"), nil
+			}
+			until, err := t.waitFor(reason, minutes)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			return actool.Text(fmt.Sprintf("已进入等待：%s（至 %s 自动复查；人改目标/加提示会提前唤醒）", reason, until)), nil
+		})
+}
+
 // killWorkTool lets the planner terminate a single running work (by intent id).
 func (t *ToolSet) killWorkTool() actool.CoreTool {
 	return t.writeExpTool("kill_work", "终止一条正在运行的意图(work)。用于叫停跑偏/无意义的探索；被终止的意图标记为 stopped，不再自动重领。先用 get_worker_output 看看它在干嘛再决定。",
@@ -2457,7 +2527,7 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		// cold-digest §6.1: restore folded cold nodes (digest body → members → detail).
 		t.expandDigest(),
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.addIntent(), t.proveGoal(), t.goalMet(),
-		t.killWorkTool(), t.steerWorkTool(), t.MaterializeDownstreamTool(),
+		t.killWorkTool(), t.steerWorkTool(), t.waitForTool(), t.MaterializeDownstreamTool(),
 		// report_finding：规划态势研判时若自身已确证漏洞，可直接登记（与 worker 同工具）。
 		t.addFinding(),
 		// list_companies：查看企业列表 + scope + 资产数（拿 company_id / 理解归属范围）。

@@ -301,8 +301,10 @@ func TestBuildTraderVarsRealMarketHours(t *testing.T) {
 	}
 }
 
-// TestBuildPMVarsThreeDualLayers PM 三个输入各自双层，互不串。
-func TestBuildPMVarsThreeDualLayers(t *testing.T) {
+// TestBuildPMVarsFourDualLayers PM 四个输入（裁决/提案/风控/事实）各自双层，互不串。
+//
+// 裁决是 2026-11-20 补的第 4 个 —— 缺它 PM 只能给 review。
+func TestBuildPMVarsFourDualLayers(t *testing.T) {
 	d := testDB(t)
 	t.Cleanup(func() { d.Close() })
 	expID := mustExploration(t, d)
@@ -310,6 +312,7 @@ func TestBuildPMVarsThreeDualLayers(t *testing.T) {
 	ctx := withStore(es)
 
 	mkNode(t, es, db.KindFact, RoleAnalystMarket, "confirmed", map[string]any{"claim": "MARKER_FACT"})
+	mkNode(t, es, db.KindThesis, RoleResearchManager, "standing", map[string]any{"conclusion": "MARKER_VERDICT"})
 	mkNode(t, es, db.KindSignal, RoleTrader, "open", map[string]any{"rationale": "MARKER_SIGNAL"})
 	mkNode(t, es, db.KindThesis, RoleRiskAggressive, "standing", map[string]any{"thesis": "MARKER_RISK_A"})
 	mkNode(t, es, db.KindThesis, RoleRiskConservative, "standing", map[string]any{"thesis": "MARKER_RISK_C"})
@@ -339,6 +342,43 @@ func TestBuildPMVarsThreeDualLayers(t *testing.T) {
 	}
 	if !strings.Contains(vars.RiskDebateSummary, "份风控意见") {
 		t.Errorf("RiskDebateSummary 摘要格式不对: %q", vars.RiskDebateSummary)
+	}
+	// 研究裁决必须传给 PM —— 六值评级映射与 review 门槛第 2 项全建立在它上面。
+	// 回归：任务 44 里 PM 拿不到裁决 → 判 review → planner 按新规则永不派 trader。
+	if !strings.Contains(vars.ResearchVerdictJSON, "MARKER_VERDICT") {
+		t.Error("ResearchVerdictJSON 必须含研究裁决（缺它 PM 只能给 review）")
+	}
+	if strings.Contains(vars.ResearchVerdictJSON, "MARKER_SIGNAL") {
+		t.Error("ResearchVerdictJSON 不该含信号 —— 串了")
+	}
+	if !strings.Contains(vars.ResearchVerdict, "已就绪") {
+		t.Errorf("ResearchVerdict 摘要格式不对: %q", vars.ResearchVerdict)
+	}
+}
+
+// 没有裁决时 PM 必须看到「这是缺失」的明确说明，而不是空白 JSON 区块
+// （空白区块会被读成「数据故障」→ 去调不可用的工具 → 白跑一轮，见 2026-11-06 事故）。
+func TestBuildPMVarsMissingVerdictIsExplicit(t *testing.T) {
+	d := testDB(t)
+	t.Cleanup(func() { d.Close() })
+	expID := mustExploration(t, d)
+	es := d.Exploration(expID)
+	ctx := withStore(es)
+
+	intent := &db.Node{ID: 1, Kind: db.KindIntent,
+		Payload: []byte(`{"role":"portfolio_manager","asset_class":"stock"}`)}
+	vars := buildPMVars(ctx, intent)
+
+	if strings.TrimSpace(vars.ResearchVerdictJSON) == "" {
+		t.Fatal("裁决缺失时 JSON 字段不能留空 —— 空 JSON 区块会被读成数据故障")
+	}
+	if !strings.Contains(vars.ResearchVerdictJSON, "尚未产出") {
+		t.Errorf("应明确说明「上游尚未产出」: %q", vars.ResearchVerdictJSON)
+	}
+	// 新流程下 PM 阶段没有 trader 提案是正常的，说明文案必须点出这一点，
+	// 否则模型会把它当 review 理由。
+	if !strings.Contains(vars.TraderProposalJSON, "正常") {
+		t.Errorf("无提案时的说明应点明「这是正常流程」: %q", vars.TraderProposalJSON)
 	}
 }
 

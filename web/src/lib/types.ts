@@ -2,7 +2,7 @@
 // Derived from the functional spec (section 7: 关键数据形状).
 
 export type TaskStatus = "created" | "queued" | "running" | "paused" | "done" | "failed" | "timeout";
-export type EngineMode = "exploring" | "paused" | "stalled" | "idle";
+export type EngineMode = "exploring" | "paused" | "stalled" | "waiting" | "idle";
 
 export interface Task {
   id: string;
@@ -29,6 +29,9 @@ export interface Task {
   goals_total?: number;
   goals_met?: number;
   engine_mode?: EngineMode;
+  // 等待态：planner 显式调 wait_for（或零产出冷却）时会填，其余为空。
+  wait_reason?: string;
+  wait_until?: number; // unix 秒
   tokens?: TokenTotal; // whole-task token consumption
   llm_profile_id?: number; // LLM profile used; absent = default profile
   llm_profile_ids?: number[]; // ordered task-level failover chain

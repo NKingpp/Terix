@@ -505,6 +505,9 @@ func (s *Server) seedOrchestrationTools() {
 	// 内容修订型迁移，理由见 prompt_finance_migration.go 顶部。
 	s.reseedFinanceContextPrompts()
 	s.reseedFinanceContextToolDescriptions()
+	// PM 提示词补「研究裁决」输入（2026-11-20）：缺它 PM 只能给 review，
+	// 而 review 会让 planner 永不派 trader。见函数注释。
+	s.reseedPortfolioManagerPrompt()
 	// screener 提示词补上任务目标（2026-11-11）：原版让模型「看 user 消息第一段」，
 	// 而那段不存在 → 选品员看不到策略与目标 → 任务写明 BTC-USDT 却选了 NVDA。
 	s.reseedScreenerPrompt()
@@ -647,12 +650,23 @@ func (s *Server) reseedMainAgentPrompt() {
 // 找回。settings flag 守卫 → 只做一次。全新库无需处理(SeedPromptIfEmpty 已 seed 最新默认)。与
 // reseedGoalsPrompt 完全同构。
 func (s *Server) reseedPlannerPrompt() {
+	// v6（2026-11-20）：trader 移出阶段图 —— 下单改由 planner 按 PM 评级显式派单。
+	// 旧流水线里 trader 在风控与 PM 上游，**先成交后审批**（实测任务 42：
+	// trader 07:29:23 成交，PM 07:31:31 才跑完，终审拿到的是既成仓位）。
+	// 提示词新增「交易派单」段：派单前提（裁决+风控+评级齐）、判据（评级方向明确才派）、
+	// 写法（parent_ids 带裁决与评级节点）。
+	//
+	// v5（2026-11-20）：把「等待外部条件」从「结束本轮」改为**必须调 wait_for**。
+	// 任务 39 的教训：目标只能人工验收时，planner 每 10 分钟被唤醒、每轮重判
+	// 一遍「还在等」，89 轮 / 8000 万 token 全烧在同一个结论上。wait_for 让等待
+	// 变成声明式（引擎停掉常规唤醒，只在到点或人改目标/验收时回来）。
+	//
 	// v4（2026-11-11）：补 stage_graph_stalled 的处置说明 —— 光有 missing 不够，
 	// 「选品失败导致下游从未建出」这种形态只能靠 stalled 报出来。
 	//
 	// **必须 bump**：v3 已在本次部署的库上置 true。
 	// prompt 正文是 DB 快照（SeedPromptIfEmpty 首插入 only）。
-	const flag = "planner_prompt_role_dispatch_v4"
+	const flag = "planner_prompt_trader_dispatch_v6"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}

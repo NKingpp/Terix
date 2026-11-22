@@ -400,14 +400,26 @@ func Expand(assetClass string, opts ExpandOpts) (*StageGraph, error) {
 		link(debateRefs[len(debateRefs)-1], refResearchManager)
 	}
 
-	// ---- 阶段 5：交易员 ----
-	const refTrader = "trader"
-	add(refTrader, KindIntent, RoleTrader, "trade", 60, map[string]any{"stage": "trade"})
-	link(refResearchManager, refTrader)
-
-	// ---- 阶段 6：风控（并行，多轮）----
+	// ---- 阶段 5：风控（并行，多轮）----
+	//
+	// # trader 不在阶段图里（2026-11-20 改）
+	//
+	// 原来 trader 是链上的一环：research_manager → trader → risk×2 → PM。
+	// 那意味着 **trader 在风控与组合经理之前就真下单了** —— risk 质询与 PM 终审
+	// 拿到的是一个已经成交的仓位，没有任何回写路径去约束它（实测任务 42：
+	// trader 07:29:23 成交，PM 07:31:31 才跑完）。
+	//
+	// 现在串行链只到 PM：research_manager → risk×2 → join_risk → portfolio_manager。
+	// 交易由 planner 看完全部分析（裁决 + 风控质询 + PM 评级）后**显式派**
+	// 一条 role=trader 的意图下发 —— 下单变成规划决策，不是流水线副作用。
+	//
+	// 好处：
+	//   ① 下单前一定已有 PM 评级（planner 派单时可引用它作 parent fact）
+	//   ② planner 能按评级（buy/hold/sell/review）决定派不派、派多大规模
+	//   ③ 目标未达成且无新方向时，trader 不会被流水线自动拉起空跑
 	const groupRisk = "risk"
 	var riskRefs []string
+	prevRisk := refResearchManager
 	for round := 1; round <= riskRounds; round++ {
 		for _, role := range riskRoles {
 			ref := role
@@ -417,7 +429,8 @@ func Expand(assetClass string, opts ExpandOpts) (*StageGraph, error) {
 			add(ref, KindIntent, role, groupRisk, 70+round, map[string]any{
 				"stage": "risk", "round": round,
 			})
-			link(refTrader, ref)
+			link(prevRisk, ref)
+			prevRisk = ref
 			riskRefs = append(riskRefs, ref)
 		}
 	}

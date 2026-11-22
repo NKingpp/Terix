@@ -62,6 +62,10 @@ type TaskDTO struct {
 	CoverageEnabled    bool               `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
 	// InstrumentID 非 nil ⇔ 金融分析任务（分析该标的）。
 	InstrumentID *int64 `json:"instrument_id,omitempty"`
+	// WaitReason / WaitUntil 只在 planner 显式调 wait_for（或零产出冷却）时出现：
+	// 任务在等待某个客观阻塞解除，引擎已停止常规唤醒。
+	WaitReason string `json:"wait_reason,omitempty"`
+	WaitUntil  int64  `json:"wait_until,omitempty"` // unix 秒，0 = 不在等待
 	// InstrumentHint 只在「创建时没能从文本识别标的」的响应里出现。
 	//
 	// # 为什么不复用 error 字段

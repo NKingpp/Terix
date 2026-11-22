@@ -76,6 +76,11 @@ var financialRoleSet = func() map[string]bool {
 // 传 >0 表示「不展开选品阶段」，于是返回的集合里不含 screener。
 // 「缺 screener」由调用方根据自己的「任务是否绑标的」判断，不靠这张表 ——
 // 因为绑了标的的任务本来就不该有 screener，那不是缺失。
+// # 为什么返回的集合里不含 trader（2026-11-20）
+//
+// trader 已从阶段图移除 —— 它由 planner 按评级显式派单，不是「本该自动存在」
+// 的流水线阶段。留在期望清单里会让 graph_overview 每轮报「缺 trader」，
+// 而 planner 的正确响应恰好是「按评级决定派不派」，不是「补建」。
 func ExpectedStageRoles(assetClass string) []string {
 	g, err := Expand(assetClass, ExpandOpts{InstrumentID: 1})
 	if err != nil {

@@ -380,6 +380,12 @@ const riskAggressiveTmpl = `你是激进风控。你唯一的职责是：从**�
 
 混用会让 PM 无法区分「风控否决」和「风控没看」。
 
+━━ 完整数据：研究裁决（全量） ━━
+
+` + "```json" + `
+{{.ResearchConclusionJSON}}
+` + "```" + `
+
 ━━ 完整数据：交易提案（全量） ━━
 
 ` + "```json" + `
@@ -561,14 +567,16 @@ const portfolioManagerTmpl = `你是组合经理。你是整条分析链的**决
 
 ━━ 决策框架 ━━
 
-**第一步：汇总三层信息**
+**第一步：汇总四层信息**
 
 | 层 | 看什么 |
 |---|---|
 | 分析师事实 | 原始证据（技术面/情绪/衍生品等） |
-| 辩论裁决 | 哪一方论证更强（bull_wins/bear_wins/draw/inconclusive） |
-| 交易提案 | trader 的方向与周期 |
+| **辩论裁决** | {{.ResearchVerdict}} —— 哪一方论证更强（bull_wins/bear_wins/draw/inconclusive）。**全量在下方「完整数据：研究裁决」节** |
+| 交易提案 | trader 的方向与周期（**见下方说明：新流程下你这里通常没有提案**） |
 | 三方风控 | 机会成本 / 内部一致性 / 不可逆损失三个视角 |
+
+**关于「没有交易提案」**（2026-11-20 起的流程）：流水线是 analysis→debate→research→risk→**你**→planner 派 trader。所以轮到评级时 trader 还没跑，这是**设计如此、不是数据缺口**。你的评级会作为 planner 是否派 trader、派多大规模的依据。不要因为「无提案」判 review，也不要因此降置信度。
 
 **第二步：六值评级映射**
 
@@ -590,7 +598,9 @@ const portfolioManagerTmpl = `你是组合经理。你是整条分析链的**决
 | 1 | **分析师覆盖** | 分析师事实里 stance 不等于 unavailable 的条目数 >= 2 |
 | 2 | **辩论有效性** | 研究裁决的 conclusion 不等于 inconclusive —— inconclusive 意味着辩论没得出结论 |
 | 3 | **风控完整性** | 三方风控里给出明确判决（accept/reject/adjust，非 cannot_assess）的 >= 2 方 |
-| 4 | **数据充分性** | 数据缺口里不含阻断级项（缺行情 / 缺财报 / 缺信号） |
+| 4 | **数据充分性** | 数据缺口里不含阻断级项（缺行情 / 缺财报） |
+
+**注意**：「缺交易提案 / 缺交易信号」**不是**阻断级缺口 —— 新流程里 trader 在评级之后才跑。这一项只针对行情与基本面数据。
 
 **四项全部满足** → 正常评级（buy/overweight/hold/underweight/sell）
 **任一不满足** → rating=review，且 review_reasons 必须**四项全部填写**（满足的写「已满足」，不满足的写具体原因）
@@ -631,8 +641,14 @@ const portfolioManagerTmpl = `你是组合经理。你是整条分析链的**决
 | 裁决为 inconclusive | rating 通常为 review，confidence ≤ 0.4 |
 | 三方风控严重分歧（有的 accept 有的 reject） | rating 可为 hold 或 review，但必须写清分歧点 |
 | 数据缺口 ≥ 2 项 | confidence 上限 0.5 |
-| 无交易信号 | 仍可评级（基于裁决与事实），但 rationale 说明「无 trader 提案」 |
+| 无交易提案/信号 | **正常**（trader 在评级后由 planner 派单）—— 照常按裁决+事实评级，rationale 说明「提案将在评级后产出」 |
 | 全部输入都缺失 | rating=review，confidence=0.0，reasons 写「输入不足，无法评级」 |
+
+━━ 完整数据：研究裁决（全量） ━━
+
+` + "```json" + `
+{{.ResearchVerdictJSON}}
+` + "```" + `
 
 ━━ 完整数据：分析师事实（全量） ━━
 

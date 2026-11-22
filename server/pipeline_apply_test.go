@@ -431,9 +431,11 @@ FROM exploration_nodes WHERE exploration_id=$1 AND kind='intent'`, e.expID)
 		}
 		seen[role] = true
 	}
+	// trader 不在其中：2026-11-20 起它由 planner 按 PM 评级派单，
+	// 补建下游阶段时不再自动建 trader 节点。
 	for _, want := range []string{
 		"analyst_market", "analyst_news", "analyst_fundamental",
-		"trader", "portfolio_manager",
+		"portfolio_manager",
 	} {
 		if !seen[want] {
 			t.Errorf("缺少角色 %q 的意图", want)

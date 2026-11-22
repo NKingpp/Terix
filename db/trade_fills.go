@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -81,6 +82,19 @@ type FillsFilter struct {
 func (d *DB) ListFills(f FillsFilter) ([]TradeFill, error) {
 	if f.Limit <= 0 || f.Limit > 2000 {
 		f.Limit = 500
+	}
+	// 按任务查走「持仓回合」归属（db/fill_attribution.go）—— 这里的 SQL 只能连
+	// 自带 clOrdId 的成交，交易所 OCO/TP/SL 触发的平仓腿（`O` 前缀）连不上，
+	// 交易记录页会比母账少数十笔并显示「未平仓」。
+	if f.TaskID > 0 {
+		fills, err := d.TaskFills(context.Background(), f.TaskID, f.AccountID, f.InstID)
+		if err != nil {
+			return nil, err
+		}
+		if len(fills) > f.Limit {
+			fills = fills[:f.Limit] // 与下面 SQL 的 ORDER BY ... LIMIT 语义一致（最早 N 笔）
+		}
+		return fills, nil
 	}
 	q := `SELECT tf.id, tf.fill_id, tf.account_id, tf.inst_id, tf.side, tf.pos_side,
 tf.fill_px, tf.fill_sz, tf.fee, COALESCE(tf.fee_ccy,''), COALESCE(tf.ord_id,''),
@@ -197,6 +211,10 @@ GROUP BY inst_id`, accountID)
 // HasFillsFor 报告某任务是否已有任何成交（供前端区分「还没成交」与「查不到」）。
 func (d *DB) HasFillsFor(taskID int64) (bool, error) {
 	var n int
+	// 先按 ① 回合归属判（含 algo 平仓腿），再退回旧草案链。
+	if fills, err := d.TaskFills(context.Background(), taskID, 0, ""); err == nil && len(fills) > 0 {
+		return true, nil
+	}
 	err := d.QueryRow(`SELECT COUNT(*) FROM trade_fills tf
 LEFT JOIN orders_execution oe ON (oe.client_order_id = tf.cl_ord_id OR oe.channel_order_id = tf.ord_id)
 LEFT JOIN orders_draft od ON od.id = COALESCE(tf.draft_id, oe.draft_id)

@@ -949,7 +949,6 @@ func (s *Server) Handler() http.Handler {
 	// 第 7 个端点：执行面（前 6 个是管理面）。
 	// 它真的产生执行单，所以和「改配置」的端点分开 —— 权限边界不同。
 
-
 	mux.HandleFunc("GET /api/notify/meta", s.notifyMeta)
 	mux.HandleFunc("GET /api/notify/channels", s.notifyListChannels)
 	mux.HandleFunc("POST /api/notify/channels", s.notifyCreateChannel)
@@ -1147,11 +1146,17 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 	// running intent without any corresponding LLM call can be considered stalled.
 	stalled := running && activeCalls == 0 && inFlight > 0 && last > 0 && time.Now().Unix()-last > 120
 
-	// engine_mode follows the spec enum (exploring|paused|stalled|idle).
+	// engine_mode follows the spec enum (exploring|paused|stalled|waiting|idle).
+	//
+	// waiting 优先于 stalled：「没在跑、也没新意图」在显式等待下是**预期**
+	// 而非故障，把它显示成「停滞」会让人以为卡住了。
+	waitUntil, waitReason, _, waiting := s.engine.WaitState(t.ID)
 	engineMode := "idle"
 	switch {
 	case paused:
 		engineMode = "paused"
+	case waiting:
+		engineMode = "waiting"
 	case stalled:
 		engineMode = "stalled"
 	case running && activeCalls > 0:
@@ -1170,6 +1175,9 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		"stalled":       stalled,
 		"goals_total":   len(goals),
 		"goals_met":     goalsMet,
+		"waiting":       waiting,
+		"wait_reason":   waitReason,
+		"wait_until":    waitUntilUnix(waitUntil),
 	}
 	writeJSON(w, 200, out)
 }
@@ -1196,6 +1204,7 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 		}
 		dto.GoalsTotal = metric.Goals.Total
 		dto.GoalsMet = metric.Goals.Met
+		s.fillWaitState(t, &dto)
 		dto.InFlight = metric.RunningIntents
 		dto.Findings = FindingSeverityDTO{
 			Critical: metric.Findings.Critical,
@@ -2022,7 +2031,25 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 	dto := taskDTO(t, s.resolvedTaskStatus(t))
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	applyTaskArchiveBlocker(&dto, archiveBlockers)
+	s.fillWaitState(t, &dto)
 	writeJSON(w, 200, dto)
+}
+
+// fillWaitState 把引擎的等待态写进 DTO：任务详情页据 wait_reason/wait_until
+// 显示「等待中：…（至 …）」，而不是让用户看到 running + 零活动去猜原因。
+func (s *Server) fillWaitState(t *Task, dto *TaskDTO) {
+	if t == nil || dto == nil || s.engine == nil {
+		return
+	}
+	until, reason, _, ok := s.engine.WaitState(t.ID)
+	if !ok {
+		return
+	}
+	dto.WaitUntil = until.Unix()
+	dto.WaitReason = reason
+	if dto.WaitReason == "" {
+		dto.WaitReason = "本轮无新方向，降频复查中"
+	}
 }
 
 // taskCoverage returns a task's rough asset test coverage (denominator/tested/backlog).

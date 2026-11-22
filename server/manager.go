@@ -1834,6 +1834,25 @@ func (t *Task) NotifyCancelled(intentID int64, summary, reason string) {
 	t.Notify()
 }
 
+// NotifyGoalAccepted records that the human accepted (验收) a goal from 总览的目标管理,
+// then wakes the planner so it re-reads the goal graph instead of staying in wait_for.
+//
+// # 为什么验收也要唤醒（2026-11-20）
+//
+// 金融任务的目标只能人工验收，而 planner 在等验收时会调 wait_for 挂起自己。
+// 没有这条触发，「验收了 1/6」对 planner 完全不可见 —— 它要等到 wait_for 到期
+// 才发现状态变了。验收是外部输入，按 wait_for 的穿透规则必须提前唤醒。
+func (t *Task) NotifyGoalAccepted(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	t.trigMu.Lock()
+	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "goal_accepted", Detail: text})
+	t.trigMu.Unlock()
+	t.Notify()
+}
+
 // drainTriggers returns and clears the trigger events accumulated since the last round.
 func (t *Task) drainTriggers() []agent.TriggerEvent {
 	t.trigMu.Lock()

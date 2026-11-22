@@ -263,11 +263,33 @@ func buildPMVars(ctx context.Context, intent *db.Node) PMVars {
 		DataGaps:        stringSliceFromAny(p["data_gaps"]),
 	}
 
+	// 研究裁决（research_manager 的 thesis）。PM 的六值评级映射与 review 门槛
+	// 第 2 项全建立在它上面 —— 不传就等于让 PM 闭眼评级。
+	//
+	// 空数据也要填明确说明（同 buildResearchManagerVars 的 2026-11-06 事故教训）：
+	// 空白 JSON 区块会被模型读成「数据故障」，而不是「上游没产出」。
+	//
+	// # 为什么用 KindThesis 而不是 KindFact
+	//
+	// research_manager 的 emit_thesis 写的是 thesis 节点（裁决 bull_wins /
+	// bear_wins / draw / inconclusive）。任务 44 里裁决是 node 3468，type=thesis。
+	if s, found, _ := siblingOutput(ts, db.KindThesis, RoleResearchManager); found {
+		vars.ResearchVerdict = "研究裁决已就绪（完整内容见末尾）"
+		vars.ResearchVerdictJSON = s
+	} else {
+		vars.ResearchVerdict = notWiredSibling
+		vars.ResearchVerdictJSON = `[]（上游研究经理尚未产出裁决 —— 这是数据缺失，` +
+			`不是工具故障。请按「裁决缺失」处理：review 门槛第 2 项不满足，rating 必须是 review）`
+	}
+
 	if s, found, _ := siblingOutput(ts, db.KindSignal, RoleTrader); found {
 		vars.TraderProposal = "交易提案已就绪（完整内容见末尾）"
 		vars.TraderProposalJSON = s
 	} else {
 		vars.TraderProposal = notWiredSibling
+		vars.TraderProposalJSON = `[]（本轮无 trader 提案 —— 按新流程，trader 由 planner 在 ` +
+			`PM 评级之后派单，所以 PM 阶段没有提案是**正常**的。请勿因此判 review；` +
+			`按裁决方向 + 分析师事实评级即可，rationale 里说明「提案将在评级后由 planner 派 trader 产出」）`
 	}
 
 	var risks []siblingNode

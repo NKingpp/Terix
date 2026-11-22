@@ -310,6 +310,10 @@ func (s *Server) acceptGoal(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
+	// 验收是外部输入：唤醒 planner，让它在 wait_for 期间也能立刻看到状态变化。
+	if text := goalDTO(node).Text; text != "" {
+		t.NotifyGoalAccepted(text)
+	}
 	goal := res.Goal
 	if goal == nil {
 		goal = node

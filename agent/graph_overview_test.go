@@ -116,8 +116,10 @@ func TestGraphOverviewReportsMissingWithInstrument(t *testing.T) {
 	if len(m) == 0 {
 		t.Fatal("图里只有 analyst_market，必须报出其余缺失角色")
 	}
-	// trader / portfolio_manager 一定在内（它们在最下游）
-	want := map[string]bool{RoleTrader: false, RolePortfolioManager: false}
+	// portfolio_manager 一定在内（串行链终点）。
+	// trader **不该**在缺失里：2026-11-20 起它由 planner 按 PM 评级派单，
+	// 不属于「本该自动存在」的阶段节点。
+	want := map[string]bool{RolePortfolioManager: false}
 	for _, r := range m {
 		if _, ok := want[r]; ok {
 			want[r] = true
@@ -132,6 +134,13 @@ func TestGraphOverviewReportsMissingWithInstrument(t *testing.T) {
 	for _, r := range m {
 		if r == RoleAnalystMarket {
 			t.Error("analyst_market 已存在，不该报缺失")
+		}
+	}
+	// trader 已移出串行链 —— 报它缺失会让 planner 每轮去「补建」一个
+	// 本不该存在的节点（正确动作是按评级决定派不派）。
+	for _, r := range m {
+		if r == RoleTrader {
+			t.Errorf("trader 不该出现在 stage_graph_missing 里，实际: %v", m)
 		}
 	}
 }

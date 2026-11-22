@@ -169,7 +169,11 @@ export function TradesTab({ taskId }: { taskId: string }) {
   }
 
   const live = data?.live;
-  const liveCount = live?.fills.length ?? 0;
+  // 后端本该发 [] 而非 null（server/trades_api.go 已修），但这里仍要兜底：
+  // `live?.fills.length` 只护了 live，fills 为 null 时属性访问直接抛，
+  // 整页变成 "This page couldn't load"。可选链要护到最内层。
+  const liveFills = live?.fills ?? [];
+  const liveCount = liveFills.length;
 
   return (
     <div className="flex flex-col gap-4">
@@ -304,7 +308,7 @@ export function TradesTab({ taskId }: { taskId: string }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {live!.fills.map((f) => (
+                  {liveFills.map((f) => (
                     <tr key={f.fill_id} className="border-b last:border-0">
                       <td className="py-2 pr-3 text-xs text-muted-foreground">
                         {new Date(f.filled_at).toLocaleString("zh-CN")}

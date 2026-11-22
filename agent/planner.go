@@ -25,12 +25,13 @@ type Planner struct {
 	findingRecorder FindingRecorder
 	prov            llm.Provider
 	model           string
-	tx              *transcript.Store                      // raw LLM conversation persistence (nil = off)
-	window          int                                    // context window in tokens (for compaction)
-	windowFn        func() int                             // optional dynamic task-chain minimum
-	maxTurns        int                                    // max agent turns per run (0 = unlimited)
-	killWork        func(intentID int64) error             // engine callback to terminate a running work (nil = off)
-	steerWork       func(intentID int64, msg string) error // engine callback to steer a running work mid-run (nil = off)
+	tx              *transcript.Store                                // raw LLM conversation persistence (nil = off)
+	window          int                                              // context window in tokens (for compaction)
+	windowFn        func() int                                       // optional dynamic task-chain minimum
+	maxTurns        int                                              // max agent turns per run (0 = unlimited)
+	killWork        func(intentID int64) error                       // engine callback to terminate a running work (nil = off)
+	steerWork       func(intentID int64, msg string) error           // engine callback to steer a running work mid-run (nil = off)
+	waitFor         func(reason string, minutes int) (string, error) // engine callback: park planner until a blocker clears (nil = off)
 	// materializeDownstream 是 server 的「补建阶段图」回调（nil = 工具不可用）。
 	// 见 SetMaterializeDownstream 的注释：screener 失败后下游节点从未建出，
 	// planner 需要自己能补，否则只能派无 role 的通用意图顶替。
@@ -130,6 +131,11 @@ func (p *Planner) SetKillWork(fn func(intentID int64) error) { p.killWork = fn }
 // steer_work tool can inject a mid-run course-correction into a running worker.
 func (p *Planner) SetSteerWork(fn func(intentID int64, msg string) error) { p.steerWork = fn }
 
+// SetWaitFor wires the engine's explicit-wait callback so the planner's wait_for
+// tool can park the task until a known objective blocker clears (human acceptance,
+// next session open, …). See ToolSet.waitFor for why this exists.
+func (p *Planner) SetWaitFor(fn func(reason string, minutes int) (string, error)) { p.waitFor = fn }
+
 // SetMaterializeDownstream wires the server's stage-graph backfill so the planner's
 // materialize_downstream tool can rebuild the missing half of the pipeline.
 //
@@ -208,6 +214,8 @@ func renderTriggers(ts *db.ExplorationStore, evs []TriggerEvent) string {
 			} else {
 				b.WriteString(fmt.Sprintf("\n- 人（主 agent）新增了 %d 条战略提示：%s —— 均已挂到探索图上，请逐一据此调整/补充探索方向。", len(ev.Hints), strings.Join(ev.Hints, "；")))
 			}
+		case "goal_accepted":
+			b.WriteString(fmt.Sprintf("\n- 人已人工验收通过目标「%s」—— 该目标不再是待办；请据剩余未达成目标重判是否继续（若已无需推进，本轮可 wait_for 继续等剩余验收或直接结束本轮）。", ev.Detail))
 		case "goal_deleted":
 			b.WriteString(fmt.Sprintf("\n- 人删除了该目标：%s —— 该目标已移除，请据此重判剩余目标/方向（不必再为它派意图）。", ev.Detail))
 		case "goal_edited":
@@ -321,7 +329,13 @@ const plannerDefaultTmpl = `你是金融交易平台 Terix（覆盖美股 / 港�
 
 **本轮该产出几个意图（先想清楚这条）**：
 - **硬底线（最高优先）**：只要【目标未达成】且【当前没有任何 open 或 running 意图】（frontier_open=0 且 running_intents 为空），本轮就【必须】产出至少一个向目标推进的意图——没有在跑的 work 可等、也没有在排队的方向时，产出 0 意图=任务停摆；哪怕已知方向都只在 recent_done 里，也要据下面 done/exhausted/blocked 的判断另开一条或续派一条。**唯一例外是下面的③等待外部时间条件**。
-- 硬底线之外，**产出 0 个意图是正常结果，但要有正当理由**（不是"少派更稳"的默认）：①**已覆盖**——你想到的方向都已被仍在 open/running 的意图处理（换措辞重复生成已存在的意图是严重错误）；②**等待依赖**——下一步依赖当前在跑 work 的产出、而它还没出来（此时硬派会让下游拿不到前置而空转，应等下次唤醒图更新后再派）；③**等待外部时间条件**——下一步依赖未来的行情/数据（如下一交易日收盘、定时事件），当前可得数据都已核过、结论是「未触发」，且没有其它未覆盖的分析角度。此时【不要】为了凑硬底线派一条换措辞的「继续跟踪/持续观察」意图：它不带来新信息，只会每轮重复烧 token。直接结束本轮，系统会按固定间隔降频唤醒你复查；只有确实存在没试过的分析角度时，才派那条新方向。
+- 硬底线之外，**产出 0 个意图是正常结果，但要有正当理由**（不是"少派更稳"的默认）：①**已覆盖**——你想到的方向都已被仍在 open/running 的意图处理（换措辞重复生成已存在的意图是严重错误）；②**等待依赖**——下一步依赖当前在跑 work 的产出、而它还没出来（此时硬派会让下游拿不到前置而空转，应等下次唤醒图更新后再派）；③**等待外部时间条件**——下一步依赖未来的行情/数据（如下一交易日收盘、定时事件），或依赖**人**的动作（人工验收目标、补充凭证），当前可得数据都已核过、结论是「未触发」，且没有其它未覆盖的分析角度。此时【不要】为了凑硬底线派一条换措辞的「继续跟踪/持续观察」意图：它不带来新信息，只会每轮重复烧 token。
+
+  **这种等待必须调 wait_for(reason, minutes) 明确声明**，而不是「结束本轮」了事。差别很大：结束本轮只是回到 10 分钟冷却，你会被反复唤醒、每轮重判一遍「还在等」；wait_for 会让引擎停掉常规唤醒，只在到点或人改目标/加提示/验收时回来。实测（任务 39）不声明等待的后果是 89 轮规划、8000 万 token 全花在重复确认「还在等验收」上。
+
+  典型该调的场合：金融任务的目标只能人工验收（prove_goal 对金融任务会被硬拦，返回「须人工验收」）—— 提交完全部目标证据后调 wait_for("等待操作员在目标管理卡片验收 6 个目标", 120)，而不是每轮重试 prove_goal。
+
+  什么时候不该调：还有未覆盖的分析方向（那该派意图）；还有 open/running 意图在跑（等它们回来就会唤醒你，无需声明）；等你自己的下一步动作（那不是等待）。
 - 反过来：确有【未覆盖、且不依赖在跑 work】的新方向，或目标未达成且范围内仍有未覆盖的分析面，就该派——别把 0 意图当偷懒的默认。
 
 **每次唤醒的决策流程**：
@@ -394,7 +408,13 @@ const plannerDefaultTmpl = `你是金融交易平台 Terix（覆盖美股 / 港�
 
    **串行分析链：分步派，别拆成并行。** 强依赖串行链（①→②→③，后一步依赖前一步的实际产出）：不要一次性并行下发（下游拿不到还不存在的前置只会重复/空转）；用 TodoWrite 把整条链记成待办（每步一条），本轮只派"前置已满足"的那步（通常第一步），待它产出 fact 后下次唤醒（提示会带上待办清单）再派下一步并把已满足的标 completed。"同一件事"别拆两条（"确认驱动因素"和"验证驱动因素"是同一步）；只有【平行、互不依赖】的维度（如并行调研多个不相关标的）才用多意图并行。
 
-   **阶段图缺口（graph_overview 返回 stage_graph_missing 非空时）**：它列出按标的类别本该存在、但图里**没有任何意图承担**的执行角色 —— 典型原因是某个阶段中途失败，后续十几个节点从未建出。
+   **交易派单（关键，2026-11-20 起 trader 不再在流水线里）**：阶段图只跑到 portfolio_manager 为止（analysis→debate→research→risk→decision）。**下单不再是流水线的副作用，而是你显式派出的一条 role=trader 意图。**
+   - 派单前提（缺一不可）：① research_manager 已出裁决（bull_wins/bear_wins）；② 风控三方已出意见；③ portfolio_manager 已出评级（emit_rating）。这三样都在图里了，才轮到你决定派不派 trader。
+   - 派单判据：PM 评级方向明确（buy/overweight/sell/underweight）且目标要求实际交易时派；评级为 hold/review 或风控一致反对时**不派**（写了理由，等下一轮行情再判）。
+   - 派单写法：add_intent 带 role=trader，summary 里写清「依据哪条裁决/哪些风控意见/哪条评级、方向、预期仓位与止损区间」，parent_ids 填那几条 fact/finding（裁决 thesis + PM rating 节点）——trader 的 prompt 会读它们。
+   - **不要**在没有 PM 评级时就派 trader：这正是旧流水线的缺陷（trader 在 PM 上游，先成交后审批）。也不要因为「目标里有交易那一项」就每轮都派——目标未达成且无新行情结论时，等（wait_for 或结束本轮）比空派一条 trader 更对。
+
+   **阶段图缺口（graph_overview 返回 stage_graph_missing 非空时）**：它列出按标的类别本该存在、但图里**没有任何意图承担**的执行角色 —— 典型原因是某个阶段中途失败，后续十几个节点从未建出。注意 trader 不在期望清单里（它靠你按上面的规则派单），所以「缺 trader」永远不会出现在这个字段。
    - 任务**已绑定标的** → 直接调 materialize_downstream 补建（补建前别抢派分析师，否则会和补建出来的节点重复）。
    - 任务**未绑定标的** → 派一条 role=screener 的意图重跑选品；它调 set_task_instrument 选定标的后会自动展开下游。
    - 补建/重跑之后该字段会在下一轮消失。它还在，就说明还没修好 —— 别当没看见，也别用无 role 的通用意图去"顶替"某个角色（那只会得到一份没有该角色 prompt 的分析）。
@@ -406,7 +426,7 @@ const plannerDefaultTmpl = `你是金融交易平台 Terix（覆盖美股 / 港�
    - **asset_ids**：本方向要分析的标的 id（尽量传，0/1/多个，来自 list_assets）——只要方向围绕具体标的（个股/板块/市场/时间周期）就务必传，用于覆盖去重、连入标的链路，跨多标的就都传；纯全局数据收集无具体标的才留空。
    - **parent_ids**：本方向由哪些上游节点综合得出（可选，0/1/多个）——多个事实结合产生一个意图就都传，派生自某上游意图/分析结论也传其 id，顶层全新方向留空。
    - **role**（可选）：把这条意图交给指定**执行角色**，取值只能从下表选。
-     **只在「补齐一条本该存在、但因故没跑成的流水线阶段」时填。**
+     **补齐流水线缺口时填；另有一个例外：role=trader 是你的常规派单手段**（见上面「交易派单」）。
      | role | 负责 |
      |---|---|
      | screener | 按策略从市场筛候选标的，并把首选写进任务（唯一能改标的的角色） |
@@ -416,7 +436,7 @@ const plannerDefaultTmpl = `你是金融交易平台 Terix（覆盖美股 / 港�
      | analyst_sentiment_crypto | 加密衍生品：资金费率/持仓量/多空拥挤度 |
      | debate_bull / debate_bear | 多空论证（读分析师事实，不自己取数） |
      | research_manager | 裁决多空论证强度，出结论与置信度 |
-     | trader | 出交易信号/建单草案并过风控闸门 |
+     | trader | **按你的派单实际下单**（open_position/close_position）。不在流水线里，只有你派它才跑 |
      | risk_aggressive / risk_conservative / risk_neutral | 三方风控意见 |
      | portfolio_manager | 组合评级（流程终点） |
 
@@ -457,6 +477,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	tsx.SetCoverageEnabled(as == nil || as.CoverageEnabled(taskID))
 	tsx.killWork = p.killWork                           // enable kill_work tool (nil = unavailable)
 	tsx.steerWork = p.steerWork                         // enable steer_work tool (nil = unavailable)
+	tsx.waitFor = p.waitFor                             // enable wait_for tool (nil = unavailable)
 	tsx.materializeDownstream = p.materializeDownstream // enable materialize_downstream (nil = unavailable)
 	if origin, _ := ts.OriginFactID(); origin > 0 {
 		tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)
