@@ -133,7 +133,20 @@ FROM trade_records WHERE task_id = $1 AND instrument_id IS NOT NULL`, taskID); i
 		out.Fills++
 	}
 
+	// 净额容差：SplitSz 是 10 位小数字符串，逐笔重新解析后累加会留下残差
+	// （实测任务 45：230 笔累加，真值 -19 得 -19.0000000008）。残差本身
+	// 不改变「是否持仓」的判断（-19 vs -19.0000000008 都算持仓），但会让
+	// **真实已平仓**的任务算出 1e-10 而不是 0 → OpenPositions 误判为 1 →
+	// goal_accept 报「持仓未平」→ 任务永远验收不了（正是本功能要消除的病）。
+	//
+	// 阈值取 1e-8：一个合约的 1e-8 远低于交易所最小下单精度（OKX 合约
+	// 面值最小 0.01 张），任何真实持仓都不可能小到这个量级。
+	// 这不是「四舍五入掩盖问题」—— 归属层的份额由最大余额法保证逐笔精确相加，
+	// 这里只吸收字符串边界带来的浮点表示残差。
 	for instID, l := range leds {
+		if l.net.Sign() != 0 && new(big.Rat).Abs(l.net).Cmp(big.NewRat(1, 100000000)) < 0 {
+			l.net.SetInt64(0)
+		}
 		if l.net.Sign() == 0 {
 			continue
 		}

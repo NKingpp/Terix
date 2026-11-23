@@ -76,3 +76,4 @@ web/dev.out.log
 
 # WorkBuddy 工作区状态/记忆目录（工具本地数据，不入库）
 /.workbuddy/
+.worktrees/

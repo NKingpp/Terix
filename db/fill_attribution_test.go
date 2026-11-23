@@ -600,3 +600,75 @@ VALUES ($1,4,$2,$3,'open','sell','1',$4,'filled','live_auto','agent')`, r.task, 
 		t.Fatalf("夹仓后份额之和应为 2（多出的 8 张丢弃），得到 %v", total)
 	}
 }
+
+// SplitSz 是 10 位小数字符串，逐笔重新解析累加会留下残差。真实已平仓的
+// 任务因此会算出 1e-10 而非 0 → OpenPositions 误判为 1 → 验收报「持仓未平」。
+//
+// 实测任务 45：230 笔累加，真值 -19 得 -19.0000000008。这里用 3 个任务
+// 各 1 张空 + 三条 algo 买入腿复现同类残差，断言全部判为已平仓。
+//
+// # 为什么不能只靠归属层「最大余额法」
+//
+// 最大余额法保证**单笔** ΣSplitSz == FillSz，但跨多笔累加仍有残差 ——
+// 每笔的 10 位舍入方向不同，N 笔之后偏差可达 N×1e-10。
+// 汇总层必须有自己的容差，这是它的责任边界。
+func TestTaskTradeSummaryIgnoresFractionalResidual(t *testing.T) {
+	d := testOpen(t)
+	ctx := context.Background()
+	const sym = "EPISODE-RESIDUAL-SWAP"
+	if _, err := d.Exec(`INSERT INTO instruments(market, symbol, asset_class, currency)
+VALUES ('crypto',$1,'future','USDT')`, sym); err != nil {
+		t.Fatal(err)
+	}
+	var instID int64
+	if err := d.QueryRow(`SELECT id FROM instruments WHERE market='crypto' AND symbol=$1`, sym).Scan(&instID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		d.Exec(`DELETE FROM trade_fills WHERE inst_id=$1`, sym)
+		d.Exec(`DELETE FROM trade_records WHERE inst_id=$1`, sym)
+		d.Exec(`DELETE FROM instruments WHERE id=$1`, instID)
+	})
+
+	// 3 个任务各开 1 张空（三笔独立开仓）
+	for i, tid := range []int64{9401, 9402, 9403} {
+		cid := "artexo-res-" + string(rune('a'+i))
+		if _, err := d.Exec(`INSERT INTO trade_records(task_id, account_id, instrument_id, inst_id,
+action, side, qty, client_order_id, state, mode, operator)
+VALUES ($1,1,$2,$3,'open','sell','1',$4,'filled','live_auto','agent')`, tid, instID, sym, cid); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := d.InsertFill(TradeFill{
+			FillID: sym + ":open" + string(rune('a'+i)), AccountID: 1, InstID: sym,
+			Side: "sell", PosSide: "short", FillPx: "100", FillSz: "1",
+			ClOrdID: cid, FilledAt: "2026-11-20T0" + string(rune('1'+i)) + ":00:00Z",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 三条无主 algo 买入腿，每条平 1 张 —— 每条按 1/3 分给三个任务
+	for i := 0; i < 3; i++ {
+		if _, _, err := d.InsertFill(TradeFill{
+			FillID: sym + ":close" + string(rune('a'+i)), AccountID: 1, InstID: sym,
+			Side: "buy", PosSide: "short", FillPx: "90", FillSz: "1",
+			ClOrdID: "O9400000000000000" + string(rune('0'+i)), OrdID: "9400000000000000" + string(rune('0'+i)),
+			FilledAt: "2026-11-21T0" + string(rune('1'+i)) + ":00:00Z",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, tid := range []int64{9401, 9402, 9403} {
+		sum, err := TaskTradeSummaryFor(ctx, d, tid, instID)
+		if err != nil {
+			t.Fatalf("task %d: %v", tid, err)
+		}
+		if sum.OpenPositions != 0 {
+			t.Errorf("task %d: 真实已平仓，OpenPositions 应为 0，得到 %d（netqty=%v）—— 1e-10 级残差被当成持仓，验收会永远 409",
+				tid, sum.OpenPositions, sum.NetQty)
+		}
+		if q, ok := sum.NetQty[instID]; ok {
+			t.Errorf("task %d: 已平仓不该有 NetQty，得到 %q", tid, q)
+		}
+	}
+}
