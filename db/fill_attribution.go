@@ -13,16 +13,30 @@ package db
 // 平台算出 open_qty=-53、realized=-0.0037，母账真值是 pos=0、+1474.4353。
 // 人工验收因此必然 409（持仓未平），任务永远收不了尾。
 //
-// # 归属规则：逐任务净持仓 + 按比例拆份额
+// # 归属规则：逐任务逐方向净持仓 + 按比例拆份额
 //
-// 按 (account, inst) 时间升序走一遍，维护每个任务当前的净持仓：
+// 按 (account, inst) 时间升序走一遍，维护每个**仓位桶**的净持仓。
+// 桶的键是 (task, pos_side)：long_short 模式下同一任务在同一标的上可以同时持
+// 多、空两条独立仓，按任务单一净额分账会让 algo 腿把同向仓越平分越大
+// （实测账户 4 是 long_short：291 笔 long + 855 笔 short）。exec/pnl.go 的
+// groupSideOf 已按 pos_side 分账，这里必须同口径。
 //
-//   - 有主成交（clOrdId / ordId 能连回台账）→ 整笔归该任务，累加其净持仓。
-//   - 无主成交（交易所 algo 平仓腿）→ 拆给当前所有有持仓的任务，
-//     份额 = size · |open_t| / Σ|open|，符号跟随这笔成交。
-//     没有任何任务有持仓时不归属（不猜）。
+//   - 有主成交（clOrdId / ordId 能连回台账）→ 整笔归该任务的同向桶。
+//   - 无主成交（交易所 algo 平仓腿）→ 只分给「这笔成交能平掉」的桶
+//     （符号相反的桶；同向桶收到份额只会把仓位放大），
+//     份额 = size · |open_b| / Σ|open_b|，符号跟随这笔成交。
+//     没有可被平掉的持仓时不归属（不猜）。
 //
-// 份额夹在 |open_t| 以内：algo 腿不可能平掉某任务没持有的量。
+// 份额夹在 |open_b| 以内：algo 腿不可能平掉某个桶没持有的量。夹仓时
+// 多出来的 size-Σshares 张确实无从归属，**丢弃而不改派**。
+//
+// # 精确性
+//
+// 归属内部全程 big.Rat，无浮点漂移。但 SplitSz 是字符串出口（ratLiteral 只留
+// 10 位小数），三个 1/3 相加会得到 0.9999999999 而不是 1，下游重新累加后净持仓
+// 判为非零 → 人工验收报「持仓未平」—— 正是本函数要修的病。所以出口用
+// **最大余额法**：前 n-1 个份额各自取 10 位字面量，最后一个取
+// qty - Σ(已分配)，保证 ΣSplitSz 精确等于 FillSz。
 //
 // # 为什么不能用「持仓回合（episode）」
 //
@@ -66,6 +80,18 @@ type TaskFill struct {
 	SplitSz string
 	// SplitFee 是本任务占的手续费份额，按 SplitSz/FillSz 同比例分摊。
 	SplitFee string
+}
+
+// posSideOf 归一化 pos_side（与 exec/pnl.go 的 groupSideOf 同口径）。
+// 桶键必须和汇总层一致，否则归属按一个方向切、汇总按另一个方向加。
+func posSideOf(posSide string) string {
+	switch strings.ToLower(strings.TrimSpace(posSide)) {
+	case "long":
+		return "long"
+	case "short":
+		return "short"
+	}
+	return ""
 }
 
 // TaskFills 返回归属于某任务的成交份额（按 filled_at、id 升序）。
@@ -353,24 +379,37 @@ func chunkStrings(in []string, size int) [][]string {
 	return out
 }
 
-// attributeByOpenShares 逐笔维护各任务净持仓，返回 taskID 占有的成交份额。
+// bucket 是一个仓位桶：同一任务在 long_short 模式下可以同时持多、空两条
+// 独立仓（exec/pnl.go 的 groupSideOf 已按 pos_side 分账，这里必须同口径）。
+type bucket struct {
+	task    int64
+	posSide string
+}
+
+// attributeByOpenShares 逐笔维护各仓位桶净持仓，返回 taskID 占有的成交份额。
 //
 // fills 必须按 filled_at、id 升序（fillsForPair 保证）。
 // owner 是 clOrdId / ordId → taskID（ownerKeys 的产物）。
 //
-// 有主成交整笔归该任务；无主成交（交易所 algo 平仓腿）按各任务当前 |净持仓|
-// 比例拆分。拆分必须逐笔做：只有走到那一笔时各任务的持仓才是真实需要被平掉的量。
+// 有主成交整笔归该任务同向桶；无主成交（交易所 algo 平仓腿）按各桶当前
+// |净持仓| 比例拆分，且只分给这笔成交能平掉的桶。拆分必须逐笔做：只有走到
+// 那一笔时各任务真实的持仓才是需要对冲的量。
 func attributeByOpenShares(fills []TradeFill, owner map[string]int64, taskID int64) []TaskFill {
-	opens := map[int64]*big.Rat{}
-	add := func(t int64, delta *big.Rat) {
-		cur, ok := opens[t]
+	opens := map[bucket]*big.Rat{}
+	add := func(b bucket, delta *big.Rat) {
+		cur, ok := opens[b]
 		if !ok {
 			cur = new(big.Rat)
-			opens[t] = cur
+			opens[b] = cur
 		}
 		cur.Add(cur, delta)
 	}
-	var out []TaskFill
+	var (
+		out []TaskFill
+		// splitSeq 轮转「吸收舍入残差」的桶。固定让同一个桶吸收会让它每笔多
+		// 1e-10，几笔下来累积成幻影持仓；轮转后每桶的累计误差互相抵消。
+		splitSeq int
+	)
 
 	for _, f := range fills {
 		qty, ok := new(big.Rat).SetString(strings.TrimSpace(f.FillSz))
@@ -383,52 +422,93 @@ func attributeByOpenShares(fills []TradeFill, owner map[string]int64, taskID int
 		}
 
 		if t := ownerOf(f, owner); t > 0 {
-			add(t, signed)
+			add(bucket{task: t, posSide: posSideOf(f.PosSide)}, signed)
 			if t == taskID {
 				out = append(out, TaskFill{TradeFill: f, SplitSz: f.FillSz, SplitFee: f.Fee})
 			}
 			continue
 		}
 
-		// 无主成交：分母是此刻所有任务 |净持仓| 之和。
+		// 无主成交：只分给「这笔成交能平掉」的桶 —— 同向持仓不会被平掉，
+		// 收到份额只会把仓位越平分越大（long 2 + short 1，卖出 1 张时
+		// 多头本该减半而不是变 1.33）。
+		recipients := make([]bucket, 0, len(opens))
 		total := new(big.Rat)
-		ids := make([]int64, 0, len(opens))
-		for t, o := range opens {
-			if o.Sign() == 0 {
+		for b, o := range opens {
+			if o.Sign() == 0 || o.Sign() == signed.Sign() {
 				continue
 			}
-			ids = append(ids, t)
+			recipients = append(recipients, b)
 			total.Add(total, new(big.Rat).Abs(o))
 		}
 		if total.Sign() == 0 {
-			continue // 没有任何任务持仓：无从归属，不猜
+			continue // 没有可被平掉的持仓：无从归属，不猜
 		}
-		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		sort.Slice(recipients, func(i, j int) bool {
+			if recipients[i].task != recipients[j].task {
+				return recipients[i].task < recipients[j].task
+			}
+			return recipients[i].posSide < recipients[j].posSide
+		})
 
-		for _, t := range ids {
-			o := opens[t]
+		// 精确份额（同时夹在 |open_b| 以内：algo 腿不可能平掉它没持有的量）。
+		shares := make([]*big.Rat, len(recipients))
+		sumExact := new(big.Rat)
+		for i, b := range recipients {
+			o := opens[b]
 			share := new(big.Rat).Mul(qty, new(big.Rat).Abs(o))
 			share.Quo(share, total)
-			// 该任务最多只能被平掉 |open_t| 张：algo 腿不可能关掉它没持有的量。
-			// 只有这笔成交本身大于 Σ|open|（手工单等病态输入）时才会触发；
-			// 此时多出来的 size-Σshares 张确实无从归属，丢弃而不改派。
-			avail := new(big.Rat).Abs(o)
-			if share.Cmp(avail) > 0 {
+			if avail := new(big.Rat).Abs(o); share.Cmp(avail) > 0 {
 				share.Set(avail)
 			}
-			delta := new(big.Rat).Set(share)
+			shares[i] = share
+			sumExact.Add(sumExact, share)
+		}
+
+		// 最大余额法：前 n-1 个取 10 位字面量，吸收者拿 sumExact - Σ(已分配)，
+		// 保证 ΣSplitSz 精确等于 FillSz（无夹仓时）。夹仓多出来的
+		// qty - Σshares 张确实无从归属，丢弃而不改派。
+		absorb := splitSeq % len(recipients)
+		splitSeq++
+		render := make([]*big.Rat, len(recipients))
+		acc := new(big.Rat)
+		for i := range recipients {
+			if i == absorb {
+				continue
+			}
+			if r, ok := new(big.Rat).SetString(ratLiteral(shares[i])); ok {
+				render[i] = r
+				acc.Add(acc, r)
+			} else {
+				render[i] = new(big.Rat)
+			}
+		}
+		render[absorb] = new(big.Rat).Sub(sumExact, acc)
+		if render[absorb].Sign() < 0 {
+			render[absorb].SetInt64(0) // 舍入不可能到这，防御
+		}
+
+		for i, b := range recipients {
+			delta := new(big.Rat).Set(shares[i]) // 内部仍用精确值累加
 			if signed.Sign() < 0 {
 				delta.Neg(delta)
 			}
-			add(t, delta)
-			if t != taskID {
+			add(b, delta)
+
+			if b.task != taskID {
 				continue
 			}
-			splitSz, splitFee := f.FillSz, f.Fee
-			if share.Cmp(qty) != 0 {
-				splitSz, splitFee = ratLiteral(share), feeShare(f.Fee, share, qty)
+			tf := f
+			// 拆分后这一行属于被平掉的那个桶；成交自身 pos_side 为空
+			// （部分交易所字段缺失）时退回桶的方向。
+			if posSideOf(tf.PosSide) != b.posSide {
+				tf.PosSide = b.posSide
 			}
-			out = append(out, TaskFill{TradeFill: f, SplitSz: splitSz, SplitFee: splitFee})
+			out = append(out, TaskFill{
+				TradeFill: tf,
+				SplitSz:   ratLiteral(render[i]),
+				SplitFee:  feeShare(f.Fee, render[i], qty),
+			})
 		}
 	}
 	return out

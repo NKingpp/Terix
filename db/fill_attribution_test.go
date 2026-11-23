@@ -2,11 +2,15 @@ package db
 
 import (
 	"context"
+	"math/big"
+	"strconv"
+	"strings"
 	"testing"
 )
 
 // 交易所 OCO/TP/SL 触发的平仓腿（clOrdId 形如 O4114…）在 trade_records 里没有行。
-// 归属必须靠「持仓回合」，否则平仓腿被丢 → 净持仓算成未平 → 人工验收永远 409。
+// 归属必须靠「逐任务逐方向净持仓 + 按 |open| 比例拆份额」，否则平仓腿被丢
+// → 净持仓算成未平 → 人工验收永远 409。
 func TestTaskFillsIncludesAlgoCloseLeg(t *testing.T) {
 	d := testOpen(t)
 	ctx := context.Background()
@@ -138,11 +142,10 @@ VALUES (9201,1,$1,$2,'open','buy','2','artexo-episode-open2','filled','live_auto
 	}
 }
 
-// 一个「持仓回合」里夹了两个任务的成交。生产实测（账户 4，任务 42/45）：
+// 两个任务的持仓被一段连续净额串在一起。生产实测（账户 4，任务 42/45）：
 // 42 先开 1 张空，45 接着开 20 张空把净额堆到 -21，交易所 SL 一笔买 21 打回 0，
-// 45 再重开 19 张空。回合的归属取回合内**第一笔**能连回台账的成交 = 42，
-// 于是 45 的 20 张开仓全被算到 42 头上（42 的汇总变成 21 张往返）。
-// 回归：42 只该拿到自己那 1 张。
+// 45 再重开 19 张空。旧「回合首笔归属」规则把整段算给 42（45 的 20 张开仓
+// 全丢，realized 变 -891.6452）。按份额拆后 42 只占 SL 腿的 1/21。
 func TestTaskFillsSplitsMixedEpisode(t *testing.T) {
 	d := testOpen(t)
 	ctx := context.Background()
@@ -271,5 +274,329 @@ VALUES ($1,4,$2,$3,'open','sell',$4,$5,'filled','live_auto','agent')`,
 	}
 	if sum45.RealizedTotal != "-872.2532" {
 		t.Fatalf("任务 45 的已实现盈亏应为 -872.2532，得到 %s", sum45.RealizedTotal)
+	}
+}
+
+// 账户 4 是 long_short 模式（实测 291 笔 long + 855 笔 short），同一标的上
+// 多个任务可以各持一条反向仓。拆分必须只看「这笔成交能平掉的桶」：
+// 同向仓收到份额会把仓位越平分越大。
+//
+// 构造：A 多 2、B 空 1，一笔无主 algo sell 1。卖出只平多头 —— A 应减半到 1，
+// B 那张空单必须原样不动。按任务单一净额分桶时 A 会变成 2-2/3=1.33、
+// B 变成 -1-1/3=-1.33（方向全错）。
+func TestTaskFillsSplitIgnoresOppositeDirection(t *testing.T) {
+	d := testOpen(t)
+	ctx := context.Background()
+	const sym = "SPLIT-DIRECTION-SWAP"
+	if _, err := d.Exec(`INSERT INTO instruments(market, symbol, asset_class, currency)
+VALUES ('crypto',$1,'future','USDT')`, sym); err != nil {
+		t.Fatal(err)
+	}
+	var instID int64
+	if err := d.QueryRow(`SELECT id FROM instruments WHERE market='crypto' AND symbol=$1`, sym).Scan(&instID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		d.Exec(`DELETE FROM trade_fills WHERE inst_id=$1`, sym)
+		d.Exec(`DELETE FROM trade_records WHERE inst_id=$1`, sym)
+		d.Exec(`DELETE FROM instruments WHERE id=$1`, instID)
+	})
+
+	for _, r := range []struct {
+		task int64
+		cid  string
+		qty  string
+	}{{9301, "artexo-dir-long", "2"}, {9302, "artexo-dir-short", "1"}} {
+		if _, err := d.Exec(`INSERT INTO trade_records(task_id, account_id, instrument_id, inst_id, action, side, qty,
+client_order_id, state, mode, operator)
+VALUES ($1,4,$2,$3,'open','sell',$4,$5,'filled','live_auto','agent')`,
+			r.task, instID, sym, r.qty, r.cid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk := func(fid, ordID, cid, side, posSide, sz, px, at string) {
+		if _, _, err := d.InsertFill(TradeFill{
+			FillID: fid, AccountID: 4, InstID: sym, Side: side, PosSide: posSide,
+			FillPx: px, FillSz: sz, OrdID: ordID, ClOrdID: cid, FilledAt: at,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk(sym+":1", "4115000000000000001", "artexo-dir-long", "buy", "long", "2", "100", "2026-11-22T01:00:00Z")
+	mk(sym+":2", "4115000000000000002", "artexo-dir-short", "sell", "short", "1", "100", "2026-11-22T01:00:01Z")
+	mk(sym+":3", "4115000000000000003", "O4115000000000000010", "sell", "long", "1", "110", "2026-11-22T02:00:00Z")
+
+	sumA, err := TaskTradeSummaryFor(ctx, d, 9301, instID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sumA.NetQty[instID] != "1" {
+		t.Fatalf("任务 9301（多 2）被 algo 卖出 1 张后应剩 1 张多，得到 %q —— 份额分给了不该分的桶", sumA.NetQty[instID])
+	}
+
+	sumB, err := TaskTradeSummaryFor(ctx, d, 9302, instID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sumB.NetQty[instID] != "-1" {
+		t.Fatalf("任务 9302 的空单不该被 algo 卖出腿碰到（仍 -1），得到 %q", sumB.NetQty[instID])
+	}
+
+	// A 应拿到整笔（只有一个可平掉的桶），B 不该拿到这一笔的任何份额。
+	fillsA, err := d.TaskFills(ctx, 9301, 4, sym)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, f := range fillsA {
+		if f.ClOrdID == "O4115000000000000010" {
+			found = true
+			if f.SplitSz != "1" {
+				t.Fatalf("任务 9301 应占 algo 腿全部 1 张，得到 SplitSz=%q", f.SplitSz)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("任务 9301 应拿到 algo 卖出腿，得到 %+v", fillsA)
+	}
+	fillsB, err := d.TaskFills(ctx, 9302, 4, sym)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range fillsB {
+		if f.ClOrdID == "O4115000000000000010" {
+			t.Fatalf("同向仓不该收到份额（任务 9302 是空头，卖出腿平不掉它），得到 %+v", f)
+		}
+	}
+}
+
+// 三个任务各 1 张空，交易所连发三笔单张 algo buy。每笔的精确份额是 1/3。
+// ratLiteral 只留 10 位小数，0.3333333333×3 = 0.9999999999 —— 下游重新累加后
+// 净持仓被判非零 → 人工验收报「持仓未平」，正是本次要修的病。
+// 最大余额法保证 ΣSplitSz 精确等于 FillSz。
+func TestTaskFillsSplitSumsExactly(t *testing.T) {
+	d := testOpen(t)
+	ctx := context.Background()
+	const sym = "SPLIT-SUM-SWAP"
+	if _, err := d.Exec(`INSERT INTO instruments(market, symbol, asset_class, currency)
+VALUES ('crypto',$1,'future','USDT')`, sym); err != nil {
+		t.Fatal(err)
+	}
+	var instID int64
+	if err := d.QueryRow(`SELECT id FROM instruments WHERE market='crypto' AND symbol=$1`, sym).Scan(&instID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		d.Exec(`DELETE FROM trade_fills WHERE inst_id=$1`, sym)
+		d.Exec(`DELETE FROM trade_records WHERE inst_id=$1`, sym)
+		d.Exec(`DELETE FROM instruments WHERE id=$1`, instID)
+	})
+
+	tasks := []int64{9401, 9402, 9403}
+	for i, tid := range tasks {
+		cid := "artexo-sum-" + string(rune('a'+i))
+		if _, err := d.Exec(`INSERT INTO trade_records(task_id, account_id, instrument_id, inst_id, action, side, qty,
+client_order_id, state, mode, operator)
+VALUES ($1,4,$2,$3,'open','sell','1',$4,'filled','live_auto','agent')`,
+			tid, instID, sym, cid); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := d.InsertFill(TradeFill{
+			FillID: sym + ":open" + string(rune('a'+i)), AccountID: 4, InstID: sym,
+			Side: "sell", PosSide: "short", FillPx: "100", FillSz: "1",
+			OrdID: "411600000000000000" + string(rune('1'+i)), ClOrdID: cid,
+			FilledAt: "2026-11-22T01:00:0" + string(rune('1'+i)) + "Z",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 三笔单张 algo buy：每笔都要在三个桶之间分 1/3。
+	for i := 0; i < 3; i++ {
+		if _, _, err := d.InsertFill(TradeFill{
+			FillID: sym + ":algo" + string(rune('a'+i)), AccountID: 4, InstID: sym,
+			Side: "buy", PosSide: "short", FillPx: "110", FillSz: "1",
+			OrdID:    "411600000000001000" + string(rune('1'+i)),
+			ClOrdID:  "O4116000000000020" + string(rune('0'+i)),
+			FilledAt: "2026-11-22T02:00:0" + string(rune('1'+i)) + "Z",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, tid := range tasks {
+		sum, err := TaskTradeSummaryFor(ctx, d, tid, instID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sum.OpenPositions != 0 {
+			t.Fatalf("任务 %d 三笔平分后应完全平仓，得到 %+v（幻影持仓：份额未能精确加回）", tid, sum)
+		}
+		if len(sum.NetQty) != 0 {
+			t.Fatalf("任务 %d 的 NetQty 应为空，得到 %v", tid, sum.NetQty)
+		}
+	}
+
+	// ΣSplitSz 必须精确等于 FillSz（逐笔核）。
+	for i := 0; i < 3; i++ {
+		clOrd := "O4116000000000020" + string(rune('0'+i))
+		total := new(big.Rat)
+		var rows int
+		for _, tid := range tasks {
+			fills, err := d.TaskFills(ctx, tid, 4, sym)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, f := range fills {
+				if f.ClOrdID != clOrd {
+					continue
+				}
+				v, ok := new(big.Rat).SetString(strings.TrimSpace(f.SplitSz))
+				if !ok {
+					t.Fatalf("SplitSz 不是数值: %q", f.SplitSz)
+				}
+				total.Add(total, v)
+				rows++
+			}
+		}
+		if rows != 3 {
+			t.Fatalf("algo 腿 %s 应拆给 3 个任务，得到 %d 行", clOrd, rows)
+		}
+		if total.Cmp(new(big.Rat).SetInt64(1)) != 0 {
+			t.Fatalf("algo 腿 %s 的份额之和应为 1，得到 %s", clOrd, ratLiteral(total))
+		}
+	}
+}
+
+// 第一笔就是无主成交（此时谁都没持仓）—— 无从归属，必须跳过而不是随便塞给谁。
+func TestTaskFillsSplitSkipsWhenNoOpenPosition(t *testing.T) {
+	d := testOpen(t)
+	ctx := context.Background()
+	const sym = "SPLIT-NOOPEN-SWAP"
+	if _, err := d.Exec(`INSERT INTO instruments(market, symbol, asset_class, currency)
+VALUES ('crypto',$1,'future','USDT')`, sym); err != nil {
+		t.Fatal(err)
+	}
+	var instID int64
+	if err := d.QueryRow(`SELECT id FROM instruments WHERE market='crypto' AND symbol=$1`, sym).Scan(&instID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		d.Exec(`DELETE FROM trade_fills WHERE inst_id=$1`, sym)
+		d.Exec(`DELETE FROM trade_records WHERE inst_id=$1`, sym)
+		d.Exec(`DELETE FROM instruments WHERE id=$1`, instID)
+	})
+	if _, err := d.Exec(`INSERT INTO trade_records(task_id, account_id, instrument_id, inst_id, action, side, qty,
+client_order_id, state, mode, operator)
+VALUES (9501,4,$1,$2,'open','sell','1','artexo-noopen','filled','live_auto','agent')`, instID, sym); err != nil {
+		t.Fatal(err)
+	}
+	// 先来一笔无主 sell（谁都没持仓），再来本任务的开仓。
+	if _, _, err := d.InsertFill(TradeFill{
+		FillID: sym + ":algo", AccountID: 4, InstID: sym, Side: "sell", PosSide: "short",
+		FillPx: "110", FillSz: "1", OrdID: "4117000000000000001",
+		ClOrdID: "O4117000000000000020", FilledAt: "2026-11-22T01:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := d.InsertFill(TradeFill{
+		FillID: sym + ":open", AccountID: 4, InstID: sym, Side: "sell", PosSide: "short",
+		FillPx: "100", FillSz: "1", OrdID: "4117000000000000002",
+		ClOrdID: "artexo-noopen", FilledAt: "2026-11-22T01:00:01Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fills, err := d.TaskFills(ctx, 9501, 4, sym)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range fills {
+		if f.ClOrdID == "O4117000000000000020" {
+			t.Fatalf("无持仓时的无主成交无从归属，不该记到任何任务，得到 %+v", f)
+		}
+	}
+	if len(fills) != 1 {
+		t.Fatalf("只该拿到自己的开仓腿，得到 %d 笔: %+v", len(fills), fills)
+	}
+	sum, err := TaskTradeSummaryFor(ctx, d, 9501, instID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.NetQty[instID] != "-1" {
+		t.Fatalf("净持仓应为 -1（无主成交被跳过），得到 %q", sum.NetQty[instID])
+	}
+}
+
+// 无主成交大于 Σ|open|（手工单等病态输入）：份额夹在各个桶的持仓上限，
+// 多出来的部分丢弃不改派，任何桶都不许翻过零。
+func TestTaskFillsSplitClampsToAvailable(t *testing.T) {
+	d := testOpen(t)
+	ctx := context.Background()
+	const sym = "SPLIT-CLAMP-SWAP"
+	if _, err := d.Exec(`INSERT INTO instruments(market, symbol, asset_class, currency)
+VALUES ('crypto',$1,'future','USDT')`, sym); err != nil {
+		t.Fatal(err)
+	}
+	var instID int64
+	if err := d.QueryRow(`SELECT id FROM instruments WHERE market='crypto' AND symbol=$1`, sym).Scan(&instID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		d.Exec(`DELETE FROM trade_fills WHERE inst_id=$1`, sym)
+		d.Exec(`DELETE FROM trade_records WHERE inst_id=$1`, sym)
+		d.Exec(`DELETE FROM instruments WHERE id=$1`, instID)
+	})
+	for _, r := range []struct {
+		task int64
+		cid  string
+	}{{9601, "artexo-clamp-a"}, {9602, "artexo-clamp-b"}} {
+		if _, err := d.Exec(`INSERT INTO trade_records(task_id, account_id, instrument_id, inst_id, action, side, qty,
+client_order_id, state, mode, operator)
+VALUES ($1,4,$2,$3,'open','sell','1',$4,'filled','live_auto','agent')`, r.task, instID, sym, r.cid); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := d.InsertFill(TradeFill{
+			FillID: sym + ":" + r.cid, AccountID: 4, InstID: sym, Side: "sell", PosSide: "short",
+			FillPx: "100", FillSz: "1", ClOrdID: r.cid,
+			FilledAt: "2026-11-22T01:00:" + strconv.Itoa(1+int(r.task-9601)) + "Z",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// algo buy 10 张，而总共只有 2 张空可平。
+	if _, _, err := d.InsertFill(TradeFill{
+		FillID: sym + ":big", AccountID: 4, InstID: sym, Side: "buy", PosSide: "short",
+		FillPx: "110", FillSz: "10", OrdID: "4118000000000000001",
+		ClOrdID: "O4118000000000000020", FilledAt: "2026-11-22T02:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tid := range []int64{9601, 9602} {
+		sum, err := TaskTradeSummaryFor(ctx, d, tid, instID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(sum.NetQty) != 0 {
+			t.Fatalf("任务 %d 的 1 张空应被平掉且不许翻成多头，得到 %+v", tid, sum)
+		}
+	}
+	var total float64
+	for _, tid := range []int64{9601, 9602} {
+		fills, err := d.TaskFills(ctx, tid, 4, sym)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range fills {
+			if f.ClOrdID != "O4118000000000000020" {
+				continue
+			}
+			v, _ := strconv.ParseFloat(f.SplitSz, 64)
+			total += v
+		}
+	}
+	// 每桶夹到 1 张，多出来的 8 张丢弃（不改派）。
+	if total != 2 {
+		t.Fatalf("夹仓后份额之和应为 2（多出的 8 张丢弃），得到 %v", total)
 	}
 }
