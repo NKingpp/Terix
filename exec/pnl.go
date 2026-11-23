@@ -174,6 +174,19 @@ func computeOne(inst, groupSide string, fills []db.TradeFill) PnL {
 		}
 	}
 
+	// 净持仓容差：FillSz 从归属层来，是按份额拆过的 10 位小数字符串，
+	// 逐笔重新解析累加会留下残差（实测任务 45：230 笔累加，真值 0 得 -8e-10）。
+	// 残差本身不改语义，但会让「已平仓」显示成 open_qty=-0.0000000008，
+	// 而验收与前端都按「是否为零」判定是否还有持仓。
+	//
+	// 阈值 1e-8：远低于交易所最小下单精度（OKX 合约最小 0.01 张）。
+	// 这不是掩盖问题 —— 归属层用最大余额法保证单笔份额精确，这里只吸收
+	// 字符串边界的表示残差。
+	if qty.Sign() != 0 && new(big.Rat).Abs(qty).Cmp(big.NewRat(1, 100000000)) < 0 {
+		qty.SetInt64(0)
+		cost.SetInt64(0)
+	}
+
 	p := PnL{
 		InstID:      inst,
 		PosSide:     groupSide,
