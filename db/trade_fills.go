@@ -83,16 +83,25 @@ func (d *DB) ListFills(f FillsFilter) ([]TradeFill, error) {
 	if f.Limit <= 0 || f.Limit > 2000 {
 		f.Limit = 500
 	}
-	// 按任务查走「持仓回合」归属（db/fill_attribution.go）—— 这里的 SQL 只能连
-	// 自带 clOrdId 的成交，交易所 OCO/TP/SL 触发的平仓腿（`O` 前缀）连不上，
+	// 按任务查走「逐任务净持仓 + 比例拆份额」归属（db/fill_attribution.go）—— 这里的
+	// SQL 只能连自带 clOrdId 的成交，交易所 OCO/TP/SL 触发的平仓腿（`O` 前缀）连不上，
 	// 交易记录页会比母账少数十笔并显示「未平仓」。
+	// 页面上显示的是**本任务占的份额**，不是交易所侧的整笔成交：一条 algo 平仓腿
+	// 可能同时平掉多个任务的持仓，按任务查时同一 fill_id 会以不同数量出现在多个
+	// 任务的记录里 —— 这是正确行为，不是重复。
 	if f.TaskID > 0 {
-		fills, err := d.TaskFills(context.Background(), f.TaskID, f.AccountID, f.InstID)
+		shared, err := d.TaskFills(context.Background(), f.TaskID, f.AccountID, f.InstID)
 		if err != nil {
 			return nil, err
 		}
-		if len(fills) > f.Limit {
-			fills = fills[:f.Limit] // 与下面 SQL 的 ORDER BY ... LIMIT 语义一致（最早 N 笔）
+		if len(shared) > f.Limit {
+			shared = shared[:f.Limit] // 与下面 SQL 的 ORDER BY ... LIMIT 语义一致（最早 N 笔）
+		}
+		fills := make([]TradeFill, 0, len(shared))
+		for _, s := range shared {
+			tf := s.TradeFill
+			tf.FillSz, tf.Fee = s.SplitSz, s.SplitFee
+			fills = append(fills, tf)
 		}
 		return fills, nil
 	}
@@ -211,7 +220,7 @@ GROUP BY inst_id`, accountID)
 // HasFillsFor 报告某任务是否已有任何成交（供前端区分「还没成交」与「查不到」）。
 func (d *DB) HasFillsFor(taskID int64) (bool, error) {
 	var n int
-	// 先按 ① 回合归属判（含 algo 平仓腿），再退回旧草案链。
+	// 先按 ① 逐任务持仓归属判（含 algo 平仓腿），再退回旧草案链。
 	if fills, err := d.TaskFills(context.Background(), taskID, 0, ""); err == nil && len(fills) > 0 {
 		return true, nil
 	}

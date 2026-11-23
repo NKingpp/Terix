@@ -13,21 +13,37 @@ package db
 // 平台算出 open_qty=-53、realized=-0.0037，母账真值是 pos=0、+1474.4353。
 // 人工验收因此必然 409（持仓未平），任务永远收不了尾。
 //
-// # 归属规则：持仓回合（episode）
+// # 归属规则：逐任务净持仓 + 按比例拆份额
 //
-// 同一 (account, inst) 的成交按时间顺序走一遍净额：净额从 0 离开 → 一个回合开始，
-// 净额回到 0 → 回合结束。**回合的归属取回合内第一笔能连回 trade_records 的成交**，
-// 整个回合（含无主平仓腿）都归那个任务。
+// 按 (account, inst) 时间升序走一遍，维护每个任务当前的净持仓：
 //
-// 为什么这个规则安全：一个回合就是一次开平往返，它不可能横跨两个任务 ——
-// 要横跨得让两个任务在同一账户同一标的上同时持仓，而 long_short 模式下
-// pos_side 会把它们分成两条仓，净额回合天然分开。
+//   - 有主成交（clOrdId / ordId 能连回台账）→ 整笔归该任务，累加其净持仓。
+//   - 无主成交（交易所 algo 平仓腿）→ 拆给当前所有有持仓的任务，
+//     份额 = size · |open_t| / Σ|open|，符号跟随这笔成交。
+//     没有任何任务有持仓时不归属（不猜）。
+//
+// 份额夹在 |open_t| 以内：algo 腿不可能平掉某任务没持有的量。
+//
+// # 为什么不能用「持仓回合（episode）」
+//
+// 旧规则把「净额从 0 离开到回到 0」当一个回合，整个回合归回合首笔能连回台账的
+// 任务。两个反例都来自生产（账户 4，任务 42/45）：
+//
+//  1. 一个回合能横跨多个任务。任务 45 在 2026-11-20T15:14–11-21T01:15 开了 20 张
+//     空，而任务 42 同账户同标的手上还有 1 张空 —— 净额是一条连续的 -1→-21 曲线。
+//     回合首笔是 42 的，于是 45 的 20 张开仓全被算给 42：TaskFills(45)=1 笔，
+//     TaskFills(42)=6 笔、realized -891.6452（真值 -19.3920）。
+//  2. 一笔成交能覆盖多个任务的持仓。11-21T12:02 的 SL 腿是**一个** fill 行、
+//     21 张，其中 1 张属 42、20 张属 45。整笔归任何一方都错：
+//     归 45 → 45 净持仓 -18（真值 -19）；归 42 → 45 净持仓 -39。按 1:20 拆才对。
+//
+// big.Rat 保证精确：1/21·21 == 1、20/21·21 == 20，无浮点漂移。
 //
 // # 为什么不用「按 instId 取最近一条草案」
 //
 // BackfillFillDraftID 用的时间窗启发式在同一标的反复开平时会把历史成交
 // 算到最新一次上（实测 open_qty 从 0.1 变 -0.2，比不归属更糟）。
-// 回合边界由成交数据本身定义，不依赖任何时间猜测。
+// 归属由成交与持仓数据本身定义，不依赖任何时间猜测。
 
 import (
 	"context"
@@ -37,10 +53,25 @@ import (
 	"strings"
 )
 
-// TaskFills 返回归属于某任务的全部成交（按 filled_at、id 升序）。
+// TaskFill 是一笔成交归属于某任务的份额。
+//
+// 一笔成交可以被拆给多个任务：交易所 algo 触发的平仓腿只对应一个 fill 行，
+// 但它平掉的是多个任务各自的持仓（实测任务 45 的 21 张 SL 腿里
+// 1 张属于任务 42、20 张属于任务 45）。整笔归任何一方都会让另一方的
+// 净持仓算错，必须按份额拆。
+type TaskFill struct {
+	TradeFill
+	// SplitSz 是本任务占这笔成交的份额（方向仍由 Side 决定，这里只是数量）。
+	// 整笔归属时它等于 FillSz。
+	SplitSz string
+	// SplitFee 是本任务占的手续费份额，按 SplitSz/FillSz 同比例分摊。
+	SplitFee string
+}
+
+// TaskFills 返回归属于某任务的成交份额（按 filled_at、id 升序）。
 //
 // accountID <= 0 / instID 为空时不过滤。包含交易所 algo 触发的平仓腿。
-func (d *DB) TaskFills(ctx context.Context, taskID, accountID int64, instID string) ([]TradeFill, error) {
+func (d *DB) TaskFills(ctx context.Context, taskID, accountID int64, instID string) ([]TaskFill, error) {
 	if taskID <= 0 {
 		return nil, nil
 	}
@@ -92,7 +123,7 @@ WHERE tr.task_id = $1 OR (od.signal_id IS NOT NULL AND s.task_id = $1)`
 		return nil, nil
 	}
 
-	out := make([]TradeFill, 0, 64)
+	out := make([]TaskFill, 0, 64)
 	for _, p := range pairs {
 		fills, err := d.fillsForPair(ctx, p.account, p.inst)
 		if err != nil {
@@ -102,7 +133,7 @@ WHERE tr.task_id = $1 OR (od.signal_id IS NOT NULL AND s.task_id = $1)`
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, attributeEpisodes(fills, owner, taskID)...)
+		out = append(out, attributeByOpenShares(fills, owner, taskID)...)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].FilledAt != out[j].FilledAt {
@@ -322,32 +353,24 @@ func chunkStrings(in []string, size int) [][]string {
 	return out
 }
 
-// attributeEpisodes 按「净额从 0 离开再回到 0」切回合，返回归属 taskID 的成交。
+// attributeByOpenShares 逐笔维护各任务净持仓，返回 taskID 占有的成交份额。
 //
 // fills 必须按 filled_at、id 升序（fillsForPair 保证）。
-// owner 是 clOrdId → taskID（clOrdIDToTask 的产物）。
-func attributeEpisodes(fills []TradeFill, owner map[string]int64, taskID int64) []TradeFill {
-	if len(fills) == 0 {
-		return nil
-	}
-	var (
-		out    []TradeFill
-		cur    []TradeFill
-		curOwn int64
-		net    = new(big.Rat)
-		carry  *big.Rat // 反手后残留的净额（新回合的起点）
-	)
-	flush := func() {
-		if curOwn == taskID && len(cur) > 0 {
-			out = append(out, cur...)
+// owner 是 clOrdId / ordId → taskID（ownerKeys 的产物）。
+//
+// 有主成交整笔归该任务；无主成交（交易所 algo 平仓腿）按各任务当前 |净持仓|
+// 比例拆分。拆分必须逐笔做：只有走到那一笔时各任务的持仓才是真实需要被平掉的量。
+func attributeByOpenShares(fills []TradeFill, owner map[string]int64, taskID int64) []TaskFill {
+	opens := map[int64]*big.Rat{}
+	add := func(t int64, delta *big.Rat) {
+		cur, ok := opens[t]
+		if !ok {
+			cur = new(big.Rat)
+			opens[t] = cur
 		}
-		cur = nil
-		curOwn = 0
+		cur.Add(cur, delta)
 	}
-	start := func() {
-		cur = nil
-		curOwn = 0
-	}
+	var out []TaskFill
 
 	for _, f := range fills {
 		qty, ok := new(big.Rat).SetString(strings.TrimSpace(f.FillSz))
@@ -358,32 +381,66 @@ func attributeEpisodes(fills []TradeFill, owner map[string]int64, taskID int64) 
 		if strings.EqualFold(strings.TrimSpace(f.Side), "sell") {
 			signed.Neg(signed)
 		}
-		if carry != nil {
-			net.Set(carry)
-			carry = nil
-		}
-		before := new(big.Rat).Set(net)
-		net.Add(net, signed)
 
-		cur = append(cur, f)
-		if curOwn == 0 {
-			curOwn = ownerOf(f, owner)
+		if t := ownerOf(f, owner); t > 0 {
+			add(t, signed)
+			if t == taskID {
+				out = append(out, TaskFill{TradeFill: f, SplitSz: f.FillSz, SplitFee: f.Fee})
+			}
+			continue
 		}
 
-		switch {
-		case net.Sign() == 0:
-			flush()
-			start()
-		case before.Sign() != 0 && before.Sign() != net.Sign():
-			// 反手：这一笔先平掉整个旧仓、余量开反向新仓。
-			// ponytail: 只切回合、不拆行 —— 反手成交整体记在被打平的回合，
-			// 反向新回合的余量没有独立成交行。要逐分严谨时改为按余量拆两行副本。
-			flush()
-			start()
-			carry = new(big.Rat).Set(net)
-			curOwn = ownerOf(f, owner)
+		// 无主成交：分母是此刻所有任务 |净持仓| 之和。
+		total := new(big.Rat)
+		ids := make([]int64, 0, len(opens))
+		for t, o := range opens {
+			if o.Sign() == 0 {
+				continue
+			}
+			ids = append(ids, t)
+			total.Add(total, new(big.Rat).Abs(o))
+		}
+		if total.Sign() == 0 {
+			continue // 没有任何任务持仓：无从归属，不猜
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+		for _, t := range ids {
+			o := opens[t]
+			share := new(big.Rat).Mul(qty, new(big.Rat).Abs(o))
+			share.Quo(share, total)
+			// 该任务最多只能被平掉 |open_t| 张：algo 腿不可能关掉它没持有的量。
+			// 只有这笔成交本身大于 Σ|open|（手工单等病态输入）时才会触发；
+			// 此时多出来的 size-Σshares 张确实无从归属，丢弃而不改派。
+			avail := new(big.Rat).Abs(o)
+			if share.Cmp(avail) > 0 {
+				share.Set(avail)
+			}
+			delta := new(big.Rat).Set(share)
+			if signed.Sign() < 0 {
+				delta.Neg(delta)
+			}
+			add(t, delta)
+			if t != taskID {
+				continue
+			}
+			splitSz, splitFee := f.FillSz, f.Fee
+			if share.Cmp(qty) != 0 {
+				splitSz, splitFee = ratLiteral(share), feeShare(f.Fee, share, qty)
+			}
+			out = append(out, TaskFill{TradeFill: f, SplitSz: splitSz, SplitFee: splitFee})
 		}
 	}
-	flush() // 尾部仍未平的回合
 	return out
+}
+
+// feeShare 按份额摊手续费（符号与整笔一致：OKX 用负数表示支出）。
+func feeShare(fee string, share, size *big.Rat) string {
+	f, ok := new(big.Rat).SetString(strings.TrimSpace(fee))
+	if !ok {
+		return fee
+	}
+	r := new(big.Rat).Quo(share, size)
+	r.Mul(r, f)
+	return ratLiteral(r)
 }

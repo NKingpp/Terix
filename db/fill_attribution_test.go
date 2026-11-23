@@ -137,3 +137,139 @@ VALUES (9201,1,$1,$2,'open','buy','2','artexo-episode-open2','filled','live_auto
 		t.Fatalf("未平仓回合应被归属（2 张多），得到 %+v", sum)
 	}
 }
+
+// 一个「持仓回合」里夹了两个任务的成交。生产实测（账户 4，任务 42/45）：
+// 42 先开 1 张空，45 接着开 20 张空把净额堆到 -21，交易所 SL 一笔买 21 打回 0，
+// 45 再重开 19 张空。回合的归属取回合内**第一笔**能连回台账的成交 = 42，
+// 于是 45 的 20 张开仓全被算到 42 头上（42 的汇总变成 21 张往返）。
+// 回归：42 只该拿到自己那 1 张。
+func TestTaskFillsSplitsMixedEpisode(t *testing.T) {
+	d := testOpen(t)
+	ctx := context.Background()
+	const sym = "EPISODE-MIXED-SWAP"
+	if _, err := d.Exec(`INSERT INTO instruments(market, symbol, asset_class, currency)
+VALUES ('crypto',$1,'future','USDT')`, sym); err != nil {
+		t.Fatal(err)
+	}
+	var instID int64
+	if err := d.QueryRow(`SELECT id FROM instruments WHERE market='crypto' AND symbol=$1`, sym).Scan(&instID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		d.Exec(`DELETE FROM trade_fills WHERE inst_id=$1`, sym)
+		d.Exec(`DELETE FROM trade_records WHERE inst_id=$1`, sym)
+		d.Exec(`DELETE FROM instruments WHERE id=$1`, instID)
+	})
+
+	// 台账：42 开 1 张空；45 分 4 笔开 20 张空，SL 走交易所 algo 单（无台账行），
+	// 再重开 19 张空。
+	for _, r := range []struct {
+		task int64
+		cid  string
+		qty  string
+	}{
+		{42, "artexo-t42", "1"},
+		{45, "artexo-t45a", "9"},
+		{45, "artexo-t45b", "5"},
+		{45, "artexo-t45c", "4"},
+		{45, "artexo-t45d", "2"},
+		{45, "artexo-t45e", "19"},
+	} {
+		if _, err := d.Exec(`INSERT INTO trade_records(task_id, account_id, instrument_id, inst_id, action, side, qty,
+client_order_id, state, mode, operator)
+VALUES ($1,4,$2,$3,'open','sell',$4,$5,'filled','live_auto','agent')`,
+			r.task, instID, sym, r.qty, r.cid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk := func(fid, ordID, cid, side, sz, px, at string) {
+		if _, _, err := d.InsertFill(TradeFill{
+			FillID: fid, AccountID: 4, InstID: sym, Side: side, PosSide: "short",
+			FillPx: px, FillSz: sz, OrdID: ordID, ClOrdID: cid, FilledAt: at,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 净额走一遍：-1 → -10 → -15 → -19 → -21 → 0 → -19。
+	// 前 6 笔构成一个回合（第 6 笔 algo SL 把净额打回 0），第 7 笔开新回合。
+	mk(sym+":1", "4115698143391629312", "artexo-t42", "sell", "1", "662.8252", "2026-11-20T07:29:22Z")
+	mk(sym+":2", "4116635165232971776", "artexo-t45a", "sell", "9", "637.5200", "2026-11-20T15:14:48Z")
+	mk(sym+":3", "4116640143066513408", "artexo-t45b", "sell", "5", "637.4100", "2026-11-20T15:17:16Z")
+	mk(sym+":4", "4116640591521497088", "artexo-t45c", "sell", "4", "636.1302", "2026-11-20T15:17:30Z")
+	mk(sym+":5", "4117845030240501760", "artexo-t45d", "sell", "2", "651.4200", "2026-11-21T01:15:45Z")
+	mk(sym+":6", "4119146181791563776", "O4119146181668506624", "buy", "21", "682.2172", "2026-11-21T12:02:03Z")
+	mk(sym+":7", "4119277642117005312", "artexo-t45e", "sell", "19", "619.6850", "2026-11-21T13:07:20Z")
+
+	// 42 拿到 2 笔，不是 1 笔：① 自己那 1 张开仓腿；② algo SL 腿（整笔 21 张）
+	// 里属于它的 1/21 份额（SplitSz=1，原 FillSz 仍是 21）。
+	//
+	// 「只拿 1 笔」是错的 —— 只拿开仓腿就等于那张空单没被平掉，与下面
+	// OpenPositions==0 自相矛盾。整段回合归属（旧规则）才会把 45 的 20 张开仓
+	// 一起塞给 42；按份额拆则只给 1/21。两条断言互为交叉验证，勿「修」回 1 笔。
+	old, err := d.TaskFills(ctx, 42, 4, sym)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(old) != 2 {
+		t.Fatalf("任务 42 应拿到 2 笔（自己的开仓腿 + algo 平仓腿的 1/21 份额），得到 %d 笔: %+v",
+			len(old), old)
+	}
+	var openLeg, algoLeg *TaskFill
+	for i := range old {
+		switch old[i].ClOrdID {
+		case "artexo-t42":
+			openLeg = &old[i]
+		case "O4119146181668506624":
+			algoLeg = &old[i]
+		}
+	}
+	if openLeg == nil || openLeg.OrdID != "4115698143391629312" {
+		t.Fatalf("任务 42 应拿到自己的开仓腿 ordId 4115698143391629312，得到 %+v", old)
+	}
+	if algoLeg == nil {
+		t.Fatalf("任务 42 应拿到 algo 平仓腿 O4119146181668506624 的份额，得到 %+v", old)
+	}
+	// 拆份额的核心：整笔仍是 21 张，本任务只占 1 张。
+	if algoLeg.FillSz != "21" {
+		t.Fatalf("algo 腿的整笔数量应保留 21，得到 %q", algoLeg.FillSz)
+	}
+	if algoLeg.SplitSz != "1" {
+		t.Fatalf("任务 42 应只占 algo 腿 21 张里的 1 张，得到 SplitSz=%q", algoLeg.SplitSz)
+	}
+
+	// 经济后果：整段回合算给 42 时汇总被灌成 21 张往返、realized -891.6452。
+	// 真值是 1 张：662.8252 开空，682.2172 被 SL 平掉 → -(682.2172-662.8252) = -19.392。
+	sum42, err := TaskTradeSummaryFor(ctx, d, 42, instID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum42.Fills != 2 {
+		t.Fatalf("任务 42 的汇总应统计 2 笔（开仓腿 + 1/21 平仓腿），得到 %d —— 说明跨任务的整段回合被算给了它", sum42.Fills)
+	}
+	if sum42.OpenPositions != 0 {
+		t.Fatalf("任务 42 的 1 张空单应已被 SL 平掉（未平仓数 0），得到 %d", sum42.OpenPositions)
+	}
+	if sum42.RealizedTotal != "-19.392" {
+		t.Fatalf("任务 42 的已实现盈亏应为 -19.392，得到 %s", sum42.RealizedTotal)
+	}
+
+	// 45 侧才是这个 bug 的真正受害面：旧规则下它的 20 张开仓整段消失，
+	// 亏损不可见（wait_for 曾据此报 +1001 USDT）。20 张全平（algo 腿占 20/21），
+	// 之后再开 19 张仍是未平仓。
+	sum45, err := TaskTradeSummaryFor(ctx, d, 45, instID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum45.Fills != 6 {
+		t.Fatalf("任务 45 的汇总应统计 6 笔（4 笔开仓 + 20/21 平仓腿 + 19 张开仓），得到 %d", sum45.Fills)
+	}
+	if sum45.OpenPositions != 1 {
+		t.Fatalf("任务 45 应剩 1 个未平标的（重开的 19 张空），得到 %d", sum45.OpenPositions)
+	}
+	if sum45.NetQty[instID] != "-19" {
+		t.Fatalf("任务 45 的净持仓应为 -19，得到 %q", sum45.NetQty[instID])
+	}
+	if sum45.RealizedTotal != "-872.2532" {
+		t.Fatalf("任务 45 的已实现盈亏应为 -872.2532，得到 %s", sum45.RealizedTotal)
+	}
+}

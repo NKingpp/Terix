@@ -39,12 +39,16 @@ func TaskTradeSummaryFor(ctx context.Context, conn *DB, taskID int64, instrument
 		return out, nil
 	}
 
-	// 成交按「持仓回合」归属本任务（db/fill_attribution.go）。
+	// 成交按「逐任务净持仓 + 比例拆份额」归属本任务（db/fill_attribution.go）。
 	//
 	// 早先这里是 `trade_fills JOIN trade_records ON client_order_id = cl_ord_id`：
 	// 交易所 OCO/TP/SL 触发的平仓腿 clOrdId 是 `O` 前缀、平台从不写台账行，
 	// 于是整腿被丢弃 —— 实测任务 39 漏 26 笔 / 53 张，算出的净持仓 -53 与
 	// 母账 pos=0 相反，人工验收因此永远 409。
+	//
+	// 这里用 SplitSz（本任务占的份额），不是 FillSz：一条 algo 平仓腿会同时平掉
+	// 多个任务的持仓，用整笔数量会让每个任务都被平光。手续费不在本函数口径内
+	// （RealizedTotal 只看价差），故不读 SplitFee。
 	fills, err := conn.TaskFills(ctx, taskID, 0, "")
 	if err != nil {
 		return out, err
@@ -80,7 +84,7 @@ FROM trade_records WHERE task_id = $1 AND instrument_id IS NOT NULL`, taskID); i
 		if instrumentID > 0 && instID != instrumentID {
 			continue
 		}
-		qty, okQ := new(big.Rat).SetString(strings.TrimSpace(f.FillSz))
+		qty, okQ := new(big.Rat).SetString(strings.TrimSpace(f.SplitSz))
 		px, okP := new(big.Rat).SetString(strings.TrimSpace(f.FillPx))
 		if !okQ || !okP || qty.Sign() <= 0 {
 			continue
